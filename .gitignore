@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.next/
+coverage/
+*.tsbuildinfo
+playwright-report/
+test-results/
+.devflow/state/
+
+# Generated clients
+packages/database/src/generated/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Logs and editor files
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json

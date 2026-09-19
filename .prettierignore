@@ -1,0 +1,10 @@
+node_modules
+dist
+.next
+coverage
+package-lock.json
+项目说明.md
+codex.md
+packages/database/src/generated
+playwright-report
+test-results

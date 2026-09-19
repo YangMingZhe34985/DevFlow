@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "rootDir": "src",
+    "outDir": "dist",
+    "tsBuildInfoFile": "dist/.tsbuildinfo"
+  },
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/sandbox" },
+    { "path": "../../packages/git" },
+    { "path": "../../packages/tools" },
+    { "path": "../../packages/agent" },
+    { "path": "../../packages/workflow" }
+  ],
+  "include": ["src/**/*.ts"],
+  "exclude": ["dist", "tests"]
+}

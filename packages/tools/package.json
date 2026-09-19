@@ -1,0 +1,29 @@
+{
+  "name": "@devflow/tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rimraf dist",
+    "lint": "eslint .",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@devflow/git": "0.1.0",
+    "@devflow/sandbox": "0.1.0",
+    "@devflow/shared": "0.1.0",
+    "zod": "4.6.5"
+  }
+}

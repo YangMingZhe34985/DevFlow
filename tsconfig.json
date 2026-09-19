@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "files": [],
+  "references": [
+    { "path": "./packages/shared" },
+    { "path": "./packages/sandbox" },
+    { "path": "./packages/git" },
+    { "path": "./packages/tools" },
+    { "path": "./packages/agent" },
+    { "path": "./packages/workflow" },
+    { "path": "./packages/database" },
+    { "path": "./packages/eval" },
+    { "path": "./apps/cli" },
+    { "path": "./apps/api" },
+    { "path": "./apps/worker" }
+  ]
+}

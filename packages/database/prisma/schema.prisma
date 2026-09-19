@@ -1,0 +1,287 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum RepositorySourceKind {
+  LOCAL
+  GIT
+}
+
+enum TaskStatus {
+  OPEN
+  COMPLETED
+  CANCELLED
+  ARCHIVED
+}
+
+enum RunStatus {
+  QUEUED
+  RUNNING
+  WAITING_APPROVAL
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  TIMED_OUT
+}
+
+enum WorkflowStage {
+  START
+  ANALYZE_REPOSITORY
+  ANALYZE_TASK
+  GENERATE_PLAN
+  WAITING_APPROVAL
+  EXECUTE
+  TEST
+  FIX
+  REVIEW
+  GENERATE_DIFF
+  DONE
+  FAILED
+  CANCELLED
+}
+
+enum StepStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  SKIPPED
+  CANCELLED
+}
+
+enum ToolCallStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DENIED
+  TIMED_OUT
+  CANCELLED
+}
+
+enum EventLevel {
+  TRACE
+  DEBUG
+  INFO
+  WARN
+  ERROR
+}
+
+enum ArtifactKind {
+  PLAN
+  PATCH
+  DIFF
+  TEST_REPORT
+  REVIEW_REPORT
+  LOG
+  OTHER
+}
+
+enum ApprovalKind {
+  PLAN
+  TOOL_CALL
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+model Repository {
+  id            String               @id @default(uuid()) @db.Uuid
+  name          String
+  sourceKind    RepositorySourceKind
+  sourceUri     String
+  defaultBranch String?
+  createdAt     DateTime             @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime             @updatedAt @db.Timestamptz(3)
+  tasks         Task[]
+
+  @@index([createdAt])
+}
+
+model Task {
+  id           String     @id @default(uuid()) @db.Uuid
+  repositoryId String     @db.Uuid
+  title        String
+  description  String     @db.Text
+  status       TaskStatus @default(OPEN)
+  baseRef      String?
+  baseCommit   String?
+  createdAt    DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime   @updatedAt @db.Timestamptz(3)
+  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Restrict)
+  runs         Run[]
+
+  @@index([repositoryId, createdAt])
+  @@index([status])
+}
+
+model Run {
+  id                String        @id @default(uuid()) @db.Uuid
+  taskId            String        @db.Uuid
+  idempotencyKey    String?       @unique
+  status            RunStatus     @default(QUEUED)
+  currentStage      WorkflowStage @default(START)
+  baseCommit        String?
+  modelProvider     String?
+  modelName         String?
+  modelConfig       Json?
+  maxSteps          Int           @default(25)
+  maxTestRetries    Int           @default(3)
+  maxReviewRetries  Int           @default(1)
+  dispatchRevision  Int           @default(0)
+  stepCount         Int           @default(0)
+  retryCount        Int           @default(0)
+  modelCallCount    Int           @default(0)
+  toolCallCount     Int           @default(0)
+  durationMs        Int           @default(0)
+  modelLatencyMs    Int           @default(0)
+  toolLatencyMs     Int           @default(0)
+  inputTokens       Int           @default(0)
+  outputTokens      Int           @default(0)
+  totalTokens       Int           @default(0)
+  costUsd           Decimal?      @db.Decimal(18, 8)
+  startedAt         DateTime?     @db.Timestamptz(3)
+  finishedAt        DateTime?     @db.Timestamptz(3)
+  failureCode       String?
+  failureMessage    String?       @db.Text
+  failureDetails    Json?
+  summary           String?       @db.Text
+  executionOwner    String?
+  leaseExpiresAt    DateTime?     @db.Timestamptz(3)
+  cancelRequestedAt DateTime?     @db.Timestamptz(3)
+  nextEventSequence Int           @default(0)
+  metadata          Json?
+  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @db.Timestamptz(3)
+  task              Task          @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  steps             Step[]
+  toolCalls         ToolCall[]
+  events            Event[]
+  artifacts         Artifact[]
+  approvals         Approval[]
+
+  @@index([taskId, createdAt])
+  @@index([status, createdAt])
+  @@index([status, leaseExpiresAt])
+}
+
+model Step {
+  id         String        @id @default(uuid()) @db.Uuid
+  runId      String        @db.Uuid
+  sequence   Int
+  stage      WorkflowStage
+  status     StepStatus    @default(PENDING)
+  title      String?
+  input      Json?
+  output     Json?
+  error      Json?
+  startedAt  DateTime?     @db.Timestamptz(3)
+  finishedAt DateTime?     @db.Timestamptz(3)
+  durationMs Int?
+  createdAt  DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime      @updatedAt @db.Timestamptz(3)
+  run        Run           @relation(fields: [runId], references: [id], onDelete: Cascade)
+  toolCalls  ToolCall[]
+  events     Event[]
+  artifacts  Artifact[]
+  approvals  Approval[]
+
+  @@unique([runId, sequence])
+  @@index([runId, status])
+}
+
+model ToolCall {
+  id             String         @id @default(uuid()) @db.Uuid
+  runId          String         @db.Uuid
+  stepId         String         @db.Uuid
+  externalCallId String?
+  name           String
+  status         ToolCallStatus @default(PENDING)
+  input          Json
+  output         Json?
+  error          Json?
+  startedAt      DateTime?      @db.Timestamptz(3)
+  finishedAt     DateTime?      @db.Timestamptz(3)
+  durationMs     Int?
+  createdAt      DateTime       @default(now()) @db.Timestamptz(3)
+  run            Run            @relation(fields: [runId], references: [id], onDelete: Cascade)
+  step           Step           @relation(fields: [stepId], references: [id], onDelete: Cascade)
+  events         Event[]
+  approvals      Approval[]
+
+  @@unique([runId, externalCallId])
+  @@index([runId, createdAt])
+  @@index([stepId])
+  @@index([name, status])
+}
+
+model Event {
+  id         String     @id @default(uuid()) @db.Uuid
+  runId      String     @db.Uuid
+  stepId     String?    @db.Uuid
+  toolCallId String?    @db.Uuid
+  sequence   Int
+  type       String
+  level      EventLevel @default(INFO)
+  payload    Json
+  occurredAt DateTime   @default(now()) @db.Timestamptz(3)
+  run        Run        @relation(fields: [runId], references: [id], onDelete: Cascade)
+  step       Step?      @relation(fields: [stepId], references: [id], onDelete: SetNull)
+  toolCall   ToolCall?  @relation(fields: [toolCallId], references: [id], onDelete: SetNull)
+
+  @@unique([runId, sequence])
+  @@index([runId, occurredAt])
+  @@index([type, occurredAt])
+}
+
+model Artifact {
+  id        String       @id @default(uuid()) @db.Uuid
+  runId     String       @db.Uuid
+  stepId    String?      @db.Uuid
+  kind      ArtifactKind
+  name      String
+  mimeType  String?
+  uri       String?
+  content   String?      @db.Text
+  sizeBytes Int?
+  sha256    String?
+  metadata  Json?
+  createdAt DateTime     @default(now()) @db.Timestamptz(3)
+  run       Run          @relation(fields: [runId], references: [id], onDelete: Cascade)
+  step      Step?        @relation(fields: [stepId], references: [id], onDelete: SetNull)
+
+  @@index([runId, kind, createdAt])
+}
+
+model Approval {
+  id          String         @id @default(uuid()) @db.Uuid
+  runId       String         @db.Uuid
+  stepId      String?        @db.Uuid
+  toolCallId  String?        @db.Uuid
+  kind        ApprovalKind
+  status      ApprovalStatus @default(PENDING)
+  request     Json
+  resolution  Json?
+  comment     String?        @db.Text
+  actorId     String?
+  requestedAt DateTime       @default(now()) @db.Timestamptz(3)
+  resolvedAt  DateTime?      @db.Timestamptz(3)
+  updatedAt   DateTime       @updatedAt @db.Timestamptz(3)
+  run         Run            @relation(fields: [runId], references: [id], onDelete: Cascade)
+  step        Step?          @relation(fields: [stepId], references: [id], onDelete: SetNull)
+  toolCall    ToolCall?      @relation(fields: [toolCallId], references: [id], onDelete: SetNull)
+
+  @@index([runId, status, requestedAt])
+  @@index([toolCallId])
+}

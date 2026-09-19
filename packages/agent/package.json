@@ -1,0 +1,31 @@
+{
+  "name": "@devflow/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "rimraf dist",
+    "lint": "eslint .",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "4.0.70",
+    "@ai-sdk/openai-compatible": "3.0.52",
+    "@devflow/shared": "0.1.0",
+    "@devflow/tools": "0.1.0",
+    "ai": "7.0.106",
+    "zod": "4.6.5"
+  }
+}

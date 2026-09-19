@@ -1,0 +1,24 @@
+{
+  "name": "@devflow/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "dev": "tsx src/main.ts",
+    "build": "tsc -b",
+    "start": "node --enable-source-maps dist/main.js",
+    "clean": "rimraf dist",
+    "lint": "eslint .",
+    "typecheck": "tsc -b"
+  },
+  "dependencies": {
+    "@devflow/agent": "0.1.0",
+    "@devflow/git": "0.1.0",
+    "@devflow/sandbox": "0.1.0",
+    "@devflow/shared": "0.1.0",
+    "@devflow/tools": "0.1.0",
+    "@devflow/workflow": "0.1.0",
+    "dotenv": "18.0.0"
+  }
+}

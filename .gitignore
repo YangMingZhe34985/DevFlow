@@ -3,13 +3,29 @@ node_modules/
 
 # Build output
 dist/
+build/
+out/
 .next/
 .next-*/
 coverage/
 *.tsbuildinfo
 playwright-report/
 test-results/
-.devflow/state/
+
+# Runtime state and temporary output
+.devflow/
+.cache/
+logs/
+tmp/
+temp/
+sandbox-workspaces/
+*.tmp
+*.temp
+*.bak
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 
 # Generated clients
 packages/database/src/generated/
@@ -27,5 +43,13 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+*.swp
+*.swo
 
+# Local AI-assistant instructions and personal notes
 codex.md
+.codex/
+.claude/
+/apps/web/AGENTS.md
+/apps/web/CLAUDE.md
+/DevFlow_Technical_Notes_CN.md

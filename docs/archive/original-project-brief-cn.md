@@ -29,7 +29,7 @@ The project is **not intended to be a Cursor/Claude Code clone**. The primary fo
 - human approval;
 - reproducible evaluation.
 
-------
+---
 
 ## 2. Core Requirements
 
@@ -59,7 +59,7 @@ Repository
 
 `Run` represents one agent attempt to solve the task.
 
-------
+---
 
 ### 2.2 Agent Runtime
 
@@ -89,7 +89,7 @@ LLM
 
 Do not introduce unnecessary multi-agent complexity in the first version.
 
-------
+---
 
 ### 2.3 Tool System
 
@@ -123,7 +123,7 @@ Recommended schema validation library:
 Zod
 ```
 
-------
+---
 
 ### 2.4 Agent Workflow
 
@@ -161,7 +161,7 @@ The application controls workflow transitions.
 
 The LLM handles reasoning and task-specific decisions.
 
-------
+---
 
 ### 2.5 Sandbox
 
@@ -190,7 +190,7 @@ Sandbox should eventually support:
 - environment-variable control;
 - optional network restrictions.
 
-------
+---
 
 ### 2.6 Observability
 
@@ -228,7 +228,7 @@ error
 
 The web UI should display these events in real time.
 
-------
+---
 
 ### 2.7 Human-in-the-loop
 
@@ -252,7 +252,7 @@ run_command   → configurable
 git_push      → approval required
 ```
 
-------
+---
 
 ### 2.8 Test Feedback Loop
 
@@ -278,7 +278,7 @@ Passed
 
 Use a maximum retry count to prevent infinite loops.
 
-------
+---
 
 ## 3. Recommended Architecture
 
@@ -307,7 +307,7 @@ devflow/
 └─ scripts/
 ```
 
-------
+---
 
 ## 4. Technology Stack
 
@@ -325,7 +325,7 @@ Monaco Editor
 
 React Flow may be introduced later for workflow visualization.
 
-------
+---
 
 ### Backend
 
@@ -336,7 +336,7 @@ Prisma
 PostgreSQL
 ```
 
-------
+---
 
 ### Async Execution
 
@@ -347,7 +347,7 @@ BullMQ
 
 Agent runs should execute in workers instead of blocking API processes.
 
-------
+---
 
 ### Agent Layer
 
@@ -367,7 +367,7 @@ LangGraph.js
 
 Do not introduce LangGraph before the basic agent runtime is understood and working.
 
-------
+---
 
 ### Infrastructure
 
@@ -377,7 +377,7 @@ Docker Compose
 Git
 ```
 
-------
+---
 
 ### Communication
 
@@ -388,7 +388,7 @@ SSE
 
 Use REST for commands/resources and SSE for real-time run events.
 
-------
+---
 
 ### Testing
 
@@ -397,7 +397,7 @@ Vitest
 Playwright
 ```
 
-------
+---
 
 ## 5. Development Phases
 
@@ -419,7 +419,7 @@ Task
 
 The agent must successfully repair simple local test repositories.
 
-------
+---
 
 ### Phase 2 — Runtime and Tool Abstraction
 
@@ -448,7 +448,7 @@ token usage
 logging
 ```
 
-------
+---
 
 ### Phase 3 — Docker Sandbox
 
@@ -456,7 +456,7 @@ Move repository operations and command execution into Docker containers.
 
 All shell/test/build execution must go through the sandbox layer.
 
-------
+---
 
 ### Phase 4 — API and Persistence
 
@@ -475,7 +475,7 @@ Artifact
 Approval
 ```
 
-------
+---
 
 ### Phase 5 — Queue and Worker
 
@@ -500,7 +500,7 @@ timeout
 concurrency
 ```
 
-------
+---
 
 ### Phase 6 — Web UI
 
@@ -529,7 +529,7 @@ git diff
 token/latency statistics
 ```
 
-------
+---
 
 ### Phase 7 — SSE and Trace
 
@@ -537,7 +537,7 @@ Stream run events from backend to frontend using SSE.
 
 Persist important events for later replay and evaluation.
 
-------
+---
 
 ### Phase 8 — Workflow and Human Approval
 
@@ -555,7 +555,7 @@ Analyze
 
 Support rejection/replanning.
 
-------
+---
 
 ### Phase 9 — Test Feedback and Review
 
@@ -569,7 +569,7 @@ Git Diff
 Test Result
 ```
 
-------
+---
 
 ### Phase 10 — GitHub Integration
 
@@ -585,7 +585,7 @@ Optional PR Creation
 
 GitHub credentials must be handled by the platform, not directly exposed to the agent.
 
-------
+---
 
 ### Phase 11 — Evaluation
 
@@ -614,7 +614,7 @@ latency
 retry count
 ```
 
-------
+---
 
 ## 6. Implementation Priorities
 
@@ -645,7 +645,7 @@ advanced workflow editors
 
 until the core agent execution path works reliably.
 
-------
+---
 
 ## 7. Coding Principles
 
@@ -662,7 +662,7 @@ When implementing DevFlow:
 - add tests for runtime, tools, sandbox, and workflow logic;
 - prefer small incremental commits and runnable milestones.
 
-------
+---
 
 ## 8. Definition of Done for V1
 
@@ -683,7 +683,7 @@ Import/select a repository
 
 The same task must be reproducible enough to support evaluation and comparison across multiple runs.
 
-------
+---
 
 ## 9. Project Scope Constraint
 

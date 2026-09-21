@@ -1,74 +1,236 @@
 # DevFlow
 
-DevFlow 是一个 AI 软件工程 Agent 的执行、观测与评估平台。核心抽象始终是：
+[English](README.md) | [中文](README_CN.md)
 
-> **Repository + Task → Observable and Verifiable Agent Run**
+DevFlow is an AI software engineering agent platform for observable, verifiable repository analysis, code changes, testing, repair, review, approval, and GitHub delivery workflows.
 
-当前已完成 **P1–P9**：在 CLI Runtime、Docker Sandbox、API、Persistence、Queue 与 Worker 基础上，现已提供浏览器 Run Detail、持久化 SSE、计划审批与拒绝重规划、测试修复循环、独立 Review、Diff 和最终结果展示。
+> Repository + Task → Observable and Verifiable Agent Run
 
-## 目录
+DevFlow separates interactive APIs from untrusted code execution. The API persists intent and enqueues work; a BullMQ worker drives the workflow; agents can interact with a repository only through policy-controlled tools inside an isolated Docker sandbox.
+
+## Overview
+
+DevFlow turns a software engineering task into a durable Run with explicit stages, persisted events, bounded agent execution, deterministic tests, human approval gates, and reviewable Git output. It supports local repositories and GitHub repositories while pinning every Task to an immutable base commit for reproducibility.
+
+The project is currently intended for local development and evaluation. Before exposing it to an untrusted network, add an authentication and authorization layer appropriate to your deployment.
+
+## Features
+
+- Local and GitHub repository registration with immutable base-commit resolution
+- Structured planning with complexity estimation and adaptive Run-wide step budgets
+- Tool-calling agent runtime with bounded context, retries, token limits, and progress detection
+- Docker sandbox isolation for repository files, Git operations, and test commands
+- Deterministic test and targeted repair loop with retry limits
+- Independent structured review and diff generation
+- Human-in-the-loop approvals for plans and GitHub publication
+- BullMQ/Redis asynchronous execution with leases, cancellation, retry, and recovery
+- PostgreSQL/Prisma persistence for Runs, events, steps, artifacts, approvals, and metrics
+- Persisted SSE event replay for live Run status in the Web application
+- Idempotent GitHub branch push and pull request creation
+- Reproducible benchmark fixtures, provenance checks, and efficiency reports
+- OpenAI and OpenAI-compatible LLM endpoints through a provider abstraction
+
+## Architecture
+
+```text
+                        +-------------------+
+User ----------------->| Web (Next.js)     |
+  |                     +---------+---------+
+  |                               |
+  +-------------------->| CLI     | REST / SSE
+                        +----+----+         |
+                             |              v
+                             |      +-------+--------+
+                             |      | API (NestJS)   |
+                             |      +---+---------+--+
+                             |          |         |
+                             |          |         +------> PostgreSQL
+                             |          v
+                             |      Redis / BullMQ
+                             |          |
+                             |          v
+                             |      +---+----------+
+                             +----->| Worker       |
+                                    +---+----------+
+                                        |
+                           +------------+-------------+
+                           | Workflow / Agent Runtime |
+                           +------+--------------+----+
+                                  |              |
+                                  v              v
+                         Tool Executor       LLM Provider
+                                  |
+                                  v
+                         Docker Sandbox
+                         (files, Git, tests)
+                                  |
+                                  +----------> GitHub API
+```
+
+The API never executes the agent. The Worker owns execution, and the agent never receives direct host filesystem, Docker, database, or platform-credential access. See [docs/architecture.md](docs/architecture.md) for the detailed boundaries and lifecycle.
+
+## Tech Stack
+
+| Area                 | Technology                                                                |
+| -------------------- | ------------------------------------------------------------------------- |
+| Web                  | Next.js 16, React 19, TypeScript                                          |
+| API                  | NestJS 12, Zod                                                            |
+| Worker and queue     | Node.js, BullMQ, Redis                                                    |
+| Persistence          | PostgreSQL, Prisma 7                                                      |
+| Agent and LLM        | Vercel AI SDK, OpenAI/OpenAI-compatible adapters                          |
+| Isolation            | Docker sandbox with CPU, memory, PID, network, timeout, and output limits |
+| Validation and tests | Vitest, Playwright, Docker-backed integration suites                      |
+| Monorepo             | npm workspaces, TypeScript project references, ESM                        |
+
+## Project Structure
 
 ```text
 apps/
-  cli/       Phase 1 独立 Agent 原型入口
-  web/       Next.js Web 界面
-  api/       NestJS REST / SSE API
-  worker/    BullMQ Agent 执行进程
+  api/          REST API, approvals, queue dispatch, and SSE
+  cli/          Local command-line composition root
+  web/          Dashboard, Run creation, and Run detail UI
+  worker/       Queue consumer and production workflow orchestration
 packages/
-  shared/    浏览器与服务端共享的领域契约
-  sandbox/   隔离工作区与命令执行端口
-  git/       只能经 Sandbox 执行的 Git 端口
-  tools/     Tool schema、注册表、策略与执行端口
-  agent/     模型端口与 Agent Runtime
-  workflow/  确定性工作流状态机
-  database/  Prisma schema 与持久化端口
-  eval/      可复现实验与评分契约
-docker/      开发基础设施与 Sandbox 基础镜像
-docs/        架构、决策与路线图
+  agent/        Model port, agent loop, state, and context control
+  database/     Prisma schema and persistence adapters
+  eval/         Benchmark definitions, scoring, provenance, and reports
+  git/          Sandbox-only Git service
+  github/       GitHub REST adapter and publication coordinator
+  sandbox/      Docker sandbox and immutable local snapshots
+  shared/       Browser/server-safe domain contracts and events
+  tools/        Tool registry, policy, built-ins, and executor
+  workflow/     Pure workflow state and transition contracts
+docker/         Development infrastructure and sandbox image
+docs/           Architecture, decisions, and archived development material
+scripts/        Cross-workspace integration and acceptance runners
+tests/          Integration, end-to-end, and benchmark fixtures
 ```
 
-## 快速开始
+## Quick Start
 
-要求 Node.js 22.12+（推荐 Node 24）、npm 10+ 和 Docker。
+### Prerequisites
+
+- Node.js 22.12 or newer (Node.js 24 is used in CI)
+- npm 10 or newer
+- Docker Engine or Docker Desktop with Compose
+
+### Install and run
 
 ```bash
-npm install
+git clone <your-fork-or-repository-url>
+cd Devflow
 cp .env.example .env
-npm run sandbox:build
-npm run check
-npm run dev:cli -- --repo <repository-path> "Describe the software engineering task"
+npm ci
 ```
 
-Windows PowerShell 可使用 `Copy-Item .env.example .env` 替代 `cp`。
+On Windows PowerShell, use `Copy-Item .env.example .env` instead of `cp`.
 
-根目录 `.env` 会由 Prisma、API、Worker 与 Next 配置显式加载。默认端口：Web `3000`、API `3001`、Worker 健康探针 `3002`、PostgreSQL `5432`、Redis `6379`。
+Edit `.env` and configure at least `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY`. For an OpenAI-compatible provider, also set `LLM_BASE_URL`.
 
-## 常用命令
+```bash
+npm run infra:up
+npm run db:migrate:deploy
+npm run sandbox:build
+npm run dev
+```
 
-| 命令                                          | 作用                                                  |
-| --------------------------------------------- | ----------------------------------------------------- |
-| `npm run dev`                                 | 先构建核心包，再同时监听 packages、Web、API 与 Worker |
-| `npm run dev:cli -- --repo <path> "任务描述"` | 运行 Phase 1 Docker CLI Agent                         |
-| `npm run check`                               | lint、类型检查与单元测试                              |
-| `npm run test:p1`                             | 构建沙箱镜像并运行确定性 Docker 夹具修复验收          |
-| `npm run test:p2`                             | 运行 Runtime、Tool、Workflow 与 CLI 的 P2 测试        |
-| `npm run test:p3`                             | 运行 P3 真实 Docker 隔离与异常清理测试                |
-| `npm run test:p5`                             | 运行 P4–P5 数据库、API、队列和 Worker 端到端验收      |
-| `npm run test:p9`                             | 运行 P6–P9 浏览器、SSE、审批、修复与 Review 验收      |
-| `npm run build`                               | 构建核心 workspaces 与 Next.js                        |
-| `npm run infra:up`                            | 启动本地 PostgreSQL 与 Redis                          |
-| `npm run db:validate`                         | 校验 Prisma schema                                    |
-| `npm run db:migrate:deploy`                   | 将已提交的 Prisma migrations 应用到数据库             |
-| `npm run sandbox:build`                       | 构建每次 P1 Run 使用的基础镜像                        |
+The default endpoints are:
 
-## 当前边界
+- Web: `http://localhost:3000`
+- API: `http://localhost:3001/api/v1`
+- Worker health: `http://localhost:3002/health/ready`
+- PostgreSQL: `localhost:5432`
+- Redis: `localhost:6379`
 
-- API 只负责资源、审批和排队；绝不在请求进程中执行 Agent。
-- Worker/CLI 负责组装 runtime；Agent 只能通过 `ToolExecutor` 操作仓库。
-- Git 与命令执行只能经由 `SandboxSession`，不存在宿主机回退实现。
-- Web 只依赖浏览器安全的 shared 契约，不能导入 Prisma、Docker 或 Node-only 代码。
-- Approval 是可持久化的工作流状态，不能通过进程内等待模拟。
-- Trace 只记录结构化、已脱敏、可截断的数据；不得存储密钥或模型内部思维链。
+To stop the development infrastructure:
 
-详细说明见 [架构文档](docs/architecture.md) 和 [开发路线图](docs/roadmap.md)。原始需求保留在 [项目说明](项目说明.md)。
-真实模型配置与 P1 逐步验收见 [P1 手工验收指南](docs/p1-manual-acceptance.md)，P2 状态、指标、错误与 Windows 验收见 [P2 手工验收指南](docs/p2-manual-acceptance.md)，Docker 隔离见 [P3 手工验收指南](docs/p3-manual-acceptance.md)，API、PostgreSQL、Redis、Queue 与 Worker 全链路见 [P4–P5 手工验收指南](docs/p4-p5-manual-acceptance.md)，浏览器交互式工作流见 [P6–P9 手工验收指南](docs/p6-p9-manual-acceptance.md)。
+```bash
+npm run infra:down
+```
+
+## Configuration
+
+Start from [.env.example](.env.example). The most important settings are:
+
+| Variable                        | Purpose                                                    |
+| ------------------------------- | ---------------------------------------------------------- |
+| `DATABASE_URL`                  | PostgreSQL connection used by Prisma, API, and Worker      |
+| `REDIS_URL`                     | Redis connection used by BullMQ                            |
+| `LLM_PROVIDER`                  | `openai` or `openai-compatible`                            |
+| `LLM_MODEL`                     | Provider model identifier                                  |
+| `LLM_API_KEY`                   | Platform-side model credential                             |
+| `LLM_BASE_URL`                  | Required for OpenAI-compatible endpoints                   |
+| `DEVFLOW_LOCAL_REPOSITORY_ROOT` | Optional allowlisted root for local repositories           |
+| `DEVFLOW_MAX_STEPS`             | Run-wide hard limit for agent decisions                    |
+| `DEVFLOW_MAX_TOTAL_TOKENS`      | Run-wide token budget                                      |
+| `DEVFLOW_TIMEOUT_MS`            | Absolute active-execution deadline                         |
+| `DEVFLOW_SANDBOX_IMAGE`         | Docker image used for isolated Runs                        |
+| `DEVFLOW_GITHUB_WRITE_ENABLED`  | Enables approved GitHub writes; disabled by default        |
+| `GITHUB_TOKEN`                  | Platform-only GitHub credential; never passed to the agent |
+
+Do not commit `.env` or real credentials. GitHub credentials must remain at the API/Worker provider boundary and must not be included in task descriptions, model prompts, sandbox environments, or event payloads.
+
+## Development
+
+```bash
+npm run check          # lint, typecheck, and unit tests
+npm run build          # TypeScript workspaces and production Web build
+npm run test           # Vitest suite
+npm run test:e2e       # Playwright Web end-to-end tests
+npm run format:check   # verify formatting
+npm run db:validate    # validate the Prisma schema
+```
+
+Docker-backed integration runners are also available in `package.json`. They create isolated databases and sandboxes and therefore require Docker, PostgreSQL, and Redis access.
+
+## Workflow
+
+```text
+Create Repository
+        |
+        v
+Create Task and pin base commit
+        |
+        v
+Create Run -> enqueue -> Worker claim/lease
+        |
+        v
+PLAN -> Plan Approval
+        |
+        v
+EXECUTE -> TEST -> REPAIR (bounded loop)
+        |
+        v
+REVIEW -> optional targeted repair and retest
+        |
+        v
+DIFF
+        |
+        +---- LOCAL ----------------------> DONE
+        |
+        +---- GitHub -> Push Approval -> Push
+                         -> PR Approval -> Pull Request -> DONE
+```
+
+Every important transition and model/tool result is persisted. A reconnecting Web client replays events by sequence before continuing with SSE updates.
+
+## Roadmap
+
+- Deployment-grade authentication, authorization, and tenant isolation
+- Object storage and retention policies for large artifacts and logs
+- Stronger operational telemetry and distributed tracing
+- Additional repository hosts and provider-specific LLM adapters
+- Benchmark dashboards and long-running regression history
+- More granular, persisted approval policies for sensitive tools
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Architecture decision records](docs/decisions/)
+- [Test layout](tests/README.md)
+- [Script conventions](scripts/README.md)
+- [Historical development and acceptance material](docs/development/)
+
+## License
+
+DevFlow is available under the [MIT License](LICENSE).

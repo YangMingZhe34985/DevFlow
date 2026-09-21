@@ -28,11 +28,13 @@ describe("CLI project environment", () => {
   });
 
   it("resolves state storage from the project root rather than process.cwd()", () => {
+    const absoluteStateDirectory = path.resolve(os.tmpdir(), "devflow-state");
+
     expect(resolveProjectStateDirectory(".devflow/state")).toBe(
       path.join(PROJECT_ROOT, ".devflow", "state"),
     );
     expect(resolveProjectStateDirectory("   ")).toBe(path.join(PROJECT_ROOT, ".devflow", "state"));
-    expect(resolveProjectStateDirectory("D:\\devflow-state")).toBe("D:\\devflow-state");
+    expect(resolveProjectStateDirectory(absoluteStateDirectory)).toBe(absoluteStateDirectory);
   });
 
   it("loads an explicit UTF-8 env file without replacing existing variables", async () => {

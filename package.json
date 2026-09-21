@@ -14,7 +14,7 @@
   },
   "scripts": {
     "postinstall": "npm run db:generate",
-    "predev": "npm run build:core",
+    "predev": "npm run db:generate && npm run build:core",
     "dev": "concurrently --kill-others-on-fail --names types,web,api,worker --prefix-colors yellow,cyan,green,magenta \"npm:dev:types\" \"npm:dev:web\" \"npm:dev:api\" \"npm:dev:worker\"",
     "dev:types": "tsc -b -w --preserveWatchOutput",
     "dev:web": "npm run dev --workspace @devflow/web",
@@ -44,7 +44,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check": "npm run lint && npm run typecheck && npm run test",
-    "db:generate": "npm run db:generate --workspace @devflow/database",
+    "db:generate": "prisma generate --schema packages/database/prisma/schema.prisma",
     "db:validate": "npm run db:validate --workspace @devflow/database",
     "db:format": "npm run db:format --workspace @devflow/database",
     "db:migrate": "npm run db:migrate --workspace @devflow/database",

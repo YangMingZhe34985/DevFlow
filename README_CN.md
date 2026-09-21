@@ -117,13 +117,16 @@ tests/          集成测试、E2E 和 Benchmark fixture
 ### 安装与启动
 
 ```bash
-git clone <your-fork-or-repository-url>
+git clone git@github.com:YangMingZhe34985/DevFlow.git
 cd Devflow
 cp .env.example .env
 npm ci
 ```
 
 Windows PowerShell 请使用 `Copy-Item .env.example .env`。
+
+`npm ci` 会自动生成 Prisma Client；`npm run dev` 也会在编译各 workspace 前重新生成，
+因此不需要单独执行 `prisma generate`。
 
 编辑 `.env`，至少配置 `LLM_PROVIDER`、`LLM_MODEL` 和 `LLM_API_KEY`。使用 OpenAI-compatible 服务时还需要配置 `LLM_BASE_URL`。
 

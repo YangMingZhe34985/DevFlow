@@ -117,13 +117,16 @@ tests/          Integration, end-to-end, and benchmark fixtures
 ### Install and run
 
 ```bash
-git clone <your-fork-or-repository-url>
+git clone git@github.com:YangMingZhe34985/DevFlow.git
 cd Devflow
 cp .env.example .env
 npm ci
 ```
 
 On Windows PowerShell, use `Copy-Item .env.example .env` instead of `cp`.
+
+`npm ci` generates Prisma Client automatically. `npm run dev` also regenerates it before
+compiling the workspaces, so no separate `prisma generate` command is required.
 
 Edit `.env` and configure at least `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_API_KEY`. For an OpenAI-compatible provider, also set `LLM_BASE_URL`.
 

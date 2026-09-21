@@ -22,13 +22,22 @@ export class ToolRegistry {
 
   list(): readonly ToolDescriptor[] {
     return [...this.tools.values()]
-      .map(({ name, description, inputSchema, permission, timeoutMs }) => ({
-        name,
-        description,
-        inputSchema,
-        permission,
-        timeoutMs,
-      }))
+      .map(describeTool)
       .sort((left, right) => left.name.localeCompare(right.name));
   }
+}
+
+export function describeTool(tool: ToolDefinition<unknown, unknown>): ToolDescriptor {
+  const inferredReadOnly = tool.permission === "READ" || tool.permission === "GIT";
+  const readOnly = tool.readOnly ?? inferredReadOnly;
+  return {
+    name: tool.name,
+    description: tool.description,
+    inputSchema: tool.inputSchema,
+    permission: tool.permission,
+    timeoutMs: tool.timeoutMs,
+    readOnly,
+    parallelSafe: tool.parallelSafe ?? readOnly,
+    mutatesWorkspace: tool.mutatesWorkspace ?? !readOnly,
+  };
 }

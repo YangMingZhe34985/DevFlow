@@ -19,6 +19,10 @@ const optionalProvider = z.preprocess(
   (value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
   z.enum(["openai", "openai-compatible"]).optional(),
 );
+const optionalPositiveInteger = z.preprocess(
+  (value) => (typeof value === "string" && value.trim().length === 0 ? undefined : value),
+  z.coerce.number().int().positive().optional(),
+);
 
 const WorkerEnvironmentSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -35,7 +39,12 @@ const WorkerEnvironmentSchema = z.object({
   LLM_API_KEY: optionalString,
   LLM_BASE_URL: optionalUrl,
   LLM_PROVIDER_NAME: optionalString,
+  LLM_STRUCTURED_OUTPUT_MODE: z.enum(["auto", "json-schema", "json-object"]).default("auto"),
+  LLM_REASONING_PROFILE: z.enum(["efficient", "provider-default"]).default("efficient"),
   DEVFLOW_MAX_RETRIES: z.coerce.number().int().min(0).default(2),
+  DEVFLOW_MAX_MODEL_CALLS: optionalPositiveInteger,
+  DEVFLOW_MAX_TOOL_CALLS: optionalPositiveInteger,
+  DEVFLOW_MAX_TOTAL_TOKENS: z.coerce.number().int().positive().default(250_000),
   DEVFLOW_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(900_000),
   DEVFLOW_STATE_DIR: z.string().min(1).default(".devflow/state"),
   DEVFLOW_SANDBOX_IMAGE: z.string().min(1).default("devflow-sandbox:local"),
@@ -46,6 +55,12 @@ const WorkerEnvironmentSchema = z.object({
     .enum(["true", "false"])
     .default("false")
     .transform((value) => value === "true"),
+  DEVFLOW_GITHUB_WRITE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((value) => value === "true"),
+  DEVFLOW_GITHUB_API_BASE_URL: z.string().url().default("https://api.github.com"),
+  DEVFLOW_GITHUB_WEB_BASE_URL: z.string().url().default("https://github.com"),
 });
 
 export type WorkerEnvironment = z.infer<typeof WorkerEnvironmentSchema>;

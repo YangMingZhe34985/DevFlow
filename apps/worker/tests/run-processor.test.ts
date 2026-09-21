@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { RunExecutionRecord, RunRepository } from "@devflow/database";
-import type { RunQueuePort, RunResult } from "@devflow/shared";
+import { DevflowError, type RunQueuePort, type RunResult } from "@devflow/shared";
 import type { Job } from "bullmq";
 import { describe, expect, it, vi } from "vitest";
 
@@ -49,6 +49,40 @@ describe("RunProcessor", () => {
     expect(runs.complete).not.toHaveBeenCalled();
   });
 
+  it("completes a non-retryable sandbox setup failure with structured terminal data", async () => {
+    const run = executionRecord();
+    const runs = runRepository({ claim: vi.fn(async () => run) });
+    const executor: RunExecutionPort = {
+      execute: vi.fn(async () => {
+        throw new DevflowError({
+          code: "SANDBOX_FAILED",
+          message: "Failed to restore LOCAL snapshot.",
+          details: { stage: "EXECUTE" },
+        });
+      }),
+    };
+
+    await expect(createProcessor(runs, executor).process(job(run.id, 0, 3))).resolves.toMatchObject(
+      {
+        outcome: "COMPLETED",
+        status: "FAILED",
+      },
+    );
+    expect(runs.releaseForRetry).not.toHaveBeenCalled();
+    expect(runs.complete).toHaveBeenCalledWith(
+      run.id,
+      expect.any(String),
+      expect.objectContaining({
+        status: "FAILED",
+        error: expect.objectContaining({
+          code: "SANDBOX_FAILED",
+          message: "Failed to restore LOCAL snapshot.",
+          details: { stage: "EXECUTE" },
+        }),
+      }),
+    );
+  });
+
   it("parks a generated plan without completing the run", async () => {
     const run = { ...executionRecord(), currentStage: "GENERATE_PLAN" as const };
     const runs = runRepository({ claim: vi.fn(async () => run) });
@@ -65,6 +99,37 @@ describe("RunProcessor", () => {
       status: "WAITING_APPROVAL",
     });
     expect(runs.pauseForApproval).toHaveBeenCalledWith(run.id, expect.any(String), plan);
+    expect(runs.complete).not.toHaveBeenCalled();
+  });
+
+  it("parks a GitHub side-effect approval without completing the run", async () => {
+    const run = { ...executionRecord(), currentStage: "GENERATE_DIFF" as const };
+    const runs = runRepository({ claim: vi.fn(async () => run) });
+    const approval = {
+      kind: "GITHUB_PUSH" as const,
+      request: { branchName: `devflow/run-${run.id}` },
+      publication: {
+        repository: { owner: "devflow", name: "fixture" },
+        baseCommit: "a".repeat(40),
+        baseBranch: "main",
+        branchName: `devflow/run-${run.id}`,
+        pushOperationKey: `${run.id}:push:0`,
+        changesArtifactId: randomUUID(),
+      },
+    };
+    const executor: RunExecutionPort = {
+      execute: vi.fn(async () => ({
+        status: "WAITING_APPROVAL" as const,
+        approvalKind: "GITHUB" as const,
+        approval,
+      })),
+    };
+
+    await expect(createProcessor(runs, executor).process(job(run.id))).resolves.toMatchObject({
+      outcome: "COMPLETED",
+      status: "WAITING_APPROVAL",
+    });
+    expect(runs.pauseForGitHubApproval).toHaveBeenCalledWith(run.id, expect.any(String), approval);
     expect(runs.complete).not.toHaveBeenCalled();
   });
 
@@ -107,7 +172,11 @@ describe("RunRecovery", () => {
   it("re-enqueues queued and expired leased runs", async () => {
     const first = executionRecord();
     const second = executionRecord();
-    const runs = runRepository({ listRecoverable: vi.fn(async () => [first, second]) });
+    const finalizeExpiredCancellations = vi.fn(async () => 1);
+    const runs = runRepository({
+      finalizeExpiredCancellations,
+      listRecoverable: vi.fn(async () => [first, second]),
+    });
     const queue: RunQueuePort = {
       enqueue: vi.fn(async () => undefined),
       cancel: vi.fn(async () => false),
@@ -116,6 +185,7 @@ describe("RunRecovery", () => {
     };
 
     await expect(new RunRecovery(runs, queue).recover()).resolves.toBe(2);
+    expect(finalizeExpiredCancellations).toHaveBeenCalledOnce();
     expect(queue.enqueue).toHaveBeenCalledTimes(2);
   });
 });
@@ -199,6 +269,18 @@ function runRepository(overrides: Partial<RunRepository> = {}): RunRepository {
         id: randomUUID(),
         runId: run.id,
         kind: "PLAN",
+        status: "PENDING",
+        request: {},
+        requestedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      },
+    })),
+    pauseForGitHubApproval: vi.fn(async () => ({
+      run: { ...run, status: "WAITING_APPROVAL", currentStage: "WAITING_PUSH_APPROVAL" },
+      approval: {
+        id: randomUUID(),
+        runId: run.id,
+        kind: "GITHUB_PUSH",
         status: "PENDING",
         request: {},
         requestedAt: new Date().toISOString(),

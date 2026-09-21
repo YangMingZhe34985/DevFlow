@@ -148,4 +148,78 @@ describe("P1 built-in tools", () => {
     expect(result).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
     expect(sandbox.files.get("src/a.js")).toContain("needle");
   });
+
+  it("batches bounded file reads and searches", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.files.set("src/large-a.txt", "a".repeat(80 * 1_024));
+    sandbox.files.set("src/large-b.txt", "b".repeat(80 * 1_024));
+    const executor = createExecutor(["READ"]);
+    const toolContext = context(sandbox);
+
+    const read = await executor.execute(
+      {
+        name: "batchReadFiles",
+        input: { paths: ["src/large-a.txt", "src/large-b.txt"], maxBytesPerFile: 64 * 1_024 },
+      },
+      toolContext,
+    );
+    const search = await executor.execute(
+      {
+        name: "batchSearchCode",
+        input: {
+          searches: [
+            { query: "needle", path: "src" },
+            { query: "value", path: "src", maxResults: 1 },
+          ],
+        },
+      },
+      toolContext,
+    );
+
+    expect(read).toMatchObject({
+      ok: true,
+      output: {
+        totalBytes: 128 * 1_024,
+        truncated: true,
+        files: [
+          { ok: true, path: "src/large-a.txt", contentBytes: 64 * 1_024, truncated: true },
+          { ok: true, path: "src/large-b.txt", contentBytes: 64 * 1_024, truncated: true },
+        ],
+      },
+    });
+    expect(search).toMatchObject({
+      ok: true,
+      output: {
+        totalMatches: 2,
+        results: [
+          { ok: true, query: "needle", matches: ["src/a.js:1:23:needle"] },
+          { ok: true, query: "value", matches: ["src/a.js:1:23:needle"] },
+        ],
+      },
+    });
+    expect(sandbox.commands.filter(({ program }) => program === "rg")).toHaveLength(2);
+  });
+
+  it("publishes execution metadata and a compact Git summary", async () => {
+    const sandbox = new FakeSandbox();
+    const registry = new ToolRegistry();
+    registerCoreTools(registry, git);
+    const executor = new DefaultToolExecutor(registry, new ExplicitToolPolicy(["GIT"]));
+
+    expect(registry.get("readFile")).toMatchObject({
+      readOnly: true,
+      parallelSafe: true,
+      mutatesWorkspace: false,
+    });
+    expect(registry.get("writeFile")).toMatchObject({
+      readOnly: false,
+      parallelSafe: false,
+      mutatesWorkspace: true,
+    });
+    const summary = await executor.execute({ name: "gitDiffSummary", input: {} }, context(sandbox));
+    expect(summary).toMatchObject({
+      ok: true,
+      output: { filesChanged: 1, changedFiles: [], truncated: false },
+    });
+  });
 });

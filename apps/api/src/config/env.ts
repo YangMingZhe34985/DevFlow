@@ -23,6 +23,8 @@ const ApiEnvironmentSchema = z.object({
   DATABASE_URL: z.string().min(1),
   REDIS_URL: z.string().url().default("redis://localhost:6379"),
   RUN_QUEUE_NAME: z.string().min(1).default("devflow-runs"),
+  DEVFLOW_GITHUB_API_BASE_URL: z.string().url().default("https://api.github.com"),
+  DEVFLOW_GITHUB_WEB_BASE_URL: z.string().url().default("https://github.com"),
 });
 
 export type ApiEnvironment = z.infer<typeof ApiEnvironmentSchema>;

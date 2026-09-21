@@ -8,6 +8,7 @@ export class RunRecovery {
   ) {}
 
   async recover(): Promise<number> {
+    await this.runs.finalizeExpiredCancellations?.();
     const recoverable = await this.runs.listRecoverable();
     await Promise.all(
       recoverable.map(async (run) => {

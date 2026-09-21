@@ -1,0 +1,8 @@
+{
+  "name": "devflow-benchmark-max-repair-failure",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/public.test.mjs"
+  }
+}

@@ -89,6 +89,12 @@ summary:focus-visible {
   white-space: nowrap;
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 .brand {
   display: inline-flex;
   align-items: center;
@@ -199,7 +205,7 @@ summary:focus-visible {
   display: none;
 }
 
-.create-card > summary > span,
+.create-card > summary > span:first-child,
 .sequence {
   color: var(--accent);
   font:
@@ -209,7 +215,7 @@ summary:focus-visible {
     monospace;
 }
 
-.create-card > summary > span {
+.create-card > summary > span:first-child {
   display: grid;
   width: 1.35rem;
   height: 1.35rem;
@@ -218,12 +224,59 @@ summary:focus-visible {
   border-radius: 50%;
 }
 
+.create-card-title {
+  display: grid;
+  min-width: 0;
+  gap: 0.08rem;
+  color: var(--text);
+}
+
+.create-card-title small {
+  overflow: hidden;
+  color: var(--muted);
+  font:
+    0.68rem/1.25 ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.create-card-check {
+  margin-left: auto;
+  color: var(--success);
+  font-weight: 800;
+}
+
+.create-card--complete:not([open]) > summary > span:first-child {
+  border-color: var(--success);
+  background: rgb(85 201 149 / 12%);
+  color: var(--success);
+}
+
 .create-card form {
   display: grid;
   gap: 0.65rem;
   padding: 0 0.75rem 0.75rem;
   border-top: 1px solid var(--border);
   padding-top: 0.75rem;
+}
+
+.resolved-base {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.65rem;
+  border: 1px solid rgb(85 201 149 / 32%);
+  border-radius: 0.45rem;
+  background: rgb(85 201 149 / 7%);
+}
+
+.resolved-base > div {
+  min-width: 0;
 }
 
 label {
@@ -283,6 +336,105 @@ textarea {
 
 .button--quiet {
   background: transparent;
+}
+
+.button--active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.acceptance-guide {
+  display: grid;
+  gap: 1rem;
+  max-width: 100rem;
+  margin: 0 auto 1rem;
+  border-color: rgb(89 195 232 / 45%);
+  background: linear-gradient(135deg, rgb(89 195 232 / 10%), var(--surface) 45%);
+}
+
+.acceptance-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.acceptance-heading h1 {
+  margin: 0.25rem 0;
+  font-size: 1.35rem;
+}
+
+.acceptance-heading p:last-child {
+  max-width: 62rem;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.acceptance-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.acceptance-step {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  padding: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  color: var(--muted);
+  background: var(--surface-soft);
+}
+
+.acceptance-step > span {
+  display: grid;
+  width: 1.3rem;
+  height: 1.3rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  font:
+    700 0.68rem ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+}
+
+.acceptance-step--done {
+  border-color: rgb(85 201 149 / 38%);
+  color: var(--text);
+}
+
+.acceptance-step--done > span {
+  border-color: var(--success);
+  color: var(--success);
+  background: rgb(85 201 149 / 12%);
+}
+
+.acceptance-note {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+  padding: 0.75rem;
+  border-left: 2px solid var(--warning);
+  background: rgb(228 180 95 / 8%);
+  line-height: 1.5;
+}
+
+.acceptance-note span {
+  color: var(--muted);
+}
+
+.acceptance-note code {
+  color: var(--text);
 }
 
 .button-row {
@@ -403,6 +555,9 @@ textarea {
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
+  padding: clamp(1rem, 2vw, 1.4rem);
+  border-color: var(--border-strong);
+  background: linear-gradient(120deg, rgb(89 195 232 / 8%), transparent 46%), var(--surface);
 }
 
 .run-header h1,
@@ -415,6 +570,48 @@ textarea {
 .run-id {
   margin: 0.4rem 0 0;
   word-break: break-all;
+}
+
+.run-header-main {
+  display: grid;
+  min-width: 0;
+  gap: 0.65rem;
+}
+
+.run-header-context,
+.run-header-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.8rem;
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.run-header-context strong,
+.run-header-meta strong {
+  color: var(--text);
+}
+
+.run-header-stage {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.run-overview {
+  display: grid;
+  gap: 0.85rem;
+}
+
+.run-config {
+  border-top: 1px solid var(--border);
+  padding-top: 0.7rem;
+}
+
+.run-config > summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.76rem;
 }
 
 .run-header-actions,
@@ -481,9 +678,42 @@ dd {
     monospace;
 }
 
+.metric-groups {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.metric-group {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.metric-group h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.metric-grid--primary {
+  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+}
+
+.metric-grid--primary > div {
+  min-height: 5.5rem;
+  border-color: rgb(89 195 232 / 28%);
+  background: linear-gradient(145deg, rgb(89 195 232 / 10%), var(--surface-soft));
+}
+
+.metric-grid--primary dd {
+  margin-top: 0.55rem;
+  font-size: clamp(1.15rem, 2vw, 1.45rem);
+}
+
 .workflow {
   display: grid;
-  grid-template-columns: repeat(8, minmax(5rem, 1fr));
+  grid-template-columns: repeat(10, minmax(5.6rem, 1fr));
   overflow-x: auto;
   gap: 0;
   margin: 1rem 0 0;
@@ -528,19 +758,44 @@ dd {
 }
 
 .workflow-step--done,
-.workflow-step--current {
+.workflow-step--current,
+.workflow-step--completed,
+.workflow-step--running,
+.workflow-step--failed {
   color: var(--text);
 }
 
-.workflow-step--done > span {
+.workflow-step--done > span,
+.workflow-step--completed > span {
   border-color: var(--success);
   background: rgb(85 201 149 / 18%);
 }
 
-.workflow-step--current > span {
+.workflow-step--current > span,
+.workflow-step--running > span {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent);
+  box-shadow: 0 0 0 0.25rem rgb(89 195 232 / 8%);
+}
+
+.workflow-step--failed > span {
+  border-color: var(--danger);
+  background: rgb(239 118 122 / 16%);
+  color: var(--danger);
+  box-shadow: 0 0 0 0.25rem rgb(239 118 122 / 7%);
+}
+
+.workflow-step--failed::before {
+  background: linear-gradient(90deg, var(--border), var(--danger));
+}
+
+.workflow-step--skipped {
+  opacity: 0.48;
+}
+
+.workflow-step--skipped > span {
+  border-style: dashed;
 }
 
 .plan {
@@ -579,6 +834,74 @@ dd {
 .compact-timeline {
   display: grid;
   gap: 0.55rem;
+}
+
+.activity-list {
+  display: grid;
+  gap: 0.42rem;
+}
+
+.activity-row {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: var(--surface-soft);
+}
+
+.activity-row > summary {
+  display: grid;
+  grid-template-columns: auto minmax(8rem, 1fr) auto auto;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem 0.75rem;
+  cursor: pointer;
+  list-style: none;
+}
+
+.activity-row > summary::-webkit-details-marker {
+  display: none;
+}
+
+.activity-row > summary::before {
+  width: 0.45rem;
+  height: 0.45rem;
+  border-radius: 50%;
+  background: var(--border-strong);
+  content: "";
+}
+
+.activity-row--succeeded > summary::before {
+  background: var(--success);
+}
+
+.activity-row--failed > summary::before,
+.activity-row--error > summary::before {
+  background: var(--danger);
+}
+
+.activity-row--running > summary::before {
+  background: var(--accent);
+}
+
+.activity-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-meta {
+  color: var(--muted);
+  font:
+    0.68rem ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+  white-space: nowrap;
+}
+
+.activity-body {
+  padding: 0 0.75rem 0.75rem;
+  border-top: 1px solid var(--border);
 }
 
 .approval-list {
@@ -676,6 +999,83 @@ dd {
   white-space: pre;
 }
 
+.diff-panel {
+  min-width: 0;
+}
+
+.diff-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 0.65rem;
+}
+
+.diff-summary span {
+  padding: 0.18rem 0.42rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font:
+    0.66rem ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace;
+}
+
+.review-card {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.review-verdict {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.45rem;
+  background: var(--surface-soft);
+}
+
+.review-verdict--passed {
+  border-color: rgb(85 201 149 / 42%);
+}
+
+.review-verdict--changes-requested {
+  border-color: rgb(239 118 122 / 42%);
+}
+
+.review-summary h3,
+.review-findings h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.78rem;
+}
+
+.review-summary p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.finding-list {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.finding-list li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.55rem;
+  padding: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 0.4rem;
+  background: var(--surface-soft);
+}
+
 .prose-block {
   white-space: pre-wrap;
 }
@@ -713,7 +1113,8 @@ dd {
 }
 
 .event details .code-block {
-  width: min(42rem, 70vw);
+  width: 100%;
+  max-width: 100%;
 }
 
 .status,
@@ -857,8 +1258,22 @@ dd {
 
   .form-row,
   .definition-grid,
-  .metric-grid {
+  .metric-grid,
+  .resolved-base {
     grid-template-columns: 1fr;
+  }
+
+  .activity-row > summary {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .activity-row > summary .status {
+    grid-column: 2;
+  }
+
+  .activity-meta {
+    grid-column: 3;
+    grid-row: 1 / span 2;
   }
 
   .compact-event {

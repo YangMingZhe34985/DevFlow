@@ -19,6 +19,12 @@ export interface ToolDefinition<TInput = unknown, TOutput = unknown> {
   readonly outputSchema: z.ZodType<TOutput>;
   readonly permission: ToolPermission;
   readonly timeoutMs: number;
+  /** True when executing the tool cannot change repository or process state. */
+  readonly readOnly?: boolean;
+  /** True when independent invocations may safely run at the same time. */
+  readonly parallelSafe?: boolean;
+  /** True when a successful invocation may invalidate repository reads. */
+  readonly mutatesWorkspace?: boolean;
   execute(input: TInput, context: ToolContext): Promise<TOutput>;
 }
 
@@ -28,6 +34,9 @@ export interface ToolDescriptor {
   inputSchema: z.ZodType;
   permission: ToolPermission;
   timeoutMs: number;
+  readOnly: boolean;
+  parallelSafe: boolean;
+  mutatesWorkspace: boolean;
 }
 
 export interface ToolExecutionRequest {

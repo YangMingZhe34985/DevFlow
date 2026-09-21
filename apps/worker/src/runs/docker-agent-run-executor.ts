@@ -11,7 +11,11 @@ import {
 } from "@devflow/agent";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import { SandboxGitService } from "@devflow/git";
-import { DockerSandboxManager, type SandboxSession } from "@devflow/sandbox";
+import {
+  DockerSandboxManager,
+  resolveLocalFilesystemPath,
+  type SandboxSession,
+} from "@devflow/sandbox";
 import { DevflowError, type RunResult } from "@devflow/shared";
 import {
   DefaultToolExecutor,
@@ -57,7 +61,7 @@ export class DockerAgentRunExecutor implements RunExecutionPort {
           repository: {
             sourceUri,
             ...(run.task.baseRef === undefined ? {} : { baseRef: run.task.baseRef }),
-            ...(run.task.baseCommit === undefined ? {} : { baseCommit: run.task.baseCommit }),
+            ...(run.task.baseCommitSha === undefined ? {} : { baseCommit: run.task.baseCommitSha }),
           },
           limits: {
             cpuCount: this.environment.DEVFLOW_SANDBOX_CPUS,
@@ -87,11 +91,18 @@ export class DockerAgentRunExecutor implements RunExecutionPort {
       const runtime = new DefaultAgentRuntime(this.createModel(run));
       const stateStore = new JsonFileAgentStateStore(resolveStateDirectory(this.environment));
       const currentSandbox = sandbox;
+      await this.database.events.append({
+        runId: run.id,
+        type: "RUN_STARTED",
+        occurredAt: new Date().toISOString(),
+        payload: { workflow: "legacy", resumed: run.retryCount > 0 },
+      });
       const result = await runtime.run(
         {
           maxSteps: run.maxSteps,
           timeoutMs: this.environment.DEVFLOW_TIMEOUT_MS,
           maxRetries: this.environment.DEVFLOW_MAX_RETRIES,
+          emitRunLifecycle: false,
         },
         {
           runId: run.id,
@@ -100,7 +111,9 @@ export class DockerAgentRunExecutor implements RunExecutionPort {
             repositoryId: run.repository.id,
             title: run.task.title,
             description: run.task.description,
-            ...(run.task.baseCommit === undefined ? {} : { baseCommit: run.task.baseCommit }),
+            ...(run.task.baseCommitSha === undefined
+              ? {}
+              : { baseCommitSha: run.task.baseCommitSha }),
           },
           signal,
           tools,
@@ -152,12 +165,13 @@ export class DockerAgentRunExecutor implements RunExecutionPort {
       ...(this.environment.LLM_PROVIDER_NAME === undefined
         ? {}
         : { providerName: this.environment.LLM_PROVIDER_NAME }),
+      structuredOutputMode: this.environment.LLM_STRUCTURED_OUTPUT_MODE,
     });
   }
 }
 
 function localSourcePath(sourceUri: string): string {
-  return path.resolve(sourceUri.startsWith("file:") ? fileURLToPath(sourceUri) : sourceUri);
+  return resolveLocalFilesystemPath(sourceUri, PROJECT_ROOT);
 }
 
 function resolveStateDirectory(environment: WorkerEnvironment): string {

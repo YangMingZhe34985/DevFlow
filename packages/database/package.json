@@ -27,6 +27,7 @@
     "db:studio": "prisma studio"
   },
   "dependencies": {
+    "@devflow/github": "0.1.0",
     "@devflow/shared": "0.1.0",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",

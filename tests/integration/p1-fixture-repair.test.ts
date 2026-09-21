@@ -226,6 +226,11 @@ async function createSandbox(manager: DockerSandboxManager, runId: string) {
 }
 
 async function initializeFixtureRepository(sandbox: SandboxSession): Promise<void> {
+  const existingHead = await sandbox.exec({
+    program: "git",
+    args: ["rev-parse", "--verify", "HEAD^{commit}"],
+  });
+  if (existingHead.exitCode === 0) return;
   await expectSuccess(sandbox.exec({ program: "git", args: ["init", "-b", "main"] }));
   await expectSuccess(
     sandbox.exec({ program: "git", args: ["config", "user.email", "fixture@devflow.local"] }),

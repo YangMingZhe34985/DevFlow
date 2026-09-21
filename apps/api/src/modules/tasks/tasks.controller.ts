@@ -5,16 +5,13 @@ import type { DatabaseAdapter } from "@devflow/database";
 
 import { IdSchema, requiredRecord } from "../../common/validation.js";
 import { DATABASE } from "../../infrastructure/tokens.js";
+import { TaskBaseCommitResolver } from "./task-base-commit-resolver.js";
 
 const CreateTaskSchema = z.strictObject({
   repositoryId: IdSchema,
   title: z.string().trim().min(1).max(300),
   description: z.string().trim().min(1).max(100_000),
   baseRef: z.string().trim().min(1).max(255).optional(),
-  baseCommit: z
-    .string()
-    .regex(/^[0-9a-f]{7,64}$/iu)
-    .optional(),
 });
 
 const UpdateTaskSchema = z
@@ -27,11 +24,21 @@ const UpdateTaskSchema = z
 
 @Controller("tasks")
 export class TasksController {
-  constructor(@Inject(DATABASE) private readonly database: DatabaseAdapter) {}
+  constructor(
+    @Inject(DATABASE) private readonly database: DatabaseAdapter,
+    @Inject(TaskBaseCommitResolver) private readonly baseCommitResolver: TaskBaseCommitResolver,
+  ) {}
 
   @Post()
   async create(@Body() body: unknown) {
-    return await this.database.tasks.create(CreateTaskSchema.parse(body));
+    const input = CreateTaskSchema.parse(body);
+    const repository = requiredRecord(
+      await this.database.repositories.findById(input.repositoryId),
+      "Repository",
+      input.repositoryId,
+    );
+    const resolved = await this.baseCommitResolver.resolve(repository, input.baseRef);
+    return await this.database.tasks.create({ ...input, ...resolved });
   }
 
   @Get()

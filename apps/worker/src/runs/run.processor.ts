@@ -59,7 +59,11 @@ export class RunProcessor {
       if (await this.runs.isCancellationRequested(run.id)) cancellation.abort();
       const result = await this.executor.execute(run, signal);
       if (result.status === "WAITING_APPROVAL") {
-        await this.runs.pauseForApproval(run.id, owner, result.plan);
+        if (result.approvalKind === "GITHUB") {
+          await this.runs.pauseForGitHubApproval(run.id, owner, result.approval);
+        } else {
+          await this.runs.pauseForApproval(run.id, owner, result.plan);
+        }
         return { outcome: "COMPLETED", status: "WAITING_APPROVAL" };
       }
       if (await this.runs.isCancellationRequested(run.id)) {

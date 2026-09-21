@@ -141,6 +141,14 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
       maxSteps: 4,
     });
     expect(duplicate.body).toMatchObject({ created: false, run: { id: runId } });
+
+    const conflictingReplay = await request("POST", "/runs", {
+      taskId: task.id,
+      idempotencyKey,
+      maxSteps: 5,
+    });
+    expect(conflictingReplay.status).toBe(409);
+    expect(conflictingReplay.body).toMatchObject({ code: "CONFLICT" });
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(modelCreations.get(runId)).toBe(1);
   }, 180_000);

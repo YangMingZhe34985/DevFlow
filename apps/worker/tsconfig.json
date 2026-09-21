@@ -10,10 +10,12 @@
     { "path": "../../packages/shared" },
     { "path": "../../packages/sandbox" },
     { "path": "../../packages/git" },
+    { "path": "../../packages/github" },
     { "path": "../../packages/tools" },
     { "path": "../../packages/agent" },
     { "path": "../../packages/workflow" },
-    { "path": "../../packages/database" }
+    { "path": "../../packages/database" },
+    { "path": "../../packages/eval" }
   ],
   "include": ["src/**/*.ts"],
   "exclude": ["dist", "tests"]

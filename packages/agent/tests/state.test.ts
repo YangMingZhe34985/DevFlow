@@ -33,6 +33,26 @@ describe("AgentState persistence", () => {
     );
   });
 
+  it("defaults newly added runtime counters when restoring a legacy checkpoint", () => {
+    const state = createInitialAgentState(randomUUID(), [{ role: "USER", content: "legacy" }]);
+    const legacy = JSON.parse(JSON.stringify(state)) as {
+      metrics: Record<string, unknown>;
+    };
+    delete legacy.metrics.toolExecutions;
+    delete legacy.metrics.cacheHits;
+    delete legacy.metrics.duplicateToolCalls;
+    delete legacy.metrics.stalledDetections;
+    delete legacy.metrics.reasoningTokens;
+
+    expect(new AgentStateSerializer().deserialize(JSON.stringify(legacy)).metrics).toMatchObject({
+      toolExecutions: 0,
+      cacheHits: 0,
+      duplicateToolCalls: 0,
+      stalledDetections: 0,
+      reasoningTokens: 0,
+    });
+  });
+
   it("persists and restores state from an atomic JSON file", async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), "devflow-agent-state-"));
     temporaryDirectories.push(directory);
@@ -59,6 +79,11 @@ describe("AgentState persistence", () => {
       metrics: {
         modelCalls: 2,
         toolCalls: 1,
+        toolExecutions: 1,
+        cacheHits: 0,
+        duplicateToolCalls: 0,
+        stalledDetections: 0,
+        reasoningTokens: 0,
         retries: 1,
         modelLatencyMs: 123,
         toolLatencyMs: 45,

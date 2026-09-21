@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Inject, Param, Patch, Post } from "@nest
 import { z } from "zod";
 
 import type { DatabaseAdapter } from "@devflow/database";
+import { repositoryUriContainsCredentials } from "@devflow/shared";
 
 import { IdSchema, requiredRecord } from "../../common/validation.js";
 import { DATABASE } from "../../infrastructure/tokens.js";
@@ -9,14 +10,31 @@ import { DATABASE } from "../../infrastructure/tokens.js";
 const CreateRepositorySchema = z.strictObject({
   name: z.string().trim().min(1).max(200),
   sourceKind: z.enum(["LOCAL", "GIT"]),
-  sourceUri: z.string().trim().min(1).max(4_096),
+  sourceUri: z
+    .string()
+    .trim()
+    .min(1)
+    .max(4_096)
+    .refine(
+      (value) => !repositoryUriContainsCredentials(value),
+      "Repository URIs must not contain credentials; configure them at the platform boundary.",
+    ),
   defaultBranch: z.string().trim().min(1).max(255).optional(),
 });
 
 const UpdateRepositorySchema = z
   .strictObject({
     name: z.string().trim().min(1).max(200).optional(),
-    sourceUri: z.string().trim().min(1).max(4_096).optional(),
+    sourceUri: z
+      .string()
+      .trim()
+      .min(1)
+      .max(4_096)
+      .refine(
+        (value) => !repositoryUriContainsCredentials(value),
+        "Repository URIs must not contain credentials; configure them at the platform boundary.",
+      )
+      .optional(),
     defaultBranch: z.string().trim().min(1).max(255).nullable().optional(),
   })
   .refine((value) => Object.keys(value).length > 0, "At least one field is required.");

@@ -30,6 +30,7 @@ import { RunProcessor } from "../../apps/worker/src/runs/run.processor.js";
 const execFileAsync = promisify(execFile);
 const integrationEnabled = process.env.DEVFLOW_P9_INTEGRATION === "1";
 const integrationDescribe = integrationEnabled ? describe : describe.skip;
+const originalLocalRepositoryRoot = process.env.DEVFLOW_LOCAL_REPOSITORY_ROOT;
 
 integrationDescribe("P6-P9 interactive approval workflow", () => {
   const databaseUrl = requiredEnvironment("TEST_DATABASE_URL");
@@ -49,12 +50,15 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
   let temporaryRoot: string;
   let webProcess: ChildProcess | undefined;
   let webBaseUrl: string;
+  let webDistributionDirectory: string | undefined;
+  let webOutput = "";
   let browser: Browser | undefined;
   let reviewerCalls = 0;
 
   beforeAll(async () => {
     temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "devflow-p9-"));
     workspace = path.join(temporaryRoot, "repository");
+    process.env.DEVFLOW_LOCAL_REPOSITORY_ROOT = temporaryRoot;
     await cp(fixturePath, workspace, { recursive: true });
     await initializeGitRepository(workspace);
 
@@ -95,9 +99,9 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
           return fakeModelResponse({
             toolCalls: [],
             text: JSON.stringify({
-              approved: true,
+              verdict: "PASS",
               summary: "Independent review approved the tested subtraction fix.",
-              findings: [],
+              issues: [],
             }),
             usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
             latencyMs: 2,
@@ -126,6 +130,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
 
     const webPort = await availablePort();
     webBaseUrl = `http://127.0.0.1:${String(webPort)}`;
+    webDistributionDirectory = `.next-p9-${process.pid}-${crypto.randomUUID()}`;
     webProcess = spawn(
       process.execPath,
       [
@@ -139,27 +144,41 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
       ],
       {
         cwd: path.resolve("."),
-        env: { ...process.env, NEXT_PUBLIC_API_BASE_URL: apiBaseUrl },
+        env: {
+          ...process.env,
+          NODE_ENV: "development",
+          NEXT_PUBLIC_API_BASE_URL: apiBaseUrl,
+          DEVFLOW_NEXT_DIST_DIR: webDistributionDirectory,
+        },
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
       },
     );
-    await waitForHttp(webBaseUrl, 60_000);
-    const executablePath = browserExecutable();
-    browser = await chromium.launch({
-      headless: true,
-      ...(executablePath === undefined ? {} : { executablePath }),
-    });
+    const captureWebOutput = (chunk: Buffer): void => {
+      webOutput = `${webOutput}${chunk.toString("utf8")}`.slice(-20_000);
+    };
+    webProcess.stdout?.on("data", captureWebOutput);
+    webProcess.stderr?.on("data", captureWebOutput);
+    await waitForHttp(webProcess, webBaseUrl, 60_000, () => webOutput);
+    browser = await launchBrowser();
   }, 180_000);
 
   afterAll(async () => {
     await browser?.close();
-    webProcess?.kill();
+    await stopProcessTree(webProcess);
     await queueWorker?.close();
     await workerQueue?.close();
     await workerRedis?.quit();
     await app?.close();
-    await rm(temporaryRoot, { recursive: true, force: true });
+    if (temporaryRoot !== undefined) await rm(temporaryRoot, { recursive: true, force: true });
+    if (webDistributionDirectory !== undefined) {
+      await rm(path.join("apps/web", webDistributionDirectory), { recursive: true, force: true });
+    }
+    if (originalLocalRepositoryRoot === undefined) {
+      delete process.env.DEVFLOW_LOCAL_REPOSITORY_ROOT;
+    } else {
+      process.env.DEVFLOW_LOCAL_REPOSITORY_ROOT = originalLocalRepositoryRoot;
+    }
   }, 120_000);
 
   it("completes Task -> Plan -> Reject/Replan -> Approval -> Execute -> Repair -> Review -> Result in a browser", async () => {
@@ -181,7 +200,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
 
     const runForm = page.getByTestId("run-form");
     await runForm.getByLabel("Task").selectOption({ label: taskTitle });
-    await runForm.getByLabel("Max steps").fill("5");
+    await runForm.getByLabel("Max steps").fill("8");
     await runForm.getByLabel("Max repair").fill("2");
     await runForm.getByRole("button", { name: "创建并启动 Run" }).click();
     await expect.poll(() => page.url(), { timeout: 30_000 }).toContain("/runs/");
@@ -211,7 +230,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
     await page.getByText("SUCCEEDED", { exact: true }).first().waitFor({ timeout: 30_000 });
     await page
       .getByTestId("run-review")
-      .getByText(/Independent review approved/u)
+      .getByText("Independent review approved the tested subtraction fix.", { exact: true })
       .waitFor();
     await page
       .getByTestId("run-diff")
@@ -321,6 +340,9 @@ function workflowModel(run: RunExecutionRecord, planningPrompts: string[]): Fake
           toolCalls: [],
           text: JSON.stringify({
             summary: revised ? "Revised test-first calculator plan" : "Initial calculator plan",
+            complexity: "SIMPLE",
+            estimatedSteps: revised ? 9 : 8,
+            confidence: 0.9,
             steps: [
               {
                 id: revised ? "inspect-tests-revised" : "inspect-tests",
@@ -406,9 +428,19 @@ async function availablePort(): Promise<number> {
   });
 }
 
-async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
+async function waitForHttp(
+  childProcess: ChildProcess,
+  url: string,
+  timeoutMs: number,
+  output: () => string,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
+    if (childProcess.exitCode !== null) {
+      throw new Error(
+        `Next.js P9 server exited with ${String(childProcess.exitCode)} before becoming ready.\n${output()}`,
+      );
+    }
     try {
       const response = await fetch(url);
       if (response.ok) return;
@@ -417,7 +449,18 @@ async function waitForHttp(url: string, timeoutMs: number): Promise<void> {
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  throw new Error(`Timed out waiting for ${url}.`);
+  throw new Error(`Timed out waiting for ${url}.\n${output()}`);
+}
+
+async function stopProcessTree(childProcess: ChildProcess | undefined): Promise<void> {
+  if (childProcess?.pid === undefined || childProcess.exitCode !== null) return;
+  if (process.platform === "win32") {
+    await execFileAsync("taskkill", ["/PID", String(childProcess.pid), "/T", "/F"]).catch(
+      () => undefined,
+    );
+    return;
+  }
+  childProcess.kill("SIGTERM");
 }
 
 function requiredEnvironment(name: string): string {
@@ -428,18 +471,30 @@ function requiredEnvironment(name: string): string {
   return value ?? "not-configured";
 }
 
-function browserExecutable(): string | undefined {
+async function launchBrowser(): Promise<Browser> {
+  const failures: string[] = [];
+  for (const executablePath of browserExecutables()) {
+    try {
+      return await chromium.launch({ headless: true, executablePath });
+    } catch (error) {
+      failures.push(`${executablePath}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  throw new Error(`No Chromium executable could be launched:\n${failures.join("\n")}`);
+}
+
+function browserExecutables(): string[] {
   const candidates = [
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE,
-    chromium.executablePath(),
     process.platform === "win32"
       ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
       : undefined,
     process.platform === "win32"
       ? "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
       : undefined,
+    chromium.executablePath(),
   ];
-  return candidates.find((candidate): candidate is string =>
-    candidate === undefined ? false : existsSync(candidate),
-  );
+  return [
+    ...new Set(candidates.filter((candidate): candidate is string => candidate !== undefined)),
+  ].filter((candidate) => existsSync(candidate));
 }

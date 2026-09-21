@@ -10,15 +10,21 @@ import {
 } from "@nestjs/common";
 
 import { PrismaDatabaseAdapter, type DatabaseAdapter } from "@devflow/database";
+import {
+  EnvironmentGitHubCredentialSource,
+  GitHubRestProvider,
+  type GitHubProvider,
+} from "@devflow/github";
 import type { RunQueuePort } from "@devflow/shared";
 
 import { loadApiEnvironment } from "../config/env.js";
 import { BullRunQueue } from "./bull-run-queue.js";
-import { DATABASE, RUN_QUEUE } from "./tokens.js";
+import { DATABASE, GITHUB_PROVIDER, RUN_QUEUE } from "./tokens.js";
 
 export interface InfrastructureOverrides {
   database?: DatabaseAdapter;
   runQueue?: RunQueuePort;
+  githubProvider?: GitHubProvider;
 }
 
 @Injectable()
@@ -55,13 +61,23 @@ export class InfrastructureModule {
         useValue:
           overrides.runQueue ?? new BullRunQueue(environment.RUN_QUEUE_NAME, environment.REDIS_URL),
       },
+      {
+        provide: GITHUB_PROVIDER,
+        useValue:
+          overrides.githubProvider ??
+          new GitHubRestProvider({
+            credentials: new EnvironmentGitHubCredentialSource(),
+            apiBaseUrl: environment.DEVFLOW_GITHUB_API_BASE_URL,
+            webBaseUrl: environment.DEVFLOW_GITHUB_WEB_BASE_URL,
+          }),
+      },
       InfrastructureLifecycle,
     ];
     return {
       global: true,
       module: InfrastructureModule,
       providers,
-      exports: [DATABASE, RUN_QUEUE],
+      exports: [DATABASE, RUN_QUEUE, GITHUB_PROVIDER],
     };
   }
 }

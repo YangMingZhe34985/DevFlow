@@ -32,9 +32,14 @@ export function fakeModelResponse(
 ): ModelResponse {
   return {
     ...(options.text === undefined ? {} : { text: options.text }),
+    ...(options.output === undefined ? {} : { output: options.output }),
+    ...(options.structuredOutput === undefined
+      ? {}
+      : { structuredOutput: options.structuredOutput }),
     toolCalls: options.toolCalls,
     finishReason: options.finishReason ?? (options.toolCalls.length > 0 ? "TOOL_CALLS" : "STOP"),
     usage: options.usage ?? { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+    ...(options.reasoningTokens === undefined ? {} : { reasoningTokens: options.reasoningTokens }),
     latencyMs: options.latencyMs ?? 0,
   };
 }

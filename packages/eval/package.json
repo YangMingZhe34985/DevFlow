@@ -18,9 +18,11 @@
     "build": "tsc -b",
     "clean": "rimraf dist",
     "lint": "eslint .",
+    "test": "vitest run ../../packages/eval/tests",
     "typecheck": "tsc -b"
   },
   "dependencies": {
+    "@devflow/database": "0.1.0",
     "@devflow/shared": "0.1.0",
     "zod": "4.6.5"
   }

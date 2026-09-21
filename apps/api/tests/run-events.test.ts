@@ -156,6 +156,46 @@ describe("run event HTTP API", () => {
       { id: "4", data: { sequence: 4 } },
     ]);
   });
+
+  it("streams and replays a structured terminal failure before stream-end", async () => {
+    database.reset("RUNNING", [event(1)]);
+    setTimeout(() => {
+      database.addEvent(failureEvent(2));
+      database.setStatus("FAILED");
+    }, 30);
+
+    const liveMessages = await readSse(
+      await fetch(`${baseUrl}/runs/${RUN_ID}/events/stream?afterSequence=1`),
+    );
+    expect(liveMessages).toMatchObject([
+      {
+        id: "2",
+        event: "RUN_FAILED",
+        data: {
+          sequence: 2,
+          payload: {
+            stage: "EXECUTE",
+            code: "SANDBOX_FAILED",
+            message: "Failed to create Docker sandbox.",
+          },
+        },
+      },
+      { event: "stream-end", data: { status: "FAILED", lastSequence: 2 } },
+    ]);
+
+    const replayMessages = await readSse(
+      await fetch(`${baseUrl}/runs/${RUN_ID}/events/stream?afterSequence=0`),
+    );
+    expect(replayMessages.map((message) => message.event)).toEqual([
+      "STEP_COMPLETED",
+      "RUN_FAILED",
+      "stream-end",
+    ]);
+    expect(replayMessages.at(1)).toMatchObject({
+      id: "2",
+      data: { sequence: 2, payload: { code: "SANDBOX_FAILED" } },
+    });
+  });
 });
 
 class FakeDatabase implements DatabaseAdapter {
@@ -248,6 +288,25 @@ function event(sequence: number): AgentEvent {
     type: sequence === 4 ? "RUN_COMPLETED" : "STEP_COMPLETED",
     level: "INFO",
     payload: { sequence },
+  };
+}
+
+function failureEvent(sequence: number): AgentEvent {
+  return {
+    schemaVersion: 1,
+    eventId: `00000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+    runId: RUN_ID,
+    sequence,
+    occurredAt: "2026-09-19T00:00:00.000Z",
+    type: "RUN_FAILED",
+    level: "ERROR",
+    payload: {
+      status: "FAILED",
+      stage: "EXECUTE",
+      terminalStage: "FAILED",
+      code: "SANDBOX_FAILED",
+      message: "Failed to create Docker sandbox.",
+    },
   };
 }
 

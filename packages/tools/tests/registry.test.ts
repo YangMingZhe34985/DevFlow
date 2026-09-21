@@ -28,6 +28,9 @@ describe("ToolRegistry", () => {
         inputSchema: tool.inputSchema,
         permission: "READ",
         timeoutMs: 1_000,
+        readOnly: true,
+        parallelSafe: true,
+        mutatesWorkspace: false,
       },
     ]);
   });

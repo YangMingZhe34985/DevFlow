@@ -14,7 +14,11 @@ const ALLOWED_TRANSITIONS: Readonly<Record<WorkflowStage, readonly WorkflowStage
   TEST: ["FIX", "REVIEW", "CANCELLED", "FAILED"],
   FIX: ["TEST", "CANCELLED", "FAILED"],
   REVIEW: ["FIX", "GENERATE_DIFF", "CANCELLED", "FAILED"],
-  GENERATE_DIFF: ["DONE", "CANCELLED", "FAILED"],
+  GENERATE_DIFF: ["WAITING_PUSH_APPROVAL", "DONE", "CANCELLED", "FAILED"],
+  WAITING_PUSH_APPROVAL: ["PUSH", "CANCELLED", "FAILED"],
+  PUSH: ["WAITING_PR_APPROVAL", "CANCELLED", "FAILED"],
+  WAITING_PR_APPROVAL: ["CREATE_PR", "CANCELLED", "FAILED"],
+  CREATE_PR: ["DONE", "CANCELLED", "FAILED"],
   DONE: [],
   FAILED: [],
   CANCELLED: [],
@@ -39,7 +43,7 @@ export function transitionStage(state: WorkflowState, stage: WorkflowStage): Wor
         ? "FAILED"
         : stage === "CANCELLED"
           ? "CANCELLED"
-          : stage === "WAITING_APPROVAL"
+          : ["WAITING_APPROVAL", "WAITING_PUSH_APPROVAL", "WAITING_PR_APPROVAL"].includes(stage)
             ? "WAITING_APPROVAL"
             : "RUNNING";
 

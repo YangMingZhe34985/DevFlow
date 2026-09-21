@@ -1,0 +1,8 @@
+{
+  "name": "devflow-benchmark-adversarial-test-tamper",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/public.test.mjs"
+  }
+}

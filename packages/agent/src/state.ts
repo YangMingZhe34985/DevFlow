@@ -54,6 +54,11 @@ const ModelMessageSchema = z.discriminatedUnion("role", [
 export const AgentStateMetricsSchema = z.object({
   modelCalls: z.number().int().nonnegative(),
   toolCalls: z.number().int().nonnegative(),
+  toolExecutions: z.number().int().nonnegative().default(0),
+  cacheHits: z.number().int().nonnegative().default(0),
+  duplicateToolCalls: z.number().int().nonnegative().default(0),
+  stalledDetections: z.number().int().nonnegative().default(0),
+  reasoningTokens: z.number().int().nonnegative().default(0),
   retries: z.number().int().nonnegative(),
   modelLatencyMs: z.number().int().nonnegative(),
   toolLatencyMs: z.number().int().nonnegative(),
@@ -62,10 +67,26 @@ export const AgentStateMetricsSchema = z.object({
 export interface AgentStateMetrics {
   modelCalls: number;
   toolCalls: number;
+  toolExecutions: number;
+  cacheHits: number;
+  duplicateToolCalls: number;
+  stalledDetections: number;
+  reasoningTokens: number;
   retries: number;
   modelLatencyMs: number;
   toolLatencyMs: number;
   tokenUsage: TokenUsage;
+}
+
+export const AdaptiveStepBudgetStateSchema = z.object({
+  currentLimit: z.number().int().positive(),
+  hardLimit: z.number().int().positive(),
+  extensions: z.number().int().nonnegative(),
+});
+export interface AdaptiveStepBudgetState {
+  currentLimit: number;
+  hardLimit: number;
+  extensions: number;
 }
 
 export const AgentStateSchema = z.object({
@@ -77,6 +98,8 @@ export const AgentStateSchema = z.object({
   metrics: AgentStateMetricsSchema,
   startedAt: z.string().datetime({ offset: true }),
   updatedAt: z.string().datetime({ offset: true }),
+  /** Optional so schema-version 1 checkpoints written before adaptive leases remain valid. */
+  adaptiveStepBudget: AdaptiveStepBudgetStateSchema.optional(),
   plan: AgentPlanSchema.optional(),
   lastError: DevflowErrorShapeSchema.optional(),
   finalResult: RunResultSchema.optional(),
@@ -90,6 +113,7 @@ export interface AgentState {
   metrics: AgentStateMetrics;
   startedAt: string;
   updatedAt: string;
+  adaptiveStepBudget?: AdaptiveStepBudgetState;
   plan?: AgentPlan;
   lastError?: DevflowErrorShape;
   finalResult?: RunResult;
@@ -238,6 +262,11 @@ export function createInitialAgentState(
     metrics: {
       modelCalls: 0,
       toolCalls: 0,
+      toolExecutions: 0,
+      cacheHits: 0,
+      duplicateToolCalls: 0,
+      stalledDetections: 0,
+      reasoningTokens: 0,
       retries: 0,
       modelLatencyMs: 0,
       toolLatencyMs: 0,

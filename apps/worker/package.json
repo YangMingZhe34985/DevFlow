@@ -6,6 +6,8 @@
   "main": "./dist/main.js",
   "scripts": {
     "dev": "node --watch --watch-preserve-output --enable-source-maps dist/main.js",
+    "benchmark": "tsx src/benchmark-main.ts",
+    "benchmark:efficiency": "tsx src/benchmark-main.ts --efficiency",
     "build": "tsc -b",
     "start": "node --enable-source-maps dist/main.js",
     "clean": "rimraf dist",
@@ -15,7 +17,9 @@
   "dependencies": {
     "@devflow/agent": "0.1.0",
     "@devflow/database": "0.1.0",
+    "@devflow/eval": "0.1.0",
     "@devflow/git": "0.1.0",
+    "@devflow/github": "0.1.0",
     "@devflow/sandbox": "0.1.0",
     "@devflow/shared": "0.1.0",
     "@devflow/tools": "0.1.0",

@@ -11,6 +11,7 @@ export default defineConfig({
       ),
       "@devflow/eval": fileURLToPath(new URL("./packages/eval/src/index.ts", import.meta.url)),
       "@devflow/git": fileURLToPath(new URL("./packages/git/src/index.ts", import.meta.url)),
+      "@devflow/github": fileURLToPath(new URL("./packages/github/src/index.ts", import.meta.url)),
       "@devflow/sandbox": fileURLToPath(
         new URL("./packages/sandbox/src/index.ts", import.meta.url),
       ),

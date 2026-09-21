@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 .next/
+.next-*/
 coverage/
 *.tsbuildinfo
 playwright-report/
@@ -26,3 +27,5 @@ Thumbs.db
 .vscode/*
 !.vscode/extensions.json
 !.vscode/settings.json
+
+codex.md

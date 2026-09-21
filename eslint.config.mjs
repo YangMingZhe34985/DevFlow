@@ -6,9 +6,13 @@ export default tseslint.config(
     ignores: [
       "**/dist/**",
       "**/.next/**",
+      "**/.next-*/**",
       "**/coverage/**",
       "**/node_modules/**",
       "packages/database/src/generated/**",
+      // Versioned P11 fixture programs are intentionally tiny external inputs,
+      // not production source governed by this repository's lint globals.
+      "tests/fixtures/benchmarks/**",
     ],
   },
   eslint.configs.recommended,

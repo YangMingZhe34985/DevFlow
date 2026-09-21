@@ -1,6 +1,7 @@
 node_modules
 dist
 .next
+.next-*
 coverage
 package-lock.json
 项目说明.md

@@ -1,0 +1,8 @@
+{
+  "name": "devflow-benchmark-repair-loop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/public.test.mjs"
+  }
+}

@@ -1,9 +1,7 @@
 import { spawn } from "node:child_process";
-import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-import { DevflowError, toDevflowError } from "@devflow/shared";
+import { assertCredentialFreeRepositoryUri, DevflowError, toDevflowError } from "@devflow/shared";
 
 import {
   CommandSpecSchema,
@@ -14,6 +12,7 @@ import {
   type CommandSpec,
   type ListFilesRequest,
   type ListFilesResult,
+  type LocalRepositorySnapshot,
   type ReadFileRequest,
   type ReadFileResult,
   type SandboxCreateOptions,
@@ -22,6 +21,10 @@ import {
   type WriteFileRequest,
   type WriteFileResult,
 } from "./contracts.js";
+import {
+  captureLocalRepositorySnapshot,
+  validateSnapshotIntegrity,
+} from "./local-repository-snapshot.js";
 
 const DEFAULT_DOCKER_OUTPUT_BYTES = 1_000_000;
 const DEFAULT_COMMAND_OUTPUT_BYTES = 200_000;
@@ -54,9 +57,9 @@ export interface DockerCommandRunner {
   run(args: readonly string[], options?: DockerCommandOptions): Promise<DockerCommandResult>;
 }
 
-interface LocalRepository {
-  kind: "COPY";
-  path: string;
+interface SnapshotRepository {
+  kind: "SNAPSHOT";
+  snapshot: LocalRepositorySnapshot;
 }
 
 interface RemoteRepository {
@@ -64,7 +67,7 @@ interface RemoteRepository {
   uri: string;
 }
 
-type ResolvedRepository = LocalRepository | RemoteRepository;
+type ResolvedRepository = SnapshotRepository | RemoteRepository;
 
 export class NodeDockerCommandRunner implements DockerCommandRunner {
   async run(
@@ -164,7 +167,7 @@ export class DockerSandboxManager implements SandboxManager {
     }
     validateEnvironment(parsed.data.environment);
     validateGitReference(parsed.data.repository.baseRef);
-    const repository = await this.resolveRepository(parsed.data.repository.sourceUri);
+    const repository = await this.resolveRepository(parsed.data.repository, signal);
     if (repository.kind === "CLONE" && !parsed.data.limits.networkEnabled) {
       throw new DevflowError({
         code: "PERMISSION_DENIED",
@@ -203,34 +206,18 @@ export class DockerSandboxManager implements SandboxManager {
     appendEnvironment(createArgs, parsed.data.environment);
     createArgs.push(this.options.image, "sleep", "infinity");
 
-    let created = false;
     try {
       ensureDockerSuccess(
         await this.runner.run(createArgs, dockerSignal(signal)),
         "create sandbox",
       );
-      created = true;
       ensureDockerSuccess(
         await this.runner.run(["start", containerName], dockerSignal(signal)),
         "start sandbox",
       );
 
-      if (repository.kind === "COPY") {
-        const copySource = repository.path + path.sep + ".";
-        ensureDockerSuccess(
-          await this.runner.run(
-            ["cp", copySource, containerName + ":/workspace"],
-            dockerSignal(signal),
-          ),
-          "copy repository into sandbox",
-        );
-        ensureDockerSuccess(
-          await this.runner.run(
-            ["exec", "--user", "0:0", containerName, "chown", "-R", "10001:10001", "/workspace"],
-            dockerSignal(signal),
-          ),
-          "prepare sandbox workspace",
-        );
+      if (repository.kind === "SNAPSHOT") {
+        await restoreLocalSnapshot(this.runner, containerName, repository.snapshot, signal);
       } else {
         const cloneArgs = ["exec", "--user", "10001:10001", containerName, "git", "clone"];
         if (parsed.data.repository.baseRef !== undefined) {
@@ -243,9 +230,9 @@ export class DockerSandboxManager implements SandboxManager {
         );
       }
 
-      const revision =
-        parsed.data.repository.baseCommit ??
-        (repository.kind === "COPY" ? parsed.data.repository.baseRef : undefined);
+      // LOCAL snapshots are already fixed to the captured effective working tree.
+      // Only remote clones are checked out to a requested immutable revision.
+      const revision = repository.kind === "CLONE" ? parsed.data.repository.baseCommit : undefined;
       if (revision !== undefined) {
         ensureDockerSuccess(
           await this.runner.run(
@@ -276,9 +263,10 @@ export class DockerSandboxManager implements SandboxManager {
       this.sessions.set(containerName, session);
       return session;
     } catch (error) {
-      if (created) {
-        await removeContainer(this.runner, containerName).catch(() => undefined);
-      }
+      // `docker create` can produce the container and still surface an abort or
+      // transport error to the client. The deterministic name makes an
+      // unconditional best-effort cleanup both safe and idempotent.
+      await removeContainer(this.runner, containerName).catch(() => undefined);
       throw toDevflowError(error, {
         code: "SANDBOX_FAILED",
         message: "Failed to create Docker sandbox.",
@@ -295,45 +283,33 @@ export class DockerSandboxManager implements SandboxManager {
     await removeContainer(this.runner, sandboxId);
   }
 
-  private async resolveRepository(sourceUri: string): Promise<ResolvedRepository> {
-    if (isRemoteRepository(sourceUri)) return { kind: "CLONE", uri: sourceUri };
-
-    let sourcePath: string;
-    try {
-      sourcePath = sourceUri.startsWith("file:") ? fileURLToPath(sourceUri) : sourceUri;
-    } catch (error) {
-      throw new DevflowError({
-        code: "VALIDATION_ERROR",
-        message: "Repository file URI is invalid.",
-        cause: error,
-      });
+  private async resolveRepository(
+    repository: SandboxCreateOptions["repository"],
+    signal?: AbortSignal,
+  ): Promise<ResolvedRepository> {
+    if (repository.snapshot !== undefined) {
+      if (isRemoteRepository(repository.sourceUri)) {
+        throw new DevflowError({
+          code: "VALIDATION_ERROR",
+          message: "A LOCAL snapshot cannot be used with a remote repository URI.",
+        });
+      }
+      return { kind: "SNAPSHOT", snapshot: validateSnapshotIntegrity(repository.snapshot) };
     }
-
-    const repositoryPath = await realpath(path.resolve(sourcePath)).catch(() => undefined);
-    const allowedRoot = await realpath(path.resolve(this.options.workspaceRoot)).catch(
-      () => undefined,
-    );
-    if (repositoryPath === undefined || allowedRoot === undefined) {
-      throw new DevflowError({
-        code: "NOT_FOUND",
-        message: "Repository directory or configured workspace root does not exist.",
-      });
+    if (isRemoteRepository(repository.sourceUri)) {
+      assertCredentialFreeRepositoryUri(repository.sourceUri);
+      return { kind: "CLONE", uri: repository.sourceUri };
     }
-    const relative = path.relative(allowedRoot, repositoryPath);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new DevflowError({
-        code: "PERMISSION_DENIED",
-        message: "Repository source resolves outside the configured workspace root.",
-      });
-    }
-    const sourceStat = await stat(repositoryPath).catch(() => undefined);
-    if (sourceStat?.isDirectory() !== true) {
-      throw new DevflowError({
-        code: "NOT_FOUND",
-        message: "Repository directory does not exist: " + repositoryPath,
-      });
-    }
-    return { kind: "COPY", path: repositoryPath };
+    return {
+      kind: "SNAPSHOT",
+      snapshot: await captureLocalRepositorySnapshot({
+        sourceUri: repository.sourceUri,
+        workspaceRoot: this.options.workspaceRoot,
+        ...(repository.baseRef === undefined ? {} : { baseRef: repository.baseRef }),
+        ...(repository.baseCommit === undefined ? {} : { baseCommit: repository.baseCommit }),
+        ...(signal === undefined ? {} : { signal }),
+      }),
+    };
   }
 }
 
@@ -540,6 +516,85 @@ class DockerSandboxSession implements SandboxSession {
   }
 }
 
+async function restoreLocalSnapshot(
+  runner: DockerCommandRunner,
+  containerName: string,
+  snapshot: LocalRepositorySnapshot,
+  signal?: AbortSignal,
+): Promise<void> {
+  ensureDockerSuccess(
+    await runner.run(
+      [
+        "exec",
+        "--interactive",
+        "--user",
+        "10001:10001",
+        containerName,
+        "node",
+        "-e",
+        RESTORE_LOCAL_SNAPSHOT_SCRIPT,
+      ],
+      {
+        ...dockerSignal(signal),
+        stdin: JSON.stringify(snapshot),
+        maxOutputBytes: 100_000,
+      },
+    ),
+    "restore LOCAL repository snapshot",
+  );
+  ensureDockerSuccess(
+    await runner.run(
+      [
+        "exec",
+        "--user",
+        "10001:10001",
+        containerName,
+        "git",
+        "init",
+        "--initial-branch=devflow-snapshot",
+        "/workspace",
+      ],
+      dockerSignal(signal),
+    ),
+    "initialize LOCAL snapshot repository",
+  );
+  ensureDockerSuccess(
+    await runner.run(
+      ["exec", "--user", "10001:10001", containerName, "git", "-C", "/workspace", "add", "--all"],
+      dockerSignal(signal),
+    ),
+    "stage LOCAL snapshot baseline",
+  );
+  ensureDockerSuccess(
+    await runner.run(
+      [
+        "exec",
+        "--user",
+        "10001:10001",
+        "--env",
+        "GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
+        "--env",
+        "GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
+        containerName,
+        "git",
+        "-C",
+        "/workspace",
+        "-c",
+        "user.name=DevFlow Snapshot",
+        "-c",
+        "user.email=snapshot@devflow.invalid",
+        "commit",
+        "--allow-empty",
+        "--no-gpg-sign",
+        "-m",
+        `DevFlow LOCAL snapshot of ${snapshot.sourceHead}`,
+      ],
+      dockerSignal(signal),
+    ),
+    "commit LOCAL snapshot baseline",
+  );
+}
+
 async function removeContainer(runner: DockerCommandRunner, containerId: string): Promise<void> {
   const result = await runner.run(["rm", "--force", containerId]);
   if (result.exitCode !== 0 && !result.stderr.includes("No such container")) {
@@ -673,6 +728,27 @@ function isRemoteRepository(sourceUri: string): boolean {
     /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:.+/u.test(sourceUri)
   );
 }
+
+const RESTORE_LOCAL_SNAPSHOT_SCRIPT = [
+  'const fs = require("node:fs");',
+  'const path = require("node:path");',
+  'const root = "/workspace";',
+  'const snapshot = JSON.parse(fs.readFileSync(0, "utf8"));',
+  "for (const entry of snapshot.files) {",
+  '  const requested = String(entry.path).replaceAll("\\\\", "/");',
+  '  const segments = requested.split("/");',
+  '  if (!requested || path.posix.isAbsolute(requested) || segments.includes("..") || segments.includes(".git")) throw new Error("unsafe snapshot path");',
+  "  const destination = path.resolve(root, ...segments);",
+  '  if (!destination.startsWith(root + path.sep)) throw new Error("snapshot path escaped workspace");',
+  "  fs.mkdirSync(path.dirname(destination), { recursive: true });",
+  '  if (entry.kind === "FILE") {',
+  '    fs.writeFileSync(destination, Buffer.from(entry.contentBase64, "base64"), { mode: entry.mode });',
+  "    fs.chmodSync(destination, entry.mode);",
+  '  } else if (entry.kind === "SYMLINK") {',
+  "    fs.symlinkSync(entry.target, destination);",
+  '  } else throw new Error("unsupported snapshot entry");',
+  "}",
+].join("\n");
 
 const WORKSPACE_GUARD_SCRIPT = [
   'const fs = require("node:fs");',

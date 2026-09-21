@@ -4,14 +4,12 @@ import { DevflowError, toDevflowError, type JsonValue } from "@devflow/shared";
 
 import type {
   ToolContext,
-  ToolDefinition,
-  ToolDescriptor,
   ToolExecutionRequest,
   ToolExecutionResult,
   ToolExecutor,
 } from "./contracts.js";
 import type { ToolPolicy, ToolPolicyDecision } from "./policy.js";
-import type { ToolRegistry } from "./registry.js";
+import { describeTool, type ToolRegistry } from "./registry.js";
 
 export class UnimplementedToolExecutor implements ToolExecutor {
   async execute(
@@ -61,7 +59,7 @@ export class DefaultToolExecutor implements ToolExecutor {
       return result;
     }
 
-    const descriptor = describe(tool);
+    const descriptor = describeTool(tool);
     await context.emit({
       runId: context.runId,
       stepId: context.stepId,
@@ -164,16 +162,6 @@ export class DefaultToolExecutor implements ToolExecutor {
       return result;
     }
   }
-}
-
-function describe(tool: ToolDefinition): ToolDescriptor {
-  return {
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
-    permission: tool.permission,
-    timeoutMs: tool.timeoutMs,
-  };
 }
 
 async function emitResult(

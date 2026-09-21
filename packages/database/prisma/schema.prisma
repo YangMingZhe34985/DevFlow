@@ -41,6 +41,10 @@ enum WorkflowStage {
   FIX
   REVIEW
   GENERATE_DIFF
+  WAITING_PUSH_APPROVAL
+  PUSH
+  WAITING_PR_APPROVAL
+  CREATE_PR
   DONE
   FAILED
   CANCELLED
@@ -79,6 +83,7 @@ enum ArtifactKind {
   DIFF
   TEST_REPORT
   REVIEW_REPORT
+  GITHUB_CHANGESET
   LOG
   OTHER
 }
@@ -86,6 +91,8 @@ enum ArtifactKind {
 enum ApprovalKind {
   PLAN
   TOOL_CALL
+  GITHUB_PUSH
+  GITHUB_PULL_REQUEST
 }
 
 enum ApprovalStatus {
@@ -94,6 +101,15 @@ enum ApprovalStatus {
   REJECTED
   CANCELLED
   EXPIRED
+}
+
+enum BenchmarkExecutionStatus {
+  QUEUED
+  RUNNING
+  EVALUATING
+  SUCCEEDED
+  FAILED
+  INTERRUPTED
 }
 
 model Repository {
@@ -110,70 +126,145 @@ model Repository {
 }
 
 model Task {
-  id           String     @id @default(uuid()) @db.Uuid
-  repositoryId String     @db.Uuid
-  title        String
-  description  String     @db.Text
-  status       TaskStatus @default(OPEN)
-  baseRef      String?
-  baseCommit   String?
-  createdAt    DateTime   @default(now()) @db.Timestamptz(3)
-  updatedAt    DateTime   @updatedAt @db.Timestamptz(3)
-  repository   Repository @relation(fields: [repositoryId], references: [id], onDelete: Restrict)
-  runs         Run[]
+  id            String     @id @default(uuid()) @db.Uuid
+  repositoryId  String     @db.Uuid
+  title         String
+  description   String     @db.Text
+  status        TaskStatus @default(OPEN)
+  baseRef       String?
+  baseCommitSha String?    @map("baseCommit")
+  createdAt     DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt     DateTime   @updatedAt @db.Timestamptz(3)
+  repository    Repository @relation(fields: [repositoryId], references: [id], onDelete: Restrict)
+  runs          Run[]
 
   @@index([repositoryId, createdAt])
   @@index([status])
 }
 
 model Run {
-  id                String        @id @default(uuid()) @db.Uuid
-  taskId            String        @db.Uuid
-  idempotencyKey    String?       @unique
-  status            RunStatus     @default(QUEUED)
-  currentStage      WorkflowStage @default(START)
-  baseCommit        String?
-  modelProvider     String?
-  modelName         String?
-  modelConfig       Json?
-  maxSteps          Int           @default(25)
-  maxTestRetries    Int           @default(3)
-  maxReviewRetries  Int           @default(1)
-  dispatchRevision  Int           @default(0)
-  stepCount         Int           @default(0)
-  retryCount        Int           @default(0)
-  modelCallCount    Int           @default(0)
-  toolCallCount     Int           @default(0)
-  durationMs        Int           @default(0)
-  modelLatencyMs    Int           @default(0)
-  toolLatencyMs     Int           @default(0)
-  inputTokens       Int           @default(0)
-  outputTokens      Int           @default(0)
-  totalTokens       Int           @default(0)
-  costUsd           Decimal?      @db.Decimal(18, 8)
-  startedAt         DateTime?     @db.Timestamptz(3)
-  finishedAt        DateTime?     @db.Timestamptz(3)
-  failureCode       String?
-  failureMessage    String?       @db.Text
-  failureDetails    Json?
-  summary           String?       @db.Text
-  executionOwner    String?
-  leaseExpiresAt    DateTime?     @db.Timestamptz(3)
-  cancelRequestedAt DateTime?     @db.Timestamptz(3)
-  nextEventSequence Int           @default(0)
-  metadata          Json?
-  createdAt         DateTime      @default(now()) @db.Timestamptz(3)
-  updatedAt         DateTime      @updatedAt @db.Timestamptz(3)
-  task              Task          @relation(fields: [taskId], references: [id], onDelete: Restrict)
-  steps             Step[]
-  toolCalls         ToolCall[]
-  events            Event[]
-  artifacts         Artifact[]
-  approvals         Approval[]
+  id                 String                  @id @default(uuid()) @db.Uuid
+  taskId             String                  @db.Uuid
+  idempotencyKey     String?                 @unique
+  status             RunStatus               @default(QUEUED)
+  currentStage       WorkflowStage           @default(START)
+  baseCommit         String?
+  modelProvider      String?
+  modelName          String?
+  modelConfig        Json?
+  maxSteps           Int                     @default(25)
+  maxTestRetries     Int                     @default(3)
+  maxReviewRetries   Int                     @default(1)
+  dispatchRevision   Int                     @default(0)
+  stepCount          Int                     @default(0)
+  retryCount         Int                     @default(0)
+  modelCallCount     Int                     @default(0)
+  toolCallCount      Int                     @default(0)
+  durationMs         Int                     @default(0)
+  modelLatencyMs     Int                     @default(0)
+  toolLatencyMs      Int                     @default(0)
+  inputTokens        Int                     @default(0)
+  outputTokens       Int                     @default(0)
+  totalTokens        Int                     @default(0)
+  costUsd            Decimal?                @db.Decimal(18, 8)
+  metricsDetail      Json?
+  startedAt          DateTime?               @db.Timestamptz(3)
+  finishedAt         DateTime?               @db.Timestamptz(3)
+  failureCode        String?
+  failureMessage     String?                 @db.Text
+  failureDetails     Json?
+  summary            String?                 @db.Text
+  executionOwner     String?
+  leaseExpiresAt     DateTime?               @db.Timestamptz(3)
+  cancelRequestedAt  DateTime?               @db.Timestamptz(3)
+  nextEventSequence  Int                     @default(0)
+  metadata           Json?
+  createdAt          DateTime                @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime                @updatedAt @db.Timestamptz(3)
+  task               Task                    @relation(fields: [taskId], references: [id], onDelete: Restrict)
+  steps              Step[]
+  toolCalls          ToolCall[]
+  events             Event[]
+  artifacts          Artifact[]
+  approvals          Approval[]
+  githubPublication  GitHubPublication?
+  benchmarkExecution BenchmarkCaseExecution?
 
   @@index([taskId, createdAt])
   @@index([status, createdAt])
   @@index([status, leaseExpiresAt])
+}
+
+model BenchmarkSuiteExecution {
+  id             String                   @id @db.Uuid
+  suiteId        String
+  suiteVersion   String
+  status         BenchmarkExecutionStatus @default(RUNNING)
+  profile        Json
+  pricingVersion String
+  metrics        Json?
+  result         Json?
+  failure        Json?
+  startedAt      DateTime                 @default(now()) @db.Timestamptz(3)
+  finishedAt     DateTime?                @db.Timestamptz(3)
+  updatedAt      DateTime                 @updatedAt @db.Timestamptz(3)
+  cases          BenchmarkCaseExecution[]
+
+  @@index([suiteId, suiteVersion, startedAt])
+  @@index([status, updatedAt])
+}
+
+model BenchmarkCaseExecution {
+  id               String                   @id @db.Uuid
+  suiteExecutionId String?                  @db.Uuid
+  suiteId          String
+  suiteVersion     String
+  caseId           String
+  caseVersion      String
+  status           BenchmarkExecutionStatus @default(QUEUED)
+  runId            String?                  @unique @db.Uuid
+  definitionDigest String
+  definition       Json
+  profile          Json
+  observation      Json?
+  metrics          Json?
+  provenance       Json?
+  result           Json?
+  failure          Json?
+  startedAt        DateTime                 @default(now()) @db.Timestamptz(3)
+  finishedAt       DateTime?                @db.Timestamptz(3)
+  updatedAt        DateTime                 @updatedAt @db.Timestamptz(3)
+  suiteExecution   BenchmarkSuiteExecution? @relation(fields: [suiteExecutionId], references: [id], onDelete: SetNull)
+  run              Run?                     @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@index([suiteId, caseId, startedAt])
+  @@index([suiteExecutionId, startedAt])
+  @@index([status, updatedAt])
+}
+
+model GitHubPublication {
+  id                      String   @id @default(uuid()) @db.Uuid
+  runId                   String   @unique @db.Uuid
+  provider                String   @default("GITHUB")
+  repositoryOwner         String
+  repositoryName          String
+  baseCommit              String
+  baseBranch              String
+  branchName              String
+  pushOperationKey        String   @unique
+  changesArtifactId       String?  @db.Uuid
+  commitSha               String?
+  branchUrl               String?
+  pullRequestOperationKey String?  @unique
+  pullRequestNumber       Int?
+  pullRequestUrl          String?
+  pullRequestState        String?
+  createdAt               DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt               DateTime @updatedAt @db.Timestamptz(3)
+  run                     Run      @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@unique([repositoryOwner, repositoryName, branchName])
+  @@index([repositoryOwner, repositoryName, createdAt])
 }
 
 model Step {

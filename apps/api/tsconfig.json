@@ -9,7 +9,12 @@
     "emitDecoratorMetadata": true,
     "useDefineForClassFields": false
   },
-  "references": [{ "path": "../../packages/shared" }, { "path": "../../packages/database" }],
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/github" },
+    { "path": "../../packages/database" },
+    { "path": "../../packages/sandbox" }
+  ],
   "include": ["src/**/*.ts"],
   "exclude": ["dist", "tests"]
 }

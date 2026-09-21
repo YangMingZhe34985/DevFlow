@@ -15,6 +15,7 @@ import {
   listTasks,
   resolveApproval,
 } from "../lib/api";
+import { projectTerminalRun } from "../lib/run-view";
 import type {
   ApprovalRecord,
   RepositoryRecord,
@@ -27,9 +28,10 @@ import { RunDetail as RunDetailView } from "./run-detail";
 
 interface DevflowWorkbenchProps {
   initialRunId?: string;
+  acceptanceMode?: boolean;
 }
 
-export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
+export function DevflowWorkbench({ initialRunId, acceptanceMode = false }: DevflowWorkbenchProps) {
   const router = useRouter();
   const [repositories, setRepositories] = useState<readonly RepositoryRecord[]>([]);
   const [tasks, setTasks] = useState<readonly TaskRecord[]>([]);
@@ -42,6 +44,7 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
   const [detailLoading, setDetailLoading] = useState(initialRunId !== undefined);
   const [busyAction, setBusyAction] = useState<string>();
   const [error, setError] = useState<string>();
+  const [setupSection, setSetupSection] = useState<"repository" | "task" | "run">("repository");
 
   const refreshCatalog = useCallback(async () => {
     try {
@@ -142,6 +145,13 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
     eventStream.events.length === 0
       ? undefined
       : eventStream.events[eventStream.events.length - 1]?.sequence;
+  const visibleDetail = useMemo(
+    () =>
+      detail === undefined
+        ? undefined
+        : { ...detail, run: projectTerminalRun(detail.run, eventStream.events) },
+    [detail, eventStream.events],
+  );
 
   useEffect(() => {
     if (selectedRunId === "" || latestSequence === undefined) return;
@@ -216,16 +226,25 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
           <strong>DevFlow</strong>
         </button>
         <p>Task → Plan → Approval → Execute → Test / Repair → Review → Result</p>
-        <button
-          className="button button--quiet"
-          type="button"
-          onClick={() => {
-            setCatalogLoading(true);
-            void refreshCatalog();
-          }}
-        >
-          刷新列表
-        </button>
+        <div className="topbar-actions">
+          <button
+            className={`button button--quiet ${acceptanceMode ? "button--active" : ""}`}
+            type="button"
+            onClick={() => router.push(acceptanceMode ? "/" : "/acceptance")}
+          >
+            {acceptanceMode ? "退出验收" : "Web 验收"}
+          </button>
+          <button
+            className="button button--quiet"
+            type="button"
+            onClick={() => {
+              setCatalogLoading(true);
+              void refreshCatalog();
+            }}
+          >
+            刷新列表
+          </button>
+        </div>
       </header>
 
       {error !== undefined && (
@@ -247,17 +266,27 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
 
           <RepositoryForm
             busy={busyAction === "create-repository"}
+            open={setupSection === "repository"}
+            complete={selectedRepositoryId !== ""}
+            summary={repositories.find((item) => item.id === selectedRepositoryId)?.name}
+            onOpen={() => setSetupSection("repository")}
             onCreated={(repository) => {
               setRepositories((current) => [...current, repository]);
               setSelectedRepositoryId(repository.id);
               setSelectedTaskId("");
+              setSetupSection("task");
             }}
             onError={setError}
             onBusy={setBusyAction}
           />
 
           <TaskForm
+            key={selectedRepositoryId}
             busy={busyAction === "create-task"}
+            open={setupSection === "task"}
+            complete={selectedTaskId !== ""}
+            summary={tasks.find((item) => item.id === selectedTaskId)?.title}
+            onOpen={() => setSetupSection("task")}
             repositories={repositories}
             selectedRepositoryId={selectedRepositoryId}
             onRepositoryChange={(repositoryId) => {
@@ -267,6 +296,7 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
             onCreated={(task) => {
               setTasks((current) => [...current, task]);
               setSelectedTaskId(task.id);
+              setSetupSection("run");
             }}
             onError={setError}
             onBusy={setBusyAction}
@@ -274,6 +304,10 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
 
           <RunForm
             busy={busyAction === "create-run"}
+            open={setupSection === "run"}
+            complete={selectedRunId !== ""}
+            summary={selectedRunId === "" ? undefined : shortId(selectedRunId)}
+            onOpen={() => setSetupSection("run")}
             tasks={repositoryTasks}
             selectedTaskId={selectedTaskId}
             onTaskChange={setSelectedTaskId}
@@ -317,13 +351,21 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
         </aside>
 
         <div className="content">
-          {detailLoading && detail?.run.id !== selectedRunId ? (
+          {acceptanceMode && (
+            <AcceptanceGuide
+              repositories={repositories}
+              tasks={tasks}
+              runs={runs}
+              {...(visibleDetail === undefined ? {} : { detail: visibleDetail })}
+            />
+          )}
+          {detailLoading && visibleDetail?.run.id !== selectedRunId ? (
             <div className="panel loading-panel" role="status">
               正在载入 Run detail…
             </div>
-          ) : detail !== undefined && detail.run.id === selectedRunId ? (
+          ) : visibleDetail !== undefined && visibleDetail.run.id === selectedRunId ? (
             <RunDetailView
-              detail={detail}
+              detail={visibleDetail}
               events={eventStream.events}
               streamState={eventStream.state}
               {...(eventStream.error === undefined ? {} : { streamError: eventStream.error })}
@@ -346,22 +388,133 @@ export function DevflowWorkbench({ initialRunId }: DevflowWorkbenchProps) {
   );
 }
 
+function AcceptanceGuide({
+  repositories,
+  tasks,
+  runs,
+  detail,
+}: {
+  repositories: readonly RepositoryRecord[];
+  tasks: readonly TaskRecord[];
+  runs: readonly RunRecord[];
+  detail?: RunDetail;
+}) {
+  const planApproved = detail?.approvals.some(
+    (approval) => approval.kind === "PLAN" && approval.status === "APPROVED",
+  );
+  const pushApproved = detail?.approvals.some(
+    (approval) => approval.kind === "GITHUB_PUSH" && approval.status === "APPROVED",
+  );
+  const pullRequestApproved = detail?.approvals.some(
+    (approval) => approval.kind === "GITHUB_PULL_REQUEST" && approval.status === "APPROVED",
+  );
+  const terminal =
+    detail !== undefined &&
+    ["SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(detail.run.status);
+  const gitRun = detail?.repository.sourceKind === "GIT";
+  const steps = [
+    { label: "创建 Repository", done: repositories.length > 0 },
+    { label: "创建 Task", done: tasks.length > 0 },
+    { label: "启动 Run", done: runs.length > 0 },
+    { label: "审阅并批准 Plan", done: planApproved === true },
+    {
+      label: gitRun ? "显式批准 Push" : "LOCAL Run 无需 Push",
+      done: gitRun ? pushApproved === true : detail !== undefined,
+    },
+    {
+      label: gitRun ? "显式批准 Pull Request" : "检查事件、Diff 与 Review",
+      done: gitRun ? pullRequestApproved === true : terminal,
+    },
+    { label: "确认终态与结果", done: terminal },
+  ];
+
+  return (
+    <section className="panel acceptance-guide" data-testid="acceptance-guide">
+      <div className="acceptance-heading">
+        <div>
+          <p className="section-kicker">P10–P11 acceptance</p>
+          <h1>Web 验收中心</h1>
+          <p>
+            使用左侧表单完成创建，在 Run Detail 中处理所有审批并观察实时事件；无需手写 API、SSE
+            或数据库命令。
+          </p>
+        </div>
+        <span className="status status--running">
+          {steps.filter((step) => step.done).length} / {steps.length}
+        </span>
+      </div>
+      <ol className="acceptance-checklist">
+        {steps.map((step, index) => (
+          <li
+            className={step.done ? "acceptance-step acceptance-step--done" : "acceptance-step"}
+            key={step.label}
+          >
+            <span>{step.done ? "✓" : index + 1}</span>
+            {step.label}
+          </li>
+        ))}
+      </ol>
+      <div className="acceptance-note">
+        <strong>P11 可信 Benchmark</strong>
+        <span>
+          隐藏 evaluator、超时和防篡改必须由自动化执行；只需运行一次 <code>npm run test:p11</code>
+          ，不再逐条手工拼命令。
+        </span>
+      </div>
+    </section>
+  );
+}
+
 interface FormControlProps {
   busy: boolean;
   onError(message: string | undefined): void;
   onBusy(action: string | undefined): void;
 }
 
+interface SetupCardProps {
+  open: boolean;
+  complete: boolean;
+  summary: string | undefined;
+  onOpen(): void;
+}
+
+function SetupSummary({
+  step,
+  title,
+  complete,
+  summary,
+}: {
+  step: number;
+  title: string;
+  complete: boolean;
+  summary: string | undefined;
+}) {
+  return (
+    <summary>
+      <span>{step}</span>
+      <span className="create-card-title">
+        <strong>{title}</strong>
+        {summary === undefined ? null : <small>{summary}</small>}
+      </span>
+      {complete && <span className="create-card-check">✓</span>}
+    </summary>
+  );
+}
+
 function RepositoryForm({
   busy,
+  open,
+  complete,
+  summary,
+  onOpen,
   onCreated,
   onError,
   onBusy,
-}: FormControlProps & { onCreated(repository: RepositoryRecord): void }) {
+}: FormControlProps & SetupCardProps & { onCreated(repository: RepositoryRecord): void }) {
   const [name, setName] = useState("");
   const [sourceKind, setSourceKind] = useState<RepositorySourceKind>("LOCAL");
   const [sourceUri, setSourceUri] = useState("");
-  const [defaultBranch, setDefaultBranch] = useState("main");
+  const [defaultBranch, setDefaultBranch] = useState("");
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -385,11 +538,15 @@ function RepositoryForm({
   };
 
   return (
-    <details className="create-card" open>
-      <summary>
-        <span>1</span>
-        Repository
-      </summary>
+    <details
+      className={`create-card ${complete ? "create-card--complete" : ""}`}
+      data-testid="setup-repository"
+      open={open}
+      onToggle={(event) => {
+        if (event.currentTarget.open) onOpen();
+      }}
+    >
+      <SetupSummary step={1} title="Repository" complete={complete} summary={summary} />
       <form data-testid="repository-form" onSubmit={(event) => void submit(event)}>
         <label>
           名称
@@ -404,7 +561,11 @@ function RepositoryForm({
           来源
           <select
             value={sourceKind}
-            onChange={(event) => setSourceKind(event.target.value as RepositorySourceKind)}
+            onChange={(event) => {
+              const nextSourceKind = event.target.value as RepositorySourceKind;
+              setSourceKind(nextSourceKind);
+              setDefaultBranch(nextSourceKind === "GIT" ? "main" : "");
+            }}
           >
             <option value="LOCAL">本地目录</option>
             <option value="GIT">Git URL</option>
@@ -423,9 +584,10 @@ function RepositoryForm({
           />
         </label>
         <label>
-          默认分支
+          默认分支（可选）
           <input
             maxLength={255}
+            placeholder={sourceKind === "LOCAL" ? "自动使用当前分支" : "main"}
             value={defaultBranch}
             onChange={(event) => setDefaultBranch(event.target.value)}
           />
@@ -440,22 +602,31 @@ function RepositoryForm({
 
 function TaskForm({
   busy,
+  open,
+  complete,
+  summary,
+  onOpen,
   repositories,
   selectedRepositoryId,
   onRepositoryChange,
   onCreated,
   onError,
   onBusy,
-}: FormControlProps & {
-  repositories: readonly RepositoryRecord[];
-  selectedRepositoryId: string;
-  onRepositoryChange(repositoryId: string): void;
-  onCreated(task: TaskRecord): void;
-}) {
+}: FormControlProps &
+  SetupCardProps & {
+    repositories: readonly RepositoryRecord[];
+    selectedRepositoryId: string;
+    onRepositoryChange(repositoryId: string): void;
+    onCreated(task: TaskRecord): void;
+  }) {
+  const selectedRepository = repositories.find(
+    (repository) => repository.id === selectedRepositoryId,
+  );
+  const suggestedBaseRef =
+    selectedRepository?.sourceKind === "GIT" ? (selectedRepository.defaultBranch ?? "main") : "";
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
-  const [baseRef, setBaseRef] = useState("main");
-  const [baseCommit, setBaseCommit] = useState("");
+  const [baseRef, setBaseRef] = useState(suggestedBaseRef);
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -467,12 +638,10 @@ function TaskForm({
         title: title.trim(),
         description: description.trim(),
         ...(baseRef.trim() === "" ? {} : { baseRef: baseRef.trim() }),
-        ...(baseCommit.trim() === "" ? {} : { baseCommit: baseCommit.trim() }),
       });
       onCreated(task);
       setTitle("");
       setDescription("");
-      setBaseCommit("");
       onError(undefined);
     } catch (submitError) {
       onError(toMessage(submitError));
@@ -482,11 +651,15 @@ function TaskForm({
   };
 
   return (
-    <details className="create-card" open>
-      <summary>
-        <span>2</span>
-        Task
-      </summary>
+    <details
+      className={`create-card ${complete ? "create-card--complete" : ""}`}
+      data-testid="setup-task"
+      open={open}
+      onToggle={(event) => {
+        if (event.currentTarget.open) onOpen();
+      }}
+    >
+      <SetupSummary step={2} title="Task" complete={complete} summary={summary} />
       <form data-testid="task-form" onSubmit={(event) => void submit(event)}>
         <label>
           Repository
@@ -522,25 +695,19 @@ function TaskForm({
             onChange={(event) => setDescription(event.target.value)}
           />
         </label>
-        <div className="form-row">
-          <label>
-            Base ref
-            <input
-              maxLength={255}
-              value={baseRef}
-              onChange={(event) => setBaseRef(event.target.value)}
-            />
-          </label>
-          <label>
-            Base commit
-            <input
-              pattern="[0-9a-fA-F]{7,64}"
-              placeholder="可选"
-              value={baseCommit}
-              onChange={(event) => setBaseCommit(event.target.value)}
-            />
-          </label>
-        </div>
+        <label>
+          Base ref（可选）
+          <input
+            maxLength={255}
+            placeholder={
+              selectedRepository?.sourceKind === "LOCAL"
+                ? "默认使用当前 checkout branch / HEAD"
+                : "默认使用 Repository default branch"
+            }
+            value={baseRef}
+            onChange={(event) => setBaseRef(event.target.value)}
+          />
+        </label>
         <button
           className="button button--primary"
           disabled={busy || selectedRepositoryId === ""}
@@ -555,18 +722,24 @@ function TaskForm({
 
 function RunForm({
   busy,
+  open,
+  complete,
+  summary,
+  onOpen,
   tasks,
   selectedTaskId,
   onTaskChange,
   onCreated,
   onError,
   onBusy,
-}: FormControlProps & {
-  tasks: readonly TaskRecord[];
-  selectedTaskId: string;
-  onTaskChange(taskId: string): void;
-  onCreated(run: RunRecord): void;
-}) {
+}: FormControlProps &
+  SetupCardProps & {
+    tasks: readonly TaskRecord[];
+    selectedTaskId: string;
+    onTaskChange(taskId: string): void;
+    onCreated(run: RunRecord): void;
+  }) {
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId);
   const [idempotencyKey, setIdempotencyKey] = useState("");
   const [modelProvider, setModelProvider] = useState("");
   const [modelName, setModelName] = useState("");
@@ -598,11 +771,15 @@ function RunForm({
   };
 
   return (
-    <details className="create-card" open>
-      <summary>
-        <span>3</span>
-        Run
-      </summary>
+    <details
+      className={`create-card ${complete ? "create-card--complete" : ""}`}
+      data-testid="setup-run"
+      open={open}
+      onToggle={(event) => {
+        if (event.currentTarget.open) onOpen();
+      }}
+    >
+      <SetupSummary step={3} title="Run" complete={complete} summary={summary} />
       <form data-testid="run-form" onSubmit={(event) => void submit(event)}>
         <label>
           Task
@@ -619,6 +796,20 @@ function RunForm({
             ))}
           </select>
         </label>
+        {selectedTask?.baseCommitSha === undefined ? null : (
+          <dl className="resolved-base" aria-label="Task base commit">
+            <div>
+              <dt>Base ref</dt>
+              <dd data-testid="task-base-ref">{selectedTask.baseRef ?? "HEAD"}</dd>
+            </div>
+            <div>
+              <dt>Base commit</dt>
+              <dd data-testid="task-base-commit" title={selectedTask.baseCommitSha}>
+                <code>{selectedTask.baseCommitSha.slice(0, 12)}</code>
+              </dd>
+            </div>
+          </dl>
+        )}
         <label>
           Idempotency key
           <input

@@ -16,6 +16,10 @@ export type WorkflowStage =
   | "FIX"
   | "REVIEW"
   | "GENERATE_DIFF"
+  | "WAITING_PUSH_APPROVAL"
+  | "PUSH"
+  | "WAITING_PR_APPROVAL"
+  | "CREATE_PR"
   | "DONE"
   | "FAILED"
   | "CANCELLED";
@@ -37,7 +41,7 @@ export interface TaskRecord {
   description: string;
   status: TaskStatus;
   baseRef?: string;
-  baseCommit?: string;
+  baseCommitSha?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -46,7 +50,54 @@ export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  reasoningTokens?: number;
   costUsd?: string;
+}
+
+export type RunComplexity = "SIMPLE" | "MEDIUM" | "COMPLEX";
+export type RunMetricStage = "PLAN" | "EXECUTE" | "TEST" | "REPAIR" | "REVIEW";
+
+export interface StageMetrics {
+  steps: number;
+  attempts: number;
+  modelCalls: number;
+  toolCalls: number;
+  toolExecutions: number;
+  cacheHits: number;
+  modelLatencyMs: number;
+  toolLatencyMs: number;
+  wallLatencyMs: number;
+  reasoningTokens: number;
+  formatRepairCalls: number;
+  tokenUsage: TokenUsage;
+}
+
+export type RunStageMetrics = Partial<Record<RunMetricStage, StageMetrics>>;
+
+export interface RunControlMetrics {
+  duplicateToolCalls: number;
+  contextCacheHits: number;
+  structuredOutputFailures: number;
+  structuredOutputRepairAttempts: number;
+  stalledDetections: number;
+}
+
+export interface AdaptiveBudgetMetrics {
+  complexity: RunComplexity;
+  estimatedSteps: number;
+  confidence: number;
+  softLimit: number;
+  activeLimit: number;
+  hardLimit: number;
+  planSteps: number;
+  executeSteps: number;
+  repairSteps: number;
+  reviewSteps: number;
+  unusedSteps: number;
+  budgetExtensions: number;
+  rawEstimatedSteps?: number;
+  adaptiveMargin?: number;
+  estimateClamped?: boolean;
 }
 
 export interface RunMetrics {
@@ -54,10 +105,28 @@ export interface RunMetrics {
   steps: number;
   modelCalls: number;
   toolCalls: number;
+  toolExecutions?: number;
+  cacheHits?: number;
+  reasoningTokens?: number;
   retries: number;
   modelLatencyMs: number;
   toolLatencyMs: number;
   tokenUsage: TokenUsage;
+  control?: RunControlMetrics;
+  stages?: RunStageMetrics;
+  budget?: AdaptiveBudgetMetrics;
+  /** Legacy flat adaptive-budget fields retained for historical Runs and events. */
+  complexity?: RunComplexity;
+  complexityConfidence?: number;
+  estimatedSteps?: number;
+  softLimit?: number;
+  hardLimit?: number;
+  planSteps?: number;
+  executeSteps?: number;
+  repairSteps?: number;
+  reviewSteps?: number;
+  unusedSteps?: number;
+  budgetExtensions?: number;
 }
 
 export interface RunResult {
@@ -112,7 +181,7 @@ export interface ApprovalRecord {
   runId: string;
   stepId?: string;
   toolCallId?: string;
-  kind: "PLAN" | "TOOL_CALL";
+  kind: "PLAN" | "TOOL_CALL" | "GITHUB_PUSH" | "GITHUB_PULL_REQUEST";
   status: "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED" | "EXPIRED";
   request: JsonValue;
   resolution?: JsonValue;
@@ -160,7 +229,15 @@ export interface ArtifactRecord {
   id: string;
   runId: string;
   stepId?: string;
-  kind: "PLAN" | "PATCH" | "DIFF" | "TEST_REPORT" | "REVIEW_REPORT" | "LOG" | "OTHER";
+  kind:
+    | "PLAN"
+    | "PATCH"
+    | "DIFF"
+    | "TEST_REPORT"
+    | "REVIEW_REPORT"
+    | "GITHUB_CHANGESET"
+    | "LOG"
+    | "OTHER";
   name: string;
   mimeType?: string;
   uri?: string;
@@ -180,6 +257,23 @@ export interface RunDetail {
   events: readonly AgentEvent[];
   artifacts: readonly ArtifactRecord[];
   approvals: readonly ApprovalRecord[];
+  githubPublication?: GitHubPublicationRecord;
+}
+
+export interface GitHubPublicationRecord {
+  runId: string;
+  repository: { owner: string; name: string };
+  baseCommit: string;
+  baseBranch: string;
+  branchName: string;
+  pushOperationKey: string;
+  changesArtifactId?: string;
+  commitSha?: string;
+  branchUrl?: string;
+  pullRequestOperationKey?: string;
+  pullRequestNumber?: number;
+  pullRequestUrl?: string;
+  pullRequestState?: "open" | "closed";
 }
 
 export interface CreateRepositoryInput {
@@ -194,7 +288,6 @@ export interface CreateTaskInput {
   title: string;
   description: string;
   baseRef?: string;
-  baseCommit?: string;
 }
 
 export interface CreateRunInput {

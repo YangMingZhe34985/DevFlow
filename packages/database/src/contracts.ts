@@ -419,6 +419,8 @@ export interface RunDetailRecord {
 }
 
 export interface DatabaseAdapter extends DatabaseLifecycle {
+  /** Immutable, scope-bound localization entries. Optional for legacy/test adapters. */
+  readonly repositoryIndexes?: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
@@ -427,6 +429,11 @@ export interface DatabaseAdapter extends DatabaseLifecycle {
   readonly githubPublications: DatabaseGitHubPublicationStore;
   readonly benchmarkExecutions: BenchmarkExecutionStore;
   readonly events: EventStore;
+}
+
+export interface RepositoryIndexStore {
+  get(scope: string, key: string): Promise<unknown | undefined>;
+  publish(scope: string, key: string, value: unknown): Promise<void>;
 }
 
 export interface AtomicEventWriter extends EventSink {

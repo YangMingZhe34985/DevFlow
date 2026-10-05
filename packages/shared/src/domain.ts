@@ -1,7 +1,10 @@
 import { z } from "zod";
+import { ExecuteCompletionSchema, VerificationContractSchema } from "./completion.js";
 
 import { DevflowErrorShapeSchema } from "./errors.js";
 import { EntityIdSchema } from "./ids.js";
+import { ExecutionContractSchema } from "./execution.js";
+import { PlanProposalSchema, PlanApprovalScopeSchema } from "./proposal.js";
 
 export const TaskStatusSchema = z.enum(["OPEN", "COMPLETED", "CANCELLED", "ARCHIVED"]);
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;
@@ -64,6 +67,11 @@ export const AgentPlanSchema = z.object({
   complexity: ComplexitySchema.optional(),
   estimatedSteps: z.number().int().positive().optional(),
   confidence: z.number().min(0).max(1).optional(),
+  executionContract: ExecutionContractSchema.optional(),
+  proposalVersion: z.literal("plan-proposal-v1").optional(),
+  proposal: PlanProposalSchema.optional(),
+  approvalScope: PlanApprovalScopeSchema.optional(),
+  warnings: z.array(z.string()).optional(),
 });
 export type AgentPlan = z.infer<typeof AgentPlanSchema>;
 
@@ -77,11 +85,22 @@ export const FreshAgentPlanOutputSchema = z
   })
   .strict();
 export type FreshAgentPlanOutput = z.infer<typeof FreshAgentPlanOutputSchema>;
+export const FreshAgentPlanWithContractSchema = FreshAgentPlanOutputSchema.extend({
+  executionContract: ExecutionContractSchema,
+});
 
 export const ReviewFindingSchema = z.object({
   severity: z.enum(["INFO", "WARNING", "ERROR"]),
   message: z.string().min(1),
   path: z.string().min(1).optional(),
+  evidenceStatus: z.enum(["SOURCE_LINKED", "UNVERIFIED"]).optional(),
+  evidence: z
+    .object({
+      quote: z.string().min(1),
+      fileSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+      workspaceRevision: z.number().int().nonnegative(),
+    })
+    .optional(),
 });
 
 export const ReviewResultSchema = z.object({
@@ -172,10 +191,36 @@ export const RunMetricsSchema = z.object({
   control: RunControlMetricsSchema.optional(),
   stages: RunStageMetricsSchema.optional(),
   budget: AdaptiveBudgetMetricsSchema.optional(),
+  prePatch: z.record(z.string(), z.unknown()).optional(),
+  /** Unknown usage from an interrupted summary request remains reserved, never fabricated as usage. */
+  contextCompressionReservedTokens: z.number().int().nonnegative().optional(),
 });
 export type RunMetrics = z.infer<typeof RunMetricsSchema>;
 
 export const TerminalRunStatusSchema = z.enum(["SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"]);
+
+export const PhaseCompletionSchema = z.object({
+  outcome: z.enum([
+    "CHANGED",
+    "ALREADY_SATISFIED",
+    "CONTRADICTED",
+    "INSUFFICIENT_EVIDENCE",
+    "SCOPE_CONFLICT",
+  ]),
+  evidence: z
+    .array(
+      z
+        .object({
+          path: z.string().min(1),
+          quote: z.string().min(1).max(2000),
+          fileSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+        })
+        .strict(),
+    )
+    .max(4)
+    .optional(),
+  evidenceStatus: z.enum(["CURRENT_SOURCE_LINKED", "UNVERIFIED"]).optional(),
+});
 
 export const RunResultSchema = z.object({
   runId: EntityIdSchema,
@@ -183,5 +228,8 @@ export const RunResultSchema = z.object({
   summary: z.string().optional(),
   metrics: RunMetricsSchema,
   error: DevflowErrorShapeSchema.optional(),
+  executeCompletion: ExecuteCompletionSchema.optional(),
+  verification: VerificationContractSchema.optional(),
+  phaseCompletion: PhaseCompletionSchema.optional(),
 });
 export type RunResult = z.infer<typeof RunResultSchema>;

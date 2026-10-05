@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import type { GitService } from "@devflow/git";
 import type {
@@ -221,5 +221,76 @@ describe("P1 built-in tools", () => {
       ok: true,
       output: { filesChanged: 1, changedFiles: [], truncated: false },
     });
+  });
+
+  it("keeps full-file metadata separate from snippet hashes after batch output truncation", async () => {
+    class HashedSandbox extends FakeSandbox {
+      override async readFile(input: ReadFileRequest): Promise<ReadFileResult> {
+        const read = await super.readFile(input);
+        return {
+          ...read,
+          fileSha256: createHash("sha256").update(read.content).digest("hex"),
+          sizeBytes: Buffer.byteLength(read.content),
+        };
+      }
+    }
+    const sandbox = new HashedSandbox();
+    const content = "\uFEFF" + "line\r\n".repeat(12_000) + "😀";
+    const paths = Array.from({ length: 5 }, (_, index) => `src/large-${index}.txt`);
+    for (const filePath of paths) sandbox.files.set(filePath, content);
+    const result = await createExecutor(["READ"]).execute(
+      { name: "batchReadFiles", input: { paths } },
+      context(sandbox),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) throw new Error("Expected successful batch read");
+    const output = result.output as {
+      files: {
+        content: string;
+        sha256: string;
+        contentHash: string;
+        fileSha256: string;
+        sizeBytes: number;
+        truncated: boolean;
+      }[];
+      totalBytes: number;
+    };
+    expect(output.totalBytes).toBe(256 * 1_024);
+    for (const file of output.files) {
+      const snippetHash = createHash("sha256").update(file.content).digest("hex");
+      expect(file.sha256).toBe(snippetHash);
+      expect(file.contentHash).toBe(snippetHash);
+      expect(file.fileSha256).toBe(createHash("sha256").update(content).digest("hex"));
+      expect(file.sizeBytes).toBe(Buffer.byteLength(content));
+      expect(file.truncated).toBe(true);
+    }
+    expect(output.files[4]?.content).toBe("");
+  });
+
+  it("preserves astral characters and does not invent full-file hashes for legacy sandbox reads", async () => {
+    const sandbox = new FakeSandbox();
+    sandbox.files.set("src/unicode.txt", "A😀中\r\n");
+    const result = await createExecutor(["READ"]).execute(
+      { name: "batchReadFiles", input: { paths: ["src/unicode.txt"], maxBytesPerFile: 4 } },
+      context(sandbox),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      output: {
+        files: [
+          {
+            content: "A",
+            contentBytes: 1,
+            truncated: true,
+            sha256: createHash("sha256").update("A").digest("hex"),
+            contentHash: createHash("sha256").update("A").digest("hex"),
+          },
+        ],
+      },
+    });
+    if (!result.ok) throw new Error("Expected successful legacy batch read");
+    const file = (result.output as { files: object[] }).files[0];
+    expect(file).not.toHaveProperty("fileSha256");
+    expect(file).not.toHaveProperty("sizeBytes");
   });
 });

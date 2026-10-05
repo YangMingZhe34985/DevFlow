@@ -116,7 +116,7 @@ describe("P3 Docker sandbox", () => {
   );
 
   dockerIt(
-    "removes the container after command timeout and cancellation",
+    "creator removes the container after command timeout and owner cancellation",
     async () => {
       const timeoutManager = createManager();
       const timedSandbox = await createSandbox(timeoutManager, randomUUID(), {
@@ -127,19 +127,26 @@ describe("P3 Docker sandbox", () => {
         networkEnabled: false,
       });
       const timedSandboxId = timedSandbox.id;
-      const timedResult = await timedSandbox.exec({
-        program: "node",
-        args: ["-e", "setInterval(() => {}, 1000)"],
-        timeoutMs: 200,
-      });
-      expect(timedResult.timedOut).toBe(true);
-      expect(await containerExists(timedSandboxId)).toBe(false);
+      await expect(
+        timedSandbox.exec({
+          program: "node",
+          args: ["-e", "setInterval(() => {}, 1000)"],
+          timeoutMs: 200,
+        }),
+      ).rejects.toMatchObject({ code: "SANDBOX_RESOURCE_LIMIT" });
+      expect(await containerExists(timedSandboxId)).toBe(true);
       await timedSandbox.dispose();
+      expect(await containerExists(timedSandboxId)).toBe(false);
 
       const cancelManager = createManager();
-      const cancelledSandbox = await createSandbox(cancelManager, randomUUID());
-      const cancelledSandboxId = cancelledSandbox.id;
       const cancellation = new AbortController();
+      const cancelledSandbox = await createSandbox(
+        cancelManager,
+        randomUUID(),
+        defaultLimits(),
+        cancellation.signal,
+      );
+      const cancelledSandboxId = cancelledSandbox.id;
       const timer = setTimeout(() => cancellation.abort(), 250);
       try {
         await expect(
@@ -151,7 +158,7 @@ describe("P3 Docker sandbox", () => {
             },
             cancellation.signal,
           ),
-        ).rejects.toMatchObject({ code: "CANCELLED" });
+        ).rejects.toMatchObject({ code: "SANDBOX_CANCELLED" });
       } finally {
         clearTimeout(timer);
         await cancelledSandbox.dispose();
@@ -193,13 +200,17 @@ async function createSandbox(
   manager: DockerSandboxManager,
   runId: string,
   limits: SandboxLimits = defaultLimits(),
+  signal?: AbortSignal,
 ): Promise<SandboxSession> {
-  return await manager.create({
-    runId,
-    repository: { sourceUri: pathToFileURL(fixturePath).href },
-    limits,
-    environment: { P3_UNICODE: "环境正常" },
-  });
+  return await manager.create(
+    {
+      runId,
+      repository: { sourceUri: pathToFileURL(fixturePath).href },
+      limits,
+      environment: { P3_UNICODE: "环境正常" },
+    },
+    signal,
+  );
 }
 
 function defaultLimits(): SandboxLimits {

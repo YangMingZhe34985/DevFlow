@@ -13,7 +13,7 @@ import {
 } from "@devflow/eval";
 import { SandboxGitService } from "@devflow/git";
 import type { SandboxSession } from "@devflow/sandbox";
-import type { RunMetrics, RunResult } from "@devflow/shared";
+import { DevflowError, type RunMetrics, type RunResult } from "@devflow/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -91,6 +91,68 @@ describe("benchmark execution configuration", () => {
     expect(processControlCalls).toBe(3);
     expect(recorded).toEqual(observation);
   });
+
+  it.each([
+    [124, false],
+    [137, false],
+    [124, true],
+  ] as const)(
+    "records only trusted command deadlines and never reuses the invalid segment (exit=%s, cancelled=%s)",
+    async (exitCode, cancelled) => {
+      const recordObservation = vi.fn(async () => undefined);
+      const database = databaseFor(benchmarkExecution(), { recordObservation });
+      const owner = new AbortController();
+      const cancellation = new Error("owner cancelled");
+      let processCalls = 0;
+      const resourceError = new DevflowError({
+        code: "SANDBOX_RESOURCE_LIMIT",
+        message: "Evaluator exceeded its bound",
+        details: { exitCode },
+      });
+      const sandbox = {
+        exec: vi.fn(async (command: { args?: string[] }) => {
+          if (command.args?.[0] === "evaluate.mjs") {
+            if (cancelled) owner.abort(cancellation);
+            throw resourceError;
+          }
+          processCalls++;
+          return {
+            exitCode: 0,
+            stdout: processCalls === 1 ? "[]" : "{}",
+            stderr: "",
+            durationMs: 1,
+            timedOut: false,
+            outputTruncated: false,
+          };
+        }),
+      } as unknown as SandboxSession;
+      const prepared = await prepareBenchmarkEvaluation(
+        database,
+        benchmarkRun(),
+        sandbox,
+        owner.signal,
+      );
+      const evaluation = evaluateBenchmarkInSandbox(
+        database,
+        prepared!,
+        sandbox,
+        successfulRunResult(),
+        { testPassed: true, repairAttempts: 0, reviewRetries: 0 },
+        owner.signal,
+      );
+      if (cancelled || exitCode !== 124) {
+        await expect(evaluation).rejects.toBe(cancelled ? cancellation : resourceError);
+        expect(recordObservation).not.toHaveBeenCalled();
+      } else {
+        const observation = await evaluation;
+        expect(observation.evaluation).toMatchObject({ timedOut: true, exitCode: null });
+        expect(observation.integrity.evaluationIsolated).toBe(false);
+        expect(recordObservation).toHaveBeenCalledWith(CASE_EXECUTION_ID, observation);
+      }
+      expect(processCalls).toBe(2);
+      expect(sandbox.exec).toHaveBeenCalledTimes(3);
+    },
+  );
 
   it("rejects unknown, unsupported or unapplied runtime configuration", async () => {
     const unknownRuntime = {
@@ -204,6 +266,36 @@ describe("benchmark execution configuration", () => {
         RUN_ID,
       ),
     ).rejects.toMatchObject({ message: expectedMessage });
+  });
+
+  it("accepts the precise editor in a benchmark profile and advertises only the approved tools", async () => {
+    const configuration = await benchmarkExecutionConfiguration(
+      databaseFor(
+        benchmarkExecution({ profile: profile({ enabled: ["readFile", "replaceText"] }) }),
+      ),
+      RUN_ID,
+    );
+    expect(configuration?.tools.enabled).toEqual(["readFile", "replaceText"]);
+    const { tools } = createTools(new SandboxGitService(), configuration!.tools);
+    expect(tools.map((tool) => tool.name).sort()).toEqual(["readFile", "replaceText"]);
+    expect(tools.find((tool) => tool.name === "replaceText")).toMatchObject({
+      mutatesWorkspace: true,
+      readOnly: false,
+    });
+  });
+  it("accepts public evidence recovery in configuration and registers the matching read-only capability", async () => {
+    const configuration = await benchmarkExecutionConfiguration(
+      databaseFor(benchmarkExecution({ profile: profile({ enabled: ["readEvidenceArtifact"] }) })),
+      RUN_ID,
+    );
+    const { tools } = createTools(
+      new SandboxGitService(),
+      configuration!.tools,
+      undefined,
+      async () => ({ historical: true }),
+    );
+    expect(tools.map((t) => t.name)).toEqual(["readEvidenceArtifact"]);
+    expect(tools[0]).toMatchObject({ readOnly: true, mutatesWorkspace: false });
   });
 
   it("restricts both advertised and executable tools to tools.enabled", async () => {

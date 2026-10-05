@@ -1,6 +1,21 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { ContextStage } from "./stage-context.js";
+import {
+  prepareCompressedStageContext,
+  type ContextCompressionOptions,
+  type ContextCompressionState,
+} from "./context-compression.js";
+import { deduplicateContext, invalidateHistoricalReads, type WorkingSet } from "./working-set.js";
+import { CANDIDATE_SUMMARY, type PostPatchController } from "./post-patch.js";
+import type { PrePatchController } from "./pre-patch.js";
 
-import { DevflowError, toDevflowError, type AgentPlan, type JsonValue } from "@devflow/shared";
+import {
+  DevflowError,
+  toDevflowError,
+  PhaseCompletionSchema,
+  type AgentPlan,
+  type JsonValue,
+} from "@devflow/shared";
 
 import type {
   NewAgentEvent,
@@ -32,6 +47,7 @@ import {
 export type { AgentPhase, AgentState } from "./state.js";
 
 export interface AgentProgressSnapshot {
+  patchReady?: boolean;
   stepCount: number;
   currentLimit: number;
   hardLimit: number;
@@ -45,6 +61,7 @@ export interface AgentProgressSnapshot {
   modelCalls: number;
   toolCalls: number;
   successfulMutations: number;
+  evidenceDiscoveries: number;
   hasMutationEvidence: boolean;
   hasDiffEvidence: boolean;
   progressFingerprint?: string;
@@ -75,9 +92,20 @@ export interface AdaptiveStepBudgetController {
 }
 
 export interface AgentRunRequest {
+  contextCompression?: ContextCompressionOptions;
+  contextCompressionState?: ContextCompressionState;
+  contextStage?: ContextStage;
+  contextMaxBytes?: number;
+  prePatch?: PrePatchController;
+  postPatch?: PostPatchController;
+  traceEfficiency?: boolean;
+  workingSet?: WorkingSet;
+  deduplicateContext?: boolean;
   approvedPlan?: AgentPlan;
   systemPrompt?: string;
   additionalContext?: string;
+  /** Versioned localization evidence is valid only before the first workspace mutation. */
+  invalidateAdditionalContextOnMutation?: boolean;
   emitRunLifecycle?: boolean;
   maxSteps: number;
   timeoutMs: number;
@@ -93,10 +121,13 @@ export interface AgentRunRequest {
 }
 
 export interface RunContext {
+  postPatch?: PostPatchController;
   runId: RunId;
   task: TaskSpec;
   signal: AbortSignal;
   tools: readonly ModelToolDescriptor[];
+  availableTools?(): readonly ModelToolDescriptor[];
+  authorizeTool?(request: ToolExecutionRequest): string | undefined;
   stateStore?: AgentStateStore;
   emit(event: NewAgentEvent): Promise<void>;
   executeTool(
@@ -115,6 +146,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
 
   async run(request: AgentRunRequest, context: RunContext): Promise<RunResult> {
     validateRunRequest(request);
+    const postPatch = request.postPatch;
+    if (postPatch) context = { ...context, postPatch };
     const deadlineSignal = AbortSignal.timeout(request.timeoutMs);
     const signal = AbortSignal.any([context.signal, deadlineSignal]);
     const initialMessages: ModelMessage[] = [
@@ -135,8 +168,12 @@ export class DefaultAgentRuntime implements AgentRuntime {
     if (restoredState === undefined && request.approvedPlan !== undefined) {
       state = { ...state, plan: request.approvedPlan };
     }
+    if (restoredState === undefined && request.contextCompressionState)
+      state = { ...state, contextCompression: structuredClone(request.contextCompressionState) };
     const messages: ModelMessage[] = [...state.messages];
     const execution = createExecutionState(context.tools);
+    const initialRevision = request.workingSet?.workspaceRevision ?? 0;
+    execution.workspaceRevision = initialRevision;
     let adaptiveStepBudget = initializeAdaptiveStepBudget(request, state);
     if (adaptiveStepBudget !== undefined) {
       state = { ...state, adaptiveStepBudget };
@@ -172,7 +209,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
           if (state.stepCount >= request.maxSteps) break;
         } else if (state.stepCount >= adaptiveStepBudget.currentLimit) {
           if (state.stepCount >= adaptiveStepBudget.hardLimit) break;
-          const snapshot = agentProgressSnapshot(state, execution, adaptiveStepBudget);
+          const snapshot = {
+            ...agentProgressSnapshot(state, execution, adaptiveStepBudget),
+            ...(postPatch ? { patchReady: postPatch.ready } : {}),
+          };
           const decision = await awaitWithSignal(
             Promise.resolve(request.adaptiveStepBudget?.onLimitReached(snapshot)),
             signal,
@@ -225,14 +265,261 @@ export class DefaultAgentRuntime implements AgentRuntime {
         for (let attempt = 0; attempt <= request.maxRetries; attempt += 1) {
           throwIfAborted(signal, context.signal, deadlineSignal);
           assertExecutionBudget(request, "modelCalls", state.metrics.modelCalls + 1);
-          state = await checkpoint(context, {
-            ...state,
-            metrics: {
-              ...state.metrics,
-              modelCalls: state.metrics.modelCalls + 1,
-            },
-          });
-          const projectedMessages = projectModelMessages(messages);
+          const prePatch =
+            request.prePatch?.active === true && !postPatch?.active ? request.prePatch : undefined;
+          if (!prePatch) {
+            postPatch?.modelStarted();
+            state = await checkpoint(context, {
+              ...state,
+              metrics: {
+                ...state.metrics,
+                modelCalls: state.metrics.modelCalls + 1,
+              },
+            });
+          }
+          const validMessages = request.deduplicateContext
+            ? invalidateHistoricalReads(messages)
+            : messages;
+          const currentMessages =
+            request.invalidateAdditionalContextOnMutation === true &&
+            execution.workspaceRevision !== initialRevision
+              ? validMessages.filter(
+                  (message) =>
+                    !(
+                      message.role === "USER" &&
+                      typeof message.content === "string" &&
+                      message.content.startsWith("Repository/stage evidence:\n")
+                    ),
+                )
+              : validMessages;
+          const priorCompressionReserve = state.contextCompression?.pendingTokenReserve ?? 0;
+          const compressionStepId = randomUUID();
+          let projectedMessages = request.contextStage
+            ? (
+                await prepareCompressedStageContext({
+                  stage: request.contextStage,
+                  history: currentMessages,
+                  maxBytes: request.contextMaxBytes ?? 96000,
+                  workspaceRevision: execution.workspaceRevision,
+                  authoritative: {
+                    stage: request.contextStage,
+                    workspaceRevision: execution.workspaceRevision,
+                    approvalScope: request.approvedPlan?.approvalScope ?? null,
+                    executionBudget: request.executionBudget ?? null,
+                  },
+                  signal,
+                  ...(state.contextCompression
+                    ? { compressionState: state.contextCompression }
+                    : {}),
+                  budget: {
+                    remainingCalls:
+                      (request.executionBudget?.maxModelCalls ?? request.maxSteps) -
+                      state.metrics.modelCalls,
+                    remainingSteps:
+                      (adaptiveStepBudget?.currentLimit ?? request.maxSteps) - state.stepCount,
+                    remainingTokens:
+                      (request.executionBudget?.maxTotalTokens ?? Number.MAX_SAFE_INTEGER) -
+                      state.metrics.tokenUsage.totalTokens -
+                      (state.contextCompression?.pendingTokenReserve ?? 0),
+                    mainOutputReserve:
+                      request.contextCompression?.mainOutputReserve ??
+                      request.modelSettings?.maxOutputTokens ??
+                      8192,
+                  },
+                  ...(!request.contextCompression || prePatch || postPatch?.active
+                    ? {}
+                    : {
+                        compression: {
+                          ...request.contextCompression,
+                          onRequest: async (reservation) => {
+                            state = await checkpoint(context, {
+                              ...state,
+                              stepCount: state.stepCount + 1,
+                              contextCompression: reservation.state,
+                              metrics: {
+                                ...state.metrics,
+                                modelCalls: state.metrics.modelCalls + 1,
+                              },
+                            });
+                            await context.emit({
+                              runId: context.runId,
+                              stepId: compressionStepId,
+                              type: "STEP_STARTED",
+                              occurredAt: new Date().toISOString(),
+                              payload: { step: state.stepCount, contextCompression: true },
+                            });
+                            await context.emit({
+                              runId: context.runId,
+                              stepId: compressionStepId,
+                              type: "WORKFLOW_CHECKPOINT",
+                              occurredAt: new Date().toISOString(),
+                              payload: {
+                                contextCompressionReservation: { delta: reservation.tokens },
+                              },
+                            });
+                            await context.emit({
+                              runId: context.runId,
+                              stepId: compressionStepId,
+                              type: "LLM_REQUEST",
+                              occurredAt: new Date().toISOString(),
+                              payload: {
+                                contextCompression: true,
+                                contextCompressionState: jsonValue(reservation.state),
+                                outputReserveTokens:
+                                  request.contextCompression!.maxOutputTokens ?? 2048,
+                              },
+                            });
+                            await request.contextCompression?.onRequest?.(reservation);
+                          },
+                          onResponse: async (summary) => {
+                            const reserve =
+                              (state.contextCompression?.pendingTokenReserve ?? 0) -
+                              priorCompressionReserve;
+                            state = await checkpoint(context, {
+                              ...state,
+                              contextCompression: {
+                                ...state.contextCompression!,
+                                pendingTokenReserve: priorCompressionReserve,
+                              },
+                              metrics: {
+                                ...state.metrics,
+                                modelLatencyMs:
+                                  state.metrics.modelLatencyMs +
+                                  nonnegativeInteger(summary.latencyMs),
+                                reasoningTokens:
+                                  state.metrics.reasoningTokens +
+                                  nonnegativeInteger(summary.reasoningTokens ?? 0),
+                                tokenUsage: {
+                                  inputTokens:
+                                    state.metrics.tokenUsage.inputTokens +
+                                    summary.usage.inputTokens,
+                                  outputTokens:
+                                    state.metrics.tokenUsage.outputTokens +
+                                    summary.usage.outputTokens,
+                                  totalTokens:
+                                    state.metrics.tokenUsage.totalTokens +
+                                    summary.usage.totalTokens,
+                                },
+                              },
+                            });
+                            await context.emit({
+                              runId: context.runId,
+                              stepId: compressionStepId,
+                              type: "WORKFLOW_CHECKPOINT",
+                              occurredAt: new Date().toISOString(),
+                              payload: { contextCompressionReservation: { delta: -reserve } },
+                            });
+                            await context.emit({
+                              runId: context.runId,
+                              stepId: compressionStepId,
+                              type: "LLM_RESPONSE",
+                              occurredAt: new Date().toISOString(),
+                              payload: {
+                                ok: true,
+                                contextCompression: true,
+                                finishReason: summary.finishReason,
+                                latencyMs: summary.latencyMs,
+                                usage: jsonValue(summary.usage),
+                                reasoningTokens: summary.reasoningTokens ?? 0,
+                              },
+                            });
+                            assertExecutionBudget(
+                              request,
+                              "totalTokens",
+                              state.metrics.tokenUsage.totalTokens +
+                                (state.contextCompression?.pendingTokenReserve ?? 0),
+                            );
+                            await request.contextCompression?.onResponse?.(summary);
+                          },
+                          onError: async (latencyMs, error) => {
+                            state = await checkpoint(context, {
+                              ...state,
+                              metrics: {
+                                ...state.metrics,
+                                modelLatencyMs:
+                                  state.metrics.modelLatencyMs + nonnegativeInteger(latencyMs),
+                              },
+                            });
+                            await context.emit({
+                              runId: context.runId,
+                              stepId: compressionStepId,
+                              type: "LLM_RESPONSE",
+                              level: "WARN",
+                              occurredAt: new Date().toISOString(),
+                              payload: {
+                                ok: false,
+                                contextCompression: true,
+                                latencyMs,
+                                unknownUsageReservedTokens:
+                                  state.contextCompression?.pendingTokenReserve ?? 0,
+                              },
+                            });
+                            await request.contextCompression?.onError?.(latencyMs, error);
+                          },
+                        },
+                      }),
+                }).then(async (artifact) => {
+                  if (artifact.compression.requestIssued)
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "STEP_COMPLETED",
+                      occurredAt: new Date().toISOString(),
+                      payload: {
+                        contextCompression: true,
+                        summaryStatus: artifact.compression.status,
+                        toolObservationsPersisted: true,
+                      },
+                    });
+                  state = await checkpoint(context, {
+                    ...state,
+                    contextCompression: artifact.compression.state,
+                  });
+                  assertExecutionBudget(
+                    request,
+                    "totalTokens",
+                    state.metrics.tokenUsage.totalTokens +
+                      artifact.compression.state.pendingTokenReserve,
+                  );
+                  return artifact;
+                })
+              ).view
+            : projectModelMessages(currentMessages);
+          if (request.deduplicateContext)
+            projectedMessages = deduplicateContext(
+              projectedMessages,
+              request.workingSet,
+              execution.workspaceRevision,
+            );
+          if (postPatch?.active)
+            projectedMessages = projectModelMessages(postPatch.messages(request.approvedPlan));
+          const availableTools = (context.availableTools?.() ?? context.tools).filter(
+            (t) => postPatch?.allowed(t.name) !== false && (prePatch?.available(t) ?? true),
+          );
+          if (prePatch) {
+            const preflight = prePatch.preflight(
+              request.systemPrompt ?? (initialMessages[0]!.content as string),
+              availableTools,
+              (request.executionBudget?.maxTotalTokens ?? Number.MAX_SAFE_INTEGER) -
+                state.metrics.tokenUsage.totalTokens,
+              request.modelSettings,
+            );
+            projectedMessages = [...preflight.request.messages];
+            await context.emit({
+              runId: context.runId,
+              stepId,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: { prePatchPreflight: jsonValue(preflight.observation) },
+            });
+            state = await checkpoint(context, {
+              ...state,
+              metrics: {
+                ...state.metrics,
+                modelCalls: state.metrics.modelCalls + 1,
+              },
+            });
+          }
           await context.emit({
             runId: context.runId,
             stepId,
@@ -242,7 +529,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
               messageCount: projectedMessages.length,
               originalMessageCount: messages.length,
               contextBytes: serializedBytes(projectedMessages),
-              toolCount: context.tools.length,
+              toolCount: availableTools.length,
               attempt: attempt + 1,
             },
           });
@@ -251,11 +538,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
           try {
             const modelRequest: ModelRequest = {
               messages: projectedMessages,
-              tools: context.tools,
+              tools: availableTools,
               ...(request.modelSettings === undefined ? {} : { settings: request.modelSettings }),
             };
             response = await this.model.generate(modelRequest, { signal });
-            state = await checkpoint(context, {
+            request.prePatch?.usage(response.usage.inputTokens, response.usage.outputTokens);
+            postPatch?.modelUsage(response.usage.inputTokens, response.usage.outputTokens);
+            state = {
               ...state,
               metrics: {
                 ...state.metrics,
@@ -269,8 +558,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
                   totalTokens: state.metrics.tokenUsage.totalTokens + response.usage.totalTokens,
                 },
               },
-            });
-            assertExecutionBudget(request, "totalTokens", state.metrics.tokenUsage.totalTokens);
+            };
             await context.emit({
               runId: context.runId,
               stepId,
@@ -283,11 +571,24 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 usage: jsonValue(response.usage),
                 reasoningTokens: response.reasoningTokens ?? 0,
                 attempt: attempt + 1,
-                toolCalls: response.toolCalls.map(({ id, name }) => ({ id, name })),
+                toolCalls: response.toolCalls.map(({ id, name }) => ({
+                  id,
+                  name,
+                })),
               },
             });
+            state = await checkpoint(context, state);
+            assertExecutionBudget(
+              request,
+              "totalTokens",
+              state.metrics.tokenUsage.totalTokens +
+                (state.contextCompression?.pendingTokenReserve ?? 0),
+            );
             break;
           } catch (error) {
+            // A successful provider call followed by a persistence/budget error
+            // is not a second failed model call, and must not be retried.
+            if (response !== undefined) throw error;
             const attemptLatencyMs = Date.now() - attemptStartedAt;
             state = await checkpoint(context, {
               ...state,
@@ -326,6 +627,30 @@ export class DefaultAgentRuntime implements AgentRuntime {
             message: "Model did not produce a response.",
           });
         }
+        if (response.finishReason === "LENGTH" && request.prePatch?.active) {
+          const recovered = request.prePatch.recoverLength(response.toolCalls.length);
+          await context.emit({
+            runId: context.runId,
+            stepId,
+            type: "WORKFLOW_CHECKPOINT",
+            occurredAt: new Date().toISOString(),
+            payload: { prePatchLength: jsonValue(request.prePatch.metrics()) },
+          });
+          if (!recovered)
+            throw request.prePatch.failure(
+              "LLM_FAILED",
+              "Model stopped with 'LENGTH'; no bounded correction remains or the response contains incomplete tool actions.",
+            );
+          await context.emit({
+            runId: context.runId,
+            stepId,
+            type: "STEP_COMPLETED",
+            occurredAt: new Date().toISOString(),
+            payload: { step: state.stepCount, recovery: "MODEL_OUTPUT_LENGTH" },
+          });
+          request.prePatch.endDecision();
+          continue;
+        }
         if (response.toolCalls.length === 0 && response.finishReason !== "STOP") {
           throw new DevflowError({
             code: "LLM_FAILED",
@@ -334,7 +659,19 @@ export class DefaultAgentRuntime implements AgentRuntime {
         }
 
         if (response.toolCalls.length === 0) {
-          const summary = response.text?.trim() || "Agent completed without a text summary.";
+          if (request.prePatch?.active)
+            throw request.prePatch.failure(
+              "PRE_PATCH_EXPLORATION_STALLED",
+              "Model stopped before a real APPLIED candidate mutation.",
+            );
+          if (postPatch && !postPatch.ready)
+            throw new DevflowError({
+              code: "AGENT_STALLED",
+              message: "NO_VALID_PATCH: completion requires a current, stable candidate patch.",
+            });
+          const summary = postPatch
+            ? CANDIDATE_SUMMARY
+            : response.text?.trim() || "Agent completed without a text summary.";
           messages.push({ role: "ASSISTANT", content: response.text ?? "" });
           await context.emit({
             runId: context.runId,
@@ -347,7 +684,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
             runId: context.runId,
             status: "SUCCEEDED",
             summary,
-            metrics: runMetrics(state),
+            metrics: {
+              ...runMetrics(state),
+              ...(request.prePatch ? { prePatch: request.prePatch.metrics() } : {}),
+            },
+            ...(postPatch ? { executeCompletion: postPatch.result(true) } : {}),
           };
           state = await checkpoint(context, {
             ...state,
@@ -367,6 +708,32 @@ export class DefaultAgentRuntime implements AgentRuntime {
         }
 
         const calls = response.toolCalls.map(normalizeToolCall);
+        // A deterministic, budgeted probe follows mutations, including same-batch finishPhase.
+        // Never trust a model-filtered/cached/base-relative diff as completion evidence.
+        if (
+          postPatch &&
+          calls.some((c) => toolMetadata(c.name, execution.tools.get(c.name)).mutatesWorkspace) &&
+          !calls
+            .slice(
+              calls.findLastIndex(
+                (c) => toolMetadata(c.name, execution.tools.get(c.name)).mutatesWorkspace,
+              ) + 1,
+            )
+            .some(
+              (c) =>
+                c.name === "gitDiff" &&
+                !objectValue(c.input)?.base &&
+                !objectValue(c.input)?.cached &&
+                !objectValue(c.input)?.paths,
+            )
+        ) {
+          const finishIndex = calls.findIndex((c) => c.name === "finishPhase");
+          calls.splice(finishIndex < 0 ? calls.length : finishIndex, 0, {
+            id: randomUUID(),
+            name: "gitDiff",
+            input: { maxBytes: 32768 },
+          });
+        }
         assertExecutionBudget(request, "toolCalls", state.metrics.toolCalls + calls.length);
         messages.push({
           role: "ASSISTANT",
@@ -379,7 +746,121 @@ export class DefaultAgentRuntime implements AgentRuntime {
           messages,
         });
 
-        const executedCalls = await executeToolBatch(calls, stepId, context, signal, execution);
+        const batchStartedAt = Date.now();
+        const revisionBeforeBatch = execution.workspaceRevision;
+        const executedCalls = await executeToolBatch(
+          calls,
+          stepId,
+          context,
+          signal,
+          execution,
+          async (observed) => {
+            const usage = {
+              calls: 1,
+              executions: observed.executed ? 1 : 0,
+              cacheHits: observed.cached ? 1 : 0,
+              latencyMs: observed.executed ? observed.result.durationMs : 0,
+            };
+            state = {
+              ...state,
+              metrics: {
+                ...state.metrics,
+                toolCalls: state.metrics.toolCalls + 1,
+                toolExecutions: state.metrics.toolExecutions + usage.executions,
+                cacheHits: state.metrics.cacheHits + usage.cacheHits,
+                toolLatencyMs: state.metrics.toolLatencyMs + usage.latencyMs,
+              },
+            };
+            await context.emit({
+              runId: context.runId,
+              stepId,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: {
+                toolObservation: { callId: observed.call.id, ...usage },
+              },
+            });
+          },
+        );
+        if (request.traceEfficiency) {
+          let revision = revisionBeforeBatch;
+          for (const executed of executedCalls) {
+            await context.emit({
+              runId: context.runId,
+              stepId,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: {
+                efficiencyTool: {
+                  callId: executed.call.id,
+                  toolName: executed.call.name,
+                  inputFingerprint: createHash("sha256")
+                    .update(stableStringify(executed.call.input))
+                    .digest("hex"),
+                  resultFingerprint: createHash("sha256")
+                    .update(
+                      stableStringify(
+                        executed.result.ok ? executed.result.output : executed.result.error,
+                      ),
+                    )
+                    .digest("hex"),
+                  workspaceRevision: revision,
+                  revisionAfter:
+                    executed.result.mutation?.afterRevision ??
+                    revision + (executed.metadata.mutatesWorkspace && executed.executed ? 1 : 0),
+                  startedAt: executed.startedAt ?? batchStartedAt,
+                  wallMs: executed.wallMs ?? 0,
+                  sourceBytes:
+                    executed.result.ok && !executed.cached
+                      ? sourceContentBytes(executed.result.output)
+                      : 0,
+                  cached: executed.cached,
+                  ok: executed.result.ok,
+                  mutatesWorkspace: executed.metadata.mutatesWorkspace,
+                  mutationApplied:
+                    executed.result.mutation?.mutationApplied ??
+                    (executed.metadata.mutatesWorkspace &&
+                      executed.result.ok &&
+                      objectValue(executed.result.output)?.applied !== false),
+                  normalizedMutation: executed.result.mutation
+                    ? jsonValue(executed.result.mutation)
+                    : null,
+                  patchApplied:
+                    executed.call.name === "applyPatch" && executed.result.ok
+                      ? objectValue(executed.result.output)?.applied === true
+                      : null,
+                  paths: jsonValue(toolPaths(executed.call, executed.result)),
+                  errorCode: !executed.result.ok ? executed.result.error.code : null,
+                },
+              },
+            });
+            if (executed.metadata.mutatesWorkspace && executed.executed)
+              revision = executed.result.mutation?.afterRevision ?? revision + 1;
+          }
+        }
+        // Persist denied and cached calls before any controller can terminate the decision.
+        for (const executed of executedCalls) {
+          await context.emit({
+            runId: context.runId,
+            stepId,
+            type: "WORKFLOW_CHECKPOINT",
+            occurredAt: new Date().toISOString(),
+            payload: {
+              toolDecision: jsonValue({
+                callId: executed.call.id,
+                name: executed.call.name,
+                input: executed.call.input,
+                cached: executed.cached,
+                executed: executed.executed,
+                ok: executed.result.ok,
+                error: executed.result.ok ? null : executed.result.error,
+                mutation: executed.result.mutation ?? null,
+              }),
+            },
+          });
+        }
+        for (const executed of executedCalls)
+          await request.prePatch?.observe(executed.call, executed.result);
         for (const executed of executedCalls) {
           messages.push(toolResultMessage(executed.call, executed.result));
         }
@@ -390,16 +871,32 @@ export class DefaultAgentRuntime implements AgentRuntime {
           0,
         );
         const normalCalls = executedCalls.filter(({ control }) => !control);
+        let newEvidence = false;
+        for (const { call, result, metadata } of normalCalls) {
+          if (metadata.mutatesWorkspace) continue;
+          const identity = `${execution.workspaceRevision}:${call.name}:${stableStringify(result.ok ? result.output : { input: call.input, error: result.error })}`;
+          if (!execution.evidenceSeen.has(identity)) {
+            execution.evidenceSeen.add(identity);
+            if (result.ok) execution.evidenceDiscoveries++;
+            newEvidence = true;
+          }
+        }
         const madeWorkspaceProgress = normalCalls.some(
-          ({ metadata, result }) => metadata.mutatesWorkspace && result.ok,
+          ({ metadata, result }) =>
+            result.mutation?.mutationApplied ?? (metadata.mutatesWorkspace && result.ok),
         );
         const successfulMutations = normalCalls.filter(
-          ({ metadata, result }) => metadata.mutatesWorkspace && result.ok,
+          ({ metadata, result }) =>
+            result.mutation?.mutationApplied ?? (metadata.mutatesWorkspace && result.ok),
         ).length;
-        const observedDiff = normalCalls.some(({ call, result }) =>
-          !result.ok ? false : hasDiffEvidence(call.name, result.output),
-        );
-        const observedDiffFingerprint = diffEvidenceFingerprint(normalCalls);
+        const observedDiff =
+          (postPatch === undefined || postPatch.active) &&
+          normalCalls.some(({ call, result }) =>
+            !result.ok ? false : hasDiffEvidence(call.name, result.output),
+          );
+        const observedDiffFingerprint = postPatch
+          ? (postPatch.diffFingerprint ?? undefined)
+          : diffEvidenceFingerprint(normalCalls);
         execution.successfulMutations += successfulMutations;
         if (
           observedDiffFingerprint !== undefined &&
@@ -412,19 +909,19 @@ export class DefaultAgentRuntime implements AgentRuntime {
           execution.progressFingerprint = observedDiffFingerprint;
         }
         const repeatedWithoutProgress =
-          normalCalls.length > 0 && normalCalls.every(({ cached }) => cached);
+          normalCalls.length > 0 &&
+          (normalCalls.every(({ cached }) => cached) ||
+            (!madeWorkspaceProgress && !newEvidence) ||
+            (!madeWorkspaceProgress &&
+              normalCalls.some(({ result }) => result.mutation !== undefined)));
         state = await checkpoint(context, {
           ...state,
           phase: "CALLING_TOOL",
           messages,
           metrics: {
             ...state.metrics,
-            toolCalls: state.metrics.toolCalls + calls.length,
-            toolExecutions: state.metrics.toolExecutions + toolExecutions,
-            cacheHits: state.metrics.cacheHits + cachedToolCalls,
             duplicateToolCalls: state.metrics.duplicateToolCalls + cachedToolCalls,
             stalledDetections: state.metrics.stalledDetections + (repeatedWithoutProgress ? 1 : 0),
-            toolLatencyMs: state.metrics.toolLatencyMs + actualToolLatencyMs,
           },
         });
 
@@ -436,12 +933,14 @@ export class DefaultAgentRuntime implements AgentRuntime {
             messages.push({
               role: "USER",
               content:
-                "Convergence warning: every tool call in the previous step repeated an unchanged read and was served from cache. Do not repeat it again; change strategy, make a targeted edit, or finish the phase.",
+                "Convergence warning: the previous calls produced no new evidence or workspace change. Do not repeat unchanged reads, failed calls or no-op edits; change strategy or finish with the unresolved gap.",
             });
           } else {
             throw new DevflowError({
               code: "AGENT_STALLED",
-              message: "Agent repeated the same unchanged tool calls without making progress.",
+              message: postPatch?.ready
+                ? "PATCH_READY_BUT_NOT_FINISHED: repeated confirmation instead of phase handoff."
+                : "Agent repeated the same unchanged tool calls without making progress.",
               details: {
                 noProgressStreak: execution.noProgressStreak,
                 tools: normalCalls.map(({ call }) => call.name),
@@ -457,6 +956,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           occurredAt: new Date().toISOString(),
           payload: {
             step: state.stepCount,
+            toolObservationsPersisted: true,
             toolCalls: calls.length,
             toolExecutions,
             cachedToolCalls,
@@ -465,14 +965,23 @@ export class DefaultAgentRuntime implements AgentRuntime {
           },
         });
 
+        request.prePatch?.endDecision();
         const finishCall = executedCalls.find(({ control }) => control);
-        if (finishCall?.result.ok === true) {
-          const summary = finishSummary(finishCall.call);
+        if (finishCall?.result.ok === true || (postPatch?.ready && postPatch.autoFinish)) {
+          throwIfAborted(signal, context.signal, deadlineSignal);
+          const summary = postPatch ? CANDIDATE_SUMMARY : finishSummary(finishCall!.call);
           const result: RunResult = {
             runId: context.runId,
             status: "SUCCEEDED",
             summary,
-            metrics: runMetrics(state),
+            metrics: {
+              ...runMetrics(state),
+              ...(request.prePatch ? { prePatch: request.prePatch.metrics() } : {}),
+            },
+            ...(postPatch ? { executeCompletion: postPatch.result(true) } : {}),
+            ...(finishCall && PhaseCompletionSchema.safeParse(finishCall.call.input).success
+              ? { phaseCompletion: PhaseCompletionSchema.parse(finishCall.call.input) }
+              : {}),
           };
           state = await checkpoint(context, {
             ...state,
@@ -490,7 +999,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
           }
           return result;
         }
-        state = await checkpoint(context, { ...state, phase: "THINKING", messages });
+        state = await checkpoint(context, {
+          ...state,
+          phase: "THINKING",
+          messages,
+        });
       }
 
       const exhaustedLimit = adaptiveStepBudget?.hardLimit ?? request.maxSteps;
@@ -511,8 +1024,21 @@ export class DefaultAgentRuntime implements AgentRuntime {
       const result: RunResult = {
         runId: context.runId,
         status,
-        metrics: runMetrics(state),
+        metrics: {
+          ...runMetrics(state),
+          ...(request.prePatch ? { prePatch: request.prePatch.metrics() } : {}),
+        },
         error: normalized.toJSON(),
+        ...(postPatch
+          ? {
+              executeCompletion: postPatch.result(
+                false,
+                normalized.message.startsWith("NO_VALID_PATCH:")
+                  ? "NO_VALID_PATCH"
+                  : normalized.code,
+              ),
+            }
+          : {}),
       };
       state = await checkpoint(context, {
         ...state,
@@ -527,7 +1053,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
           type: status === "CANCELLED" ? "RUN_CANCELLED" : "RUN_FAILED",
           level: "ERROR",
           occurredAt: new Date().toISOString(),
-          payload: { error: jsonValue(normalized.toJSON()), metrics: jsonValue(result.metrics) },
+          payload: {
+            error: jsonValue(normalized.toJSON()),
+            metrics: jsonValue(result.metrics),
+          },
         });
       }
       return result;
@@ -547,6 +1076,8 @@ interface ToolExecutionMetadata {
 }
 
 interface RuntimeExecutionState {
+  evidenceSeen: Set<string>;
+  evidenceDiscoveries: number;
   readonly tools: ReadonlyMap<string, ModelToolDescriptor>;
   readonly cache: Map<string, ToolExecutionResult>;
   readonly inFlight: Map<string, Promise<ToolExecutionResult>>;
@@ -559,6 +1090,8 @@ interface RuntimeExecutionState {
 }
 
 interface ExecutedToolCall {
+  startedAt?: number;
+  wallMs?: number;
   call: ModelToolCall;
   result: ToolExecutionResult;
   metadata: ToolExecutionMetadata;
@@ -570,6 +1103,8 @@ interface ExecutedToolCall {
 function createExecutionState(tools: readonly ModelToolDescriptor[]): RuntimeExecutionState {
   return {
     tools: new Map(tools.map((tool) => [tool.name, tool])),
+    evidenceSeen: new Set(),
+    evidenceDiscoveries: 0,
     cache: new Map(),
     inFlight: new Map(),
     workspaceRevision: 0,
@@ -613,6 +1148,7 @@ function agentProgressSnapshot(
     modelCalls: state.metrics.modelCalls,
     toolCalls: state.metrics.toolCalls,
     successfulMutations: execution.successfulMutations,
+    evidenceDiscoveries: execution.evidenceDiscoveries,
     hasMutationEvidence: execution.successfulMutations > 0,
     hasDiffEvidence: execution.hasDiffEvidence,
     ...(execution.progressFingerprint === undefined
@@ -680,6 +1216,7 @@ async function executeToolBatch(
   context: RunContext,
   signal: AbortSignal,
   state: RuntimeExecutionState,
+  observe: (result: ExecutedToolCall) => Promise<void>,
 ): Promise<ExecutedToolCall[]> {
   const results = new Array<ExecutedToolCall | undefined>(calls.length);
   let cursor = 0;
@@ -693,20 +1230,28 @@ async function executeToolBatch(
     }
     const metadata = toolMetadata(call.name, state.tools.get(call.name));
     if (metadata.readOnly && metadata.parallelSafe) {
-      const batch: { call: ModelToolCall; index: number; metadata: ToolExecutionMetadata }[] = [];
+      const batch: {
+        call: ModelToolCall;
+        index: number;
+        metadata: ToolExecutionMetadata;
+      }[] = [];
       while (cursor < calls.length) {
         const candidate = calls[cursor];
         if (candidate === undefined || candidate.name === "finishPhase") break;
         const candidateMetadata = toolMetadata(candidate.name, state.tools.get(candidate.name));
         if (!candidateMetadata.readOnly || !candidateMetadata.parallelSafe) break;
-        batch.push({ call: candidate, index: cursor, metadata: candidateMetadata });
+        batch.push({
+          call: candidate,
+          index: cursor,
+          metadata: candidateMetadata,
+        });
         cursor += 1;
       }
       const executed = await mapWithConcurrency(
         batch,
         MAX_PARALLEL_READS,
         async (entry) =>
-          await executeOneTool(entry.call, entry.metadata, stepId, context, signal, state),
+          await executeOneTool(entry.call, entry.metadata, stepId, context, signal, state, observe),
       );
       for (let index = 0; index < batch.length; index += 1) {
         const entry = batch[index];
@@ -715,7 +1260,7 @@ async function executeToolBatch(
       }
       continue;
     }
-    results[cursor] = await executeOneTool(call, metadata, stepId, context, signal, state);
+    results[cursor] = await executeOneTool(call, metadata, stepId, context, signal, state, observe);
     cursor += 1;
   }
 
@@ -726,26 +1271,43 @@ async function executeToolBatch(
     const priorSucceeded = results.slice(0, index).every((result) => result?.result.ok === true);
     const isLast = index === calls.length - 1;
     const schemaError = finishSchemaError(call, state.tools.get("finishPhase"));
-    const error = !isLast
-      ? "finishPhase must be the last call in a tool-call batch."
-      : schemaError !== undefined
-        ? schemaError
-        : summary.length === 0
-          ? "finishPhase requires a non-empty string input.summary."
-          : !priorSucceeded
-            ? "finishPhase was ignored because an earlier tool call failed."
-            : undefined;
+    context.postPatch?.toolStarted("finishPhase");
+    const error =
+      context.postPatch && !context.postPatch.ready
+        ? "PATCH_NOT_READY: resolve observed mutation/diff/target blockers before finishing."
+        : !isLast
+          ? "finishPhase must be the last call in a tool-call batch."
+          : schemaError !== undefined
+            ? schemaError
+            : summary.length === 0
+              ? "finishPhase requires a non-empty string input.summary."
+              : !priorSucceeded
+                ? "finishPhase was ignored because an earlier tool call failed."
+                : undefined;
     results[index] = {
       call,
       result:
         error === undefined
-          ? { ok: true, output: { finished: true, summary }, durationMs: 0 }
+          ? {
+              ok: true,
+              output: {
+                finished: true,
+                summary,
+                ...PhaseCompletionSchema.safeParse(call.input).data,
+              },
+              durationMs: 0,
+            }
           : controlFailure(error),
-      metadata: { readOnly: true, parallelSafe: false, mutatesWorkspace: false },
+      metadata: {
+        readOnly: true,
+        parallelSafe: false,
+        mutatesWorkspace: false,
+      },
       cached: false,
       executed: false,
       control: true,
     };
+    await observe(results[index]!);
   }
 
   return results.filter((result): result is ExecutedToolCall => result !== undefined);
@@ -758,14 +1320,97 @@ async function executeOneTool(
   context: RunContext,
   signal: AbortSignal,
   state: RuntimeExecutionState,
+  observe: (result: ExecutedToolCall) => Promise<void>,
 ): Promise<ExecutedToolCall> {
+  const startedAt = Date.now();
+  context.postPatch?.toolStarted(call.name);
+  const result = await executeOneToolInner(call, metadata, stepId, context, signal, state);
+  await observe(result);
+  return { ...result, startedAt, wallMs: Date.now() - startedAt };
+}
+
+function sourceContentBytes(value: unknown): number {
+  const record = objectValue(value);
+  if (!record) return 0;
+  return (
+    (typeof record.content === "string" ? Buffer.byteLength(record.content) : 0) +
+    (Array.isArray(record.files)
+      ? record.files.reduce((n: number, f: unknown) => n + sourceContentBytes(f), 0)
+      : 0)
+  );
+}
+
+function toolPaths(call: ModelToolCall, result: ToolExecutionResult): string[] {
+  const input = objectValue(call.input),
+    output = result.ok ? objectValue(result.output) : undefined;
+  return [
+    ...new Set([
+      ...(typeof input?.path === "string" ? [input.path] : []),
+      ...(Array.isArray(input?.paths)
+        ? input.paths.filter((p): p is string => typeof p === "string")
+        : []),
+      ...(Array.isArray(output?.changedFiles)
+        ? output.changedFiles.filter((p): p is string => typeof p === "string")
+        : []),
+    ]),
+  ].slice(0, 64);
+}
+
+async function executeOneToolInner(
+  call: ModelToolCall,
+  metadata: ToolExecutionMetadata,
+  stepId: StepId,
+  context: RunContext,
+  signal: AbortSignal,
+  state: RuntimeExecutionState,
+): Promise<ExecutedToolCall> {
+  const denied = context.authorizeTool?.({
+    callId: call.id,
+    name: call.name,
+    input: call.input,
+  });
+  if (denied) {
+    if (metadata.mutatesWorkspace && context.postPatch) {
+      const revision = context.postPatch.revision;
+      context.postPatch.observeMutation(
+        {
+          status: "REJECTED",
+          executionSucceeded: false,
+          mutationAttempted: false,
+          mutationApplied: false,
+          workspaceChanged: false,
+          reason: denied,
+          beforeRevision: revision,
+          afterRevision: revision,
+          changedFiles: [],
+          currentHashes: {},
+        },
+        [],
+      );
+    }
+    return {
+      call,
+      result: controlFailure(denied),
+      metadata,
+      cached: false,
+      executed: false,
+      control: false,
+    };
+  }
   const cacheKey = metadata.readOnly
     ? `${String(state.workspaceRevision)}:${call.name}:${stableStringify(call.input)}`
     : undefined;
   if (cacheKey !== undefined) {
     const cached = state.cache.get(cacheKey);
     if (cached !== undefined) {
-      return { call, result: cached, metadata, cached: true, executed: false, control: false };
+      return {
+        call,
+        result: cached,
+        metadata,
+        cached: true,
+        executed: false,
+        control: false,
+      };
     }
     const pending = state.inFlight.get(cacheKey);
     if (pending !== undefined) {
@@ -793,11 +1438,18 @@ async function executeOneTool(
     if (cacheKey !== undefined) state.inFlight.delete(cacheKey);
   }
   if (cacheKey !== undefined && result.ok) state.cache.set(cacheKey, result);
-  if (metadata.mutatesWorkspace && result.ok) {
-    state.workspaceRevision += 1;
+  if (metadata.mutatesWorkspace) {
+    state.workspaceRevision = result.mutation?.afterRevision ?? state.workspaceRevision + 1;
     state.cache.clear();
   }
-  return { call, result, metadata, cached: false, executed: true, control: false };
+  return {
+    call,
+    result,
+    metadata,
+    cached: false,
+    executed: true,
+    control: false,
+  };
 }
 
 function toolMetadata(
@@ -826,7 +1478,9 @@ function toolMetadata(
     "gitDiff",
     "gitDiffSummary",
   ]).has(name);
-  const mutatesWorkspace = new Set(["writeFile", "applyPatch", "runCommand"]).has(name);
+  const mutatesWorkspace = new Set(["writeFile", "replaceText", "applyPatch", "runCommand"]).has(
+    name,
+  );
   return { readOnly, parallelSafe: readOnly, mutatesWorkspace };
 }
 
@@ -933,7 +1587,12 @@ export function projectModelMessages(
       ...compactBase,
       ...(latestFiles === undefined
         ? []
-        : [{ ...latestFiles, content: truncateUtf8(latestFiles.content, 48 * 1_024) }]),
+        : [
+            {
+              ...latestFiles,
+              content: truncateUtf8(latestFiles.content, 48 * 1_024),
+            },
+          ]),
       ...selectedGroups.slice(-1).flatMap((group) => projectInteractionGroup(group, 40 * 1_024)),
     ];
   }
@@ -949,14 +1608,24 @@ export function projectModelMessages(
     projected = [
       ...(firstSystem?.role !== "SYSTEM"
         ? []
-        : [{ role: "SYSTEM" as const, content: truncateUtf8(firstSystem.content, 4_096) }]),
+        : [
+            {
+              role: "SYSTEM" as const,
+              content: truncateUtf8(firstSystem.content, 4_096),
+            },
+          ]),
       ...fixedUsers.map((message) => ({
         role: "USER" as const,
         content: truncateUtf8(message.content, 8_192),
       })),
       ...(latestFiles === undefined
         ? []
-        : [{ ...latestFiles, content: truncateUtf8(latestFiles.content, 24 * 1_024) }]),
+        : [
+            {
+              ...latestFiles,
+              content: truncateUtf8(latestFiles.content, 24 * 1_024),
+            },
+          ]),
       ...groups.slice(-1).flatMap((group) => projectInteractionGroup(group, 16 * 1_024)),
     ];
   }
@@ -979,10 +1648,16 @@ function interactionGroups(messages: readonly ModelMessage[]): ModelMessage[][] 
 
 function projectBaseMessage(message: ModelMessage, compact: boolean): ModelMessage {
   if (message.role === "SYSTEM") {
-    return { role: "SYSTEM", content: truncateUtf8(message.content, compact ? 8_192 : 24_576) };
+    return {
+      role: "SYSTEM",
+      content: truncateUtf8(message.content, compact ? 8_192 : 24_576),
+    };
   }
   if (message.role === "USER") {
-    return { role: "USER", content: truncateUtf8(message.content, compact ? 24_576 : 57_344) };
+    return {
+      role: "USER",
+      content: truncateUtf8(message.content, compact ? 24_576 : 57_344),
+    };
   }
   return message;
 }
@@ -1004,7 +1679,10 @@ function projectInteractionGroup(
   for (const message of group) {
     if (message.role === "TOOL") {
       if (!retainedIds.has(message.toolCallId)) continue;
-      projected.push({ ...message, content: boundModelValue(message.content, payloadBudget) });
+      projected.push({
+        ...message,
+        content: boundModelValue(message.content, payloadBudget),
+      });
       continue;
     }
     if (message.role === "ASSISTANT") {
@@ -1023,7 +1701,10 @@ function projectInteractionGroup(
       });
       continue;
     }
-    projected.push({ ...message, content: truncateUtf8(message.content, 4_096) });
+    projected.push({
+      ...message,
+      content: truncateUtf8(message.content, 4_096),
+    });
   }
   return projected;
 }
@@ -1087,15 +1768,24 @@ function serializedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value));
 }
 
+type FileSnapshot = {
+  path: string;
+  content: string;
+  truncated?: boolean;
+  startLine?: number;
+  endLine?: number;
+  fileSha256?: string;
+  workspaceRevision?: number;
+};
 function latestFileSnapshotMessage(
   messages: readonly ModelMessage[],
 ): { role: "USER"; content: string } | undefined {
-  const latest = new Map<string, { path: string; content: string; truncated?: boolean }>();
+  const latest = new Map<string, FileSnapshot>();
   for (const message of messages) {
     if (message.role === "ASSISTANT") {
       if (
         message.toolCalls?.some(({ name }) =>
-          new Set(["writeFile", "applyPatch", "runCommand"]).has(name),
+          new Set(["writeFile", "replaceText", "applyPatch", "runCommand"]).has(name),
         ) === true
       ) {
         latest.clear();
@@ -1115,23 +1805,29 @@ function latestFileSnapshotMessage(
     }
   }
   if (latest.size === 0) return undefined;
-  const files = [...latest.values()].slice(-8).map((file) => ({
-    ...file,
-    content: truncateUtf8(file.content, 24 * 1_024),
-  }));
+  const files = [...latest.values()].slice(-8).map((file) => {
+    const prefix = utf8Prefix(file.content, 1536);
+    const partial = prefix !== file.content;
+    const content = partial ? prefix.slice(0, prefix.lastIndexOf("\n") + 1) : prefix;
+    const startLine = file.startLine ?? 1;
+    const lines = content.match(/[^\n]*\n|[^\n]+$/gu)?.length ?? 0;
+    return {
+      ...file,
+      content,
+      startLine,
+      endLine: lines ? startLine + lines - 1 : startLine - 1,
+      truncated: file.truncated || partial,
+      note: "Bounded historical snapshot. Use the tool result or current range read for exact source and identity.",
+    };
+  });
+  while (serializedBytes(files) > 16 * 1024 && files.length > 1) files.shift();
   return {
     role: "USER",
-    content: `Latest relevant file snapshots (newer reads replace older versions):\n${truncateUtf8(
-      JSON.stringify(files),
-      160 * 1_024,
-    )}`,
+    content: `Latest relevant file snapshots (newer reads replace older versions):\n${JSON.stringify(files)}`,
   };
 }
 
-function rememberFileSnapshot(
-  latest: Map<string, { path: string; content: string; truncated?: boolean }>,
-  value: unknown,
-): void {
+function rememberFileSnapshot(latest: Map<string, FileSnapshot>, value: unknown): void {
   const record = objectValue(value);
   if (
     record?.ok === false ||
@@ -1145,6 +1841,12 @@ function rememberFileSnapshot(
     path: record.path,
     content: record.content,
     ...(typeof record.truncated === "boolean" ? { truncated: record.truncated } : {}),
+    ...(typeof record.startLine === "number" ? { startLine: record.startLine } : {}),
+    ...(typeof record.endLine === "number" ? { endLine: record.endLine } : {}),
+    ...(typeof record.fileSha256 === "string" ? { fileSha256: record.fileSha256 } : {}),
+    ...(typeof record.workspaceRevision === "number"
+      ? { workspaceRevision: record.workspaceRevision }
+      : {}),
   });
   while (latest.size > 8) {
     const oldest = latest.keys().next().value as string | undefined;
@@ -1296,6 +1998,7 @@ function runMetrics(state: AgentState): RunMetrics {
     modelLatencyMs: state.metrics.modelLatencyMs,
     toolLatencyMs: state.metrics.toolLatencyMs,
     tokenUsage: state.metrics.tokenUsage,
+    contextCompressionReservedTokens: state.contextCompression?.pendingTokenReserve ?? 0,
     control: {
       duplicateToolCalls: state.metrics.duplicateToolCalls,
       contextCacheHits: state.metrics.cacheHits,
@@ -1313,10 +2016,16 @@ function throwIfAborted(
 ): void {
   if (!signal.aborted) return;
   if (callerSignal.aborted) {
-    throw new DevflowError({ code: "CANCELLED", message: "Agent run was cancelled." });
+    throw new DevflowError({
+      code: "CANCELLED",
+      message: "Agent run was cancelled.",
+    });
   }
   if (deadlineSignal.aborted) {
-    throw new DevflowError({ code: "TIMEOUT", message: "Agent run deadline exceeded." });
+    throw new DevflowError({
+      code: "TIMEOUT",
+      message: "Agent run deadline exceeded.",
+    });
   }
   signal.throwIfAborted();
 }
@@ -1327,10 +2036,16 @@ function normalizeRunError(
   deadlineSignal: AbortSignal,
 ): DevflowError {
   if (callerSignal.aborted) {
-    return new DevflowError({ code: "CANCELLED", message: "Agent run was cancelled." });
+    return new DevflowError({
+      code: "CANCELLED",
+      message: "Agent run was cancelled.",
+    });
   }
   if (deadlineSignal.aborted) {
-    return new DevflowError({ code: "TIMEOUT", message: "Agent run deadline exceeded." });
+    return new DevflowError({
+      code: "TIMEOUT",
+      message: "Agent run deadline exceeded.",
+    });
   }
   return toDevflowError(error, {
     code: "LLM_FAILED",

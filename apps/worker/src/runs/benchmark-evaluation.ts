@@ -24,6 +24,8 @@ const BENCHMARK_TOOL_NAMES = new Set([
   "gitStatus",
   "listFiles",
   "readFile",
+  "readEvidenceArtifact",
+  "replaceText",
   "runCommand",
   "searchCode",
   "writeFile",
@@ -43,6 +45,8 @@ export interface BenchmarkToolConfiguration {
 }
 
 export interface BenchmarkExecutionConfiguration {
+  /** Host-only edit policy; never include evaluator rules or commands in prompts. */
+  protectedPaths?: readonly string[];
   modelParameters: BenchmarkModelParameters;
   runtime: BenchmarkRuntimeConfiguration;
   tools: BenchmarkToolConfiguration;
@@ -277,17 +281,42 @@ async function runTrustedCommand(
   command: BenchmarkCase["evaluationCommand"],
   signal: AbortSignal,
 ): Promise<CommandResult> {
-  return await sandbox.exec(
-    {
-      program: command.program,
-      args: command.args,
-      cwd: command.cwd,
-      env: command.environment,
-      ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
-      maxOutputBytes: 1_000_000,
-    },
-    signal,
-  );
+  const startedAt = Date.now();
+  try {
+    return await sandbox.exec(
+      {
+        program: command.program,
+        args: command.args,
+        cwd: command.cwd,
+        env: command.environment,
+        ...(command.timeoutMs === undefined ? {} : { timeoutMs: command.timeoutMs }),
+        maxOutputBytes: 1_000_000,
+      },
+      signal,
+    );
+  } catch (error) {
+    signal.throwIfAborted();
+    // A Docker deadline permanently invalidates its segment. Record the
+    // evaluator timeout, then let the owner dispose it; never run cleanup or
+    // additional hashes in that unsafe segment or promote isolation to true.
+    if (
+      error instanceof DevflowError &&
+      error.code === "SANDBOX_RESOURCE_LIMIT" &&
+      typeof error.details === "object" &&
+      error.details !== null &&
+      (error.details as { exitCode?: unknown }).exitCode === 124
+    ) {
+      return {
+        exitCode: 124,
+        stdout: "",
+        stderr: error.message,
+        durationMs: Math.max(0, Date.now() - startedAt),
+        timedOut: true,
+        outputTruncated: false,
+      };
+    }
+    throw error;
+  }
 }
 
 async function readSandboxHead(sandbox: SandboxSession, signal: AbortSignal): Promise<string> {
@@ -399,6 +428,7 @@ function parseBenchmarkConfiguration(
 
   return {
     modelParameters,
+    protectedPaths: testCase.rules.protectedPaths.map(({ path }) => path),
     runtime: parsed.data.runtime.configuration,
     tools: {
       enabled,

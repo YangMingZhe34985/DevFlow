@@ -202,6 +202,28 @@ export function RunDetail({
                     <p className="approval-note">{approvalSpecificPlan.summary}</p>
                   )
                 )}
+                {approvalSpecificPlan?.scope !== undefined && (
+                  <div className="approval-note">
+                    <strong>
+                      {approvalSpecificPlan.scope.mode === "DISCOVERY_ONLY"
+                        ? "仅批准只读调查；写入目标需再次审批。"
+                        : "本次批准的写入范围："}
+                    </strong>
+                    {approvalSpecificPlan.scope.files.length > 0 && (
+                      <ul>
+                        {approvalSpecificPlan.scope.files.map((file) => (
+                          <li key={file.path}>
+                            <code>{file.path}</code> · {file.operation}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {(approvalSpecificPlan.warnings ?? []).map((warning, index) => (
+                      <p key={index}>{warning}</p>
+                    ))}
+                    <JsonDetails label="完整提案与验证需求" value={approvalSpecificPlan.raw} />
+                  </div>
+                )}
                 {approval.comment !== undefined && (
                   <p className="approval-feedback">
                     <strong>反馈：</strong>

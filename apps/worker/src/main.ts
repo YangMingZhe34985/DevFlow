@@ -21,6 +21,19 @@ const processor = new RunProcessor(database.runs, executor, {
   workerId: `worker-${process.pid}-${randomUUID()}`,
   leaseMs: environment.WORKER_LEASE_MS,
   cancellationPollMs: environment.WORKER_CANCEL_POLL_MS,
+  observeTiming: async (
+    runId: string,
+    timing: { queueWaitMs: number; executionWallMs: number; exitReason: string },
+  ) => {
+    await database.events.append({
+      runId,
+      type: "WORKFLOW_CHECKPOINT",
+      occurredAt: new Date().toISOString(),
+      payload: {
+        performance: { ...timing, kind: "dispatch-wall-clock", includesApprovalWait: false },
+      },
+    });
+  },
 });
 
 let shuttingDown = false;

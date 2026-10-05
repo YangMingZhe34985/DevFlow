@@ -7,3 +7,10 @@ node_modules
 coverage
 .env*
 *.log
+.devflow
+.codex
+.claude
+docs/performance
+docs/Devflow-*
+benchmarks/real-issues
+tests/fixtures/planner-*

@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 
-import type { LanguageModelPort, ModelMessage, ModelRequest, ModelResponse } from "@devflow/agent";
+import type {
+  LanguageModelPort,
+  ModelGenerationSettings,
+  ModelMessage,
+  ModelRequest,
+  ModelResponse,
+} from "@devflow/agent";
 import { DevflowError } from "@devflow/shared";
 import type { z } from "zod";
 
@@ -17,6 +23,7 @@ interface StructuredFailure {
 export interface StructuredOutputAttempt {
   purpose: string;
   formatRepair: boolean;
+  regeneration?: boolean;
   response: ModelResponse;
   failure?: StructuredFailure;
 }
@@ -29,6 +36,9 @@ export interface GenerateStructuredOutputInput<T> {
   purpose: string;
   messages: readonly ModelMessage[];
   signal: AbortSignal;
+  settings?: ModelGenerationSettings;
+  /** One new semantic decision from the original context, never a repair of truncated JSON. */
+  lengthRegeneration?: boolean;
   onRequest?(input: { purpose: string; formatRepair: boolean }): Promise<void>;
   onResponse?(attempt: StructuredOutputAttempt): Promise<void>;
   onGenerationError?(input: {
@@ -43,6 +53,7 @@ export interface GenerateStructuredOutputResult<T> {
   value: T;
   attempts: readonly StructuredOutputAttempt[];
   formatRepairAttempts: number;
+  regenerationAttempts: number;
 }
 
 /**
@@ -59,10 +70,25 @@ export async function generateStructuredOutput<T>(
   const initialValue = validatedValue(initial.response, input.schema);
   if (initialValue.success) {
     await input.onResponse?.(initial);
-    return { value: initialValue.value, attempts, formatRepairAttempts: 0 };
+    return {
+      value: initialValue.value,
+      attempts,
+      formatRepairAttempts: 0,
+      regenerationAttempts: 0,
+    };
   }
   attempts[0] = { ...initial, failure: initialValue.failure };
   await input.onResponse?.(attempts[0]!);
+
+  if (input.lengthRegeneration && initial.response.finishReason === "LENGTH") {
+    const regenerated = await generateAttempt(input, input.messages, false, true);
+    const value = validatedValue(regenerated.response, input.schema);
+    attempts.push(value.success ? regenerated : { ...regenerated, failure: value.failure });
+    await input.onResponse?.(attempts.at(-1)!);
+    if (value.success)
+      return { value: value.value, attempts, formatRepairAttempts: 0, regenerationAttempts: 1 };
+    throw invalidOutputError(input.purpose, attempts);
+  }
 
   if (initialValue.failure.kind === "EMPTY_OUTPUT" || initialValue.failure.rawText === undefined) {
     throw invalidOutputError(input.purpose, attempts);
@@ -89,7 +115,12 @@ export async function generateStructuredOutput<T>(
   const repairedValue = validatedValue(repaired.response, input.schema);
   if (repairedValue.success) {
     await input.onResponse?.(repaired);
-    return { value: repairedValue.value, attempts, formatRepairAttempts: 1 };
+    return {
+      value: repairedValue.value,
+      attempts,
+      formatRepairAttempts: 1,
+      regenerationAttempts: 0,
+    };
   }
   attempts[1] = { ...repaired, failure: repairedValue.failure };
   await input.onResponse?.(attempts[1]!);
@@ -100,8 +131,13 @@ async function generateAttempt<T>(
   input: GenerateStructuredOutputInput<T>,
   messages: readonly ModelMessage[],
   formatRepair: boolean,
+  regeneration = false,
 ): Promise<StructuredOutputAttempt> {
-  const purpose = formatRepair ? `${input.purpose}_FORMAT_REPAIR` : input.purpose;
+  const purpose = regeneration
+    ? `${input.purpose}_LENGTH_REGENERATION`
+    : formatRepair
+      ? `${input.purpose}_FORMAT_REPAIR`
+      : input.purpose;
   await input.onRequest?.({ purpose, formatRepair });
   const request: ModelRequest = {
     messages,
@@ -111,12 +147,15 @@ async function generateAttempt<T>(
       description: input.description,
       schema: input.schema,
     },
-    settings: { reasoningEffort: "none" },
+    settings: {
+      ...input.settings,
+      ...(formatRepair || regeneration ? { reasoningEffort: "none" as const } : {}),
+    },
   };
   const startedAt = Date.now();
   try {
     const response = await input.model.generate(request, { signal: input.signal });
-    return { purpose, formatRepair, response };
+    return { purpose, formatRepair, ...(regeneration ? { regeneration: true } : {}), response };
   } catch (error) {
     await input.onGenerationError?.({
       purpose,
@@ -215,25 +254,30 @@ function invalidOutputError(
     message: `${purpose} did not produce a valid structured result.`,
     details: {
       stage: purpose,
-      attempts: attempts.map(({ purpose: attemptPurpose, formatRepair, response, failure }) => ({
-        purpose: attemptPurpose,
-        formatRepair,
-        finishReason: response.finishReason,
-        outputLength: failure?.rawText?.length ?? response.text?.length ?? 0,
-        outputHash:
-          failure?.rawTextHash ??
-          (response.text === undefined || response.text.length === 0
-            ? undefined
-            : hash(response.text)),
-        error:
-          failure === undefined
-            ? undefined
-            : {
-                kind: failure.kind,
-                message: failure.message,
-                issues: failure.issues,
-              },
-      })),
+      attempts: attempts.map(
+        ({ purpose: attemptPurpose, formatRepair, regeneration, response, failure }) => ({
+          purpose: attemptPurpose,
+          formatRepair,
+          regeneration: regeneration ?? false,
+          finishReason: response.finishReason,
+          usage: response.usage,
+          reasoningTokens: response.reasoningTokens,
+          outputLength: failure?.rawText?.length ?? response.text?.length ?? 0,
+          outputHash:
+            failure?.rawTextHash ??
+            (response.text === undefined || response.text.length === 0
+              ? undefined
+              : hash(response.text)),
+          error:
+            failure === undefined
+              ? undefined
+              : {
+                  kind: failure.kind,
+                  message: failure.message,
+                  issues: failure.issues,
+                },
+        }),
+      ),
     },
   });
 }

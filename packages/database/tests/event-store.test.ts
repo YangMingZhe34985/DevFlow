@@ -302,12 +302,19 @@ describe("Prisma event store", () => {
       },
     };
     const current = prismaRun({ id: runId, executionOwner: owner });
+    const verification = {
+      execution: "PATCH_READY" as const,
+      test: "TEST_PASSED" as const,
+      review: "REVIEW_PASSED" as const,
+      issue: "VERIFICATION_INCONCLUSIVE" as const,
+      reason: "ISSUE_REPRODUCTION_NOT_ESTABLISHED",
+    };
     const terminal = prismaRun({
       ...current,
       status: "SUCCEEDED",
       currentStage: "DONE",
       executionOwner: null,
-      metricsDetail: metrics,
+      metricsDetail: { ...metrics, verification },
       finishedAt: new Date("2026-09-19T01:02:03.000Z"),
     });
     const updateMany = vi.fn(async () => ({ count: 1 }));
@@ -332,6 +339,7 @@ describe("Prisma event store", () => {
       runId,
       status: "SUCCEEDED",
       metrics,
+      verification,
     });
 
     expect(updateMany).toHaveBeenCalledWith(
@@ -340,11 +348,12 @@ describe("Prisma event store", () => {
           stepCount: 2,
           modelCallCount: 2,
           toolCallCount: 3,
-          metricsDetail: metrics,
+          metricsDetail: { ...metrics, verification },
         }),
       }),
     );
     expect(completed.result?.metrics).toEqual(metrics);
+    expect(completed.result?.verification).toEqual(verification);
   });
 
   it("uses expectedStage as an optional transition compare-and-swap guard", async () => {

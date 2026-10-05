@@ -19,6 +19,8 @@ import type {
 export interface PlanView {
   summary?: string;
   steps: readonly { id: string; title: string; description?: string }[];
+  scope?: { mode: string; files: readonly { path: string; operation: string }[] };
+  warnings?: readonly string[];
   raw: JsonValue;
 }
 
@@ -914,8 +916,22 @@ function normalizePlan(value: unknown): PlanView | undefined {
   });
   if (normalizedSteps.length === 0) return undefined;
   const summary = readString(record, "summary");
+  const scope = asObject(record.approvalScope);
+  const mode = readString(scope, "mode");
+  const files = Array.isArray(scope?.files)
+    ? scope.files.flatMap((file) => {
+        const item = asObject(file),
+          path = readString(item, "path"),
+          operation = readString(item, "operation");
+        return path && operation ? [{ path, operation }] : [];
+      })
+    : [];
   return {
     ...(summary === undefined ? {} : { summary }),
+    ...(mode === undefined ? {} : { scope: { mode, files } }),
+    ...(Array.isArray(record.warnings)
+      ? { warnings: record.warnings.filter((w): w is string => typeof w === "string") }
+      : {}),
     steps: normalizedSteps,
     raw: (nested ?? outer ?? null) as JsonValue,
   };

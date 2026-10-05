@@ -58,6 +58,7 @@ export const GitHubRepositoryTreeEntrySchema = z.strictObject({
   path: z.string().min(1).max(4_096).refine(isSafePath, "Path must be repository-relative."),
   kind: z.enum(["FILE", "SYMLINK", "DIRECTORY"]),
   sizeBytes: z.number().int().nonnegative().optional(),
+  blobSha: GitHubShaSchema.optional(),
 });
 export type GitHubRepositoryTreeEntry = z.infer<typeof GitHubRepositoryTreeEntrySchema>;
 
@@ -66,6 +67,23 @@ export const GitHubRepositoryTreeSchema = z.strictObject({
   truncated: z.boolean(),
 });
 export type GitHubRepositoryTree = z.infer<typeof GitHubRepositoryTreeSchema>;
+
+/** Blob identity must come from the tree at the workflow's fixed commit. */
+export const GitHubRepositoryFileRequestSchema = z.strictObject({
+  repository: GitHubRepositorySchema,
+  blobSha: GitHubShaSchema,
+  maxBytes: z
+    .number()
+    .int()
+    .positive()
+    .max(512 * 1024),
+});
+export type GitHubRepositoryFileRequest = z.infer<typeof GitHubRepositoryFileRequestSchema>;
+export interface GitHubRepositoryFile {
+  content: string;
+  blobSha: string;
+  sizeBytes: number;
+}
 
 export const GitHubPushRequestSchema = z
   .strictObject({
@@ -140,6 +158,10 @@ export interface GitHubProvider {
     input: GitHubRepositoryTreeRequest,
     signal?: AbortSignal,
   ): Promise<GitHubRepositoryTree>;
+  readRepositoryFile(
+    input: GitHubRepositoryFileRequest,
+    signal?: AbortSignal,
+  ): Promise<GitHubRepositoryFile>;
   pushBranch(input: GitHubPushRequest, signal?: AbortSignal): Promise<GitHubPushResult>;
   createPullRequest(
     input: GitHubPullRequestRequest,

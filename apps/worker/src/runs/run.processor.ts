@@ -13,6 +13,10 @@ import type { Job } from "bullmq";
 import type { RunExecutionPort } from "./run-execution.js";
 
 export interface RunProcessorOptions {
+  observeTiming?: (
+    runId: string,
+    timing: { queueWaitMs: number; executionWallMs: number; exitReason: string },
+  ) => Promise<void>;
   workerId: string;
   leaseMs: number;
   cancellationPollMs: number;
@@ -42,6 +46,8 @@ export class RunProcessor {
     if (run === null) return { outcome: "SKIPPED" };
 
     const cancellation = new AbortController();
+    const executionStarted = Date.now();
+    let exitReason = "ERROR";
     const signal =
       workerSignal === undefined
         ? cancellation.signal
@@ -58,6 +64,7 @@ export class RunProcessor {
     try {
       if (await this.runs.isCancellationRequested(run.id)) cancellation.abort();
       const result = await this.executor.execute(run, signal);
+      exitReason = result.status;
       if (result.status === "WAITING_APPROVAL") {
         if (result.approvalKind === "GITHUB") {
           await this.runs.pauseForGitHubApproval(run.id, owner, result.approval);
@@ -68,6 +75,7 @@ export class RunProcessor {
       }
       if (await this.runs.isCancellationRequested(run.id)) {
         const cancelled = cancelledResult(run.id, new Error("Cancellation was requested."));
+        cancelled.metrics = result.metrics;
         const persisted = await this.runs.complete(run.id, owner, cancelled);
         return { outcome: "COMPLETED", status: persisted.status };
       }
@@ -81,9 +89,16 @@ export class RunProcessor {
       const persisted = await this.runs.complete(run.id, owner, result);
       return { outcome: "COMPLETED", status: persisted.status as RunResult["status"] };
     } catch (error) {
+      let observed = run.result?.metrics ?? emptyMetrics();
+      try {
+        observed = (await this.executor.observedMetrics?.(run)) ?? observed;
+      } catch {
+        console.error("Failure metrics recovery incomplete", { runId: run.id, incomplete: true });
+      }
       const cancelled = await this.runs.isCancellationRequested(run.id);
       if (cancelled) {
         const result = cancelledResult(run.id, error);
+        result.metrics = observed;
         const persisted = await this.runs.complete(run.id, owner, result);
         return { outcome: "COMPLETED", status: persisted.status as RunResult["status"] };
       }
@@ -101,10 +116,24 @@ export class RunProcessor {
       }
 
       const result = failedResult(run.id, normalized);
+      result.metrics = observed;
       const persisted = await this.runs.complete(run.id, owner, result);
       return { outcome: "COMPLETED", status: persisted.status };
     } finally {
       clearInterval(timer);
+      try {
+        await this.options.observeTiming?.(run.id, {
+          queueWaitMs: Math.max(0, executionStarted - (job.timestamp ?? executionStarted)),
+          executionWallMs: Date.now() - executionStarted,
+          exitReason,
+        });
+      } catch (error) {
+        // Observability must not retry a Run already atomically completed or paused.
+        console.error("Dispatch timing persistence failed", {
+          runId: run.id,
+          errorType: error instanceof Error ? error.name : "UnknownError",
+        });
+      }
     }
   }
 
@@ -119,10 +148,20 @@ export class RunProcessor {
         return;
       }
       if (!(await this.runs.renewLease(runId, owner, this.options.leaseMs))) {
-        cancellation.abort();
+        cancellation.abort(
+          new DevflowError({
+            code: "SANDBOX_LOST_OWNERSHIP",
+            message: "Run lease ownership was lost.",
+          }),
+        );
       }
     } catch {
-      cancellation.abort();
+      cancellation.abort(
+        new DevflowError({
+          code: "SANDBOX_LOST_OWNERSHIP",
+          message: "Run lease could not be verified.",
+        }),
+      );
     }
   }
 }

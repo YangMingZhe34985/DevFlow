@@ -5,6 +5,9 @@ import {
   GitHubPushRequestSchema,
   GitHubRepositoryTreeRequestSchema,
   GitHubRepositoryTreeSchema,
+  GitHubRepositoryFileRequestSchema,
+  type GitHubRepositoryFileRequest,
+  type GitHubRepositoryFile,
   GitHubResolveBaseRequestSchema,
   GitHubResolvedBaseSchema,
   type GitHubProvider,
@@ -27,6 +30,7 @@ export interface FakeGitHubProviderOptions {
   defaultBranch?: string;
   baseCommitSha?: string;
   repositoryTree?: GitHubRepositoryTree;
+  repositoryFiles?: Record<string, string>;
 }
 
 export class MemoryGitHubPublicationStore implements GitHubPublicationStore {
@@ -107,6 +111,7 @@ export class MemoryGitHubPublicationStore implements GitHubPublicationStore {
 /** Deterministic provider for tests. It never performs network or credential access. */
 export class FakeGitHubProvider implements GitHubProvider {
   readonly repositoryTreeCalls: GitHubRepositoryTreeRequest[] = [];
+  readonly repositoryFileCalls: GitHubRepositoryFileRequest[] = [];
   readonly pushCalls: GitHubPushRequest[] = [];
   readonly pullRequestCalls: GitHubPullRequestRequest[] = [];
   readonly pushSideEffects: GitHubPushResult[] = [];
@@ -118,14 +123,24 @@ export class FakeGitHubProvider implements GitHubProvider {
   private readonly defaultBranch: string;
   private readonly baseCommitSha: string;
   private readonly repositoryTree: GitHubRepositoryTree;
+  private readonly blobs = new Map<string, string>();
 
   constructor(options: FakeGitHubProviderOptions = {}) {
     this.failPushes = options.failPushes ?? 0;
     this.failPullRequests = options.failPullRequests ?? 0;
     this.defaultBranch = options.defaultBranch ?? "main";
     this.baseCommitSha = options.baseCommitSha ?? "a".repeat(40);
+    const entries = Object.entries(options.repositoryFiles ?? {}).map(([path, content]) => {
+      const sizeBytes = Buffer.byteLength(content);
+      const blobSha = createHash("sha1")
+        .update(`blob ${sizeBytes}\0`)
+        .update(content)
+        .digest("hex");
+      this.blobs.set(blobSha, content);
+      return { path, sizeBytes, blobSha, kind: "FILE" as const };
+    });
     this.repositoryTree = GitHubRepositoryTreeSchema.parse(
-      options.repositoryTree ?? { entries: [], truncated: false },
+      options.repositoryTree ?? { entries, truncated: false },
     );
   }
 
@@ -141,6 +156,26 @@ export class FakeGitHubProvider implements GitHubProvider {
     const parsed = GitHubRepositoryTreeRequestSchema.parse(input);
     this.repositoryTreeCalls.push(structuredClone(parsed));
     return structuredClone(this.repositoryTree);
+  }
+
+  async readRepositoryFile(
+    input: GitHubRepositoryFileRequest,
+    signal?: AbortSignal,
+  ): Promise<GitHubRepositoryFile> {
+    signal?.throwIfAborted();
+    const parsed = GitHubRepositoryFileRequestSchema.parse(input);
+    this.repositoryFileCalls.push(structuredClone(parsed));
+    const content = this.blobs.get(parsed.blobSha);
+    if (content === undefined)
+      throw new GitHubProviderError("NOT_FOUND", "Fake repository blob not found.", false);
+    const sizeBytes = Buffer.byteLength(content);
+    if (sizeBytes > parsed.maxBytes)
+      throw new GitHubProviderError(
+        "INVALID_REQUEST",
+        "Fake repository blob exceeds the byte limit.",
+        false,
+      );
+    return { content, sizeBytes, blobSha: parsed.blobSha };
   }
 
   async pushBranch(input: GitHubPushRequest): Promise<GitHubPushResult> {

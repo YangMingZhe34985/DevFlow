@@ -25,7 +25,7 @@ describe("generateStructuredOutput", () => {
     expect(result.formatRepairAttempts).toBe(0);
     expect(model.requests).toHaveLength(1);
     expect(model.requests[0]?.output?.schema).toBe(schema);
-    expect(model.requests[0]?.settings?.reasoningEffort).toBe("none");
+    expect(model.requests[0]?.settings?.reasoningEffort).toBeUndefined();
   });
 
   it("treats fenced JSON as malformed and performs one context-free format repair", async () => {
@@ -74,6 +74,65 @@ describe("generateStructuredOutput", () => {
     const model = new FakeLanguageModel([fakeModelResponse({ toolCalls: [], text: "" })]);
     await expect(run(model)).rejects.toMatchObject({ code: "MODEL_OUTPUT_INVALID" });
     expect(model.requests).toHaveLength(1);
+  });
+
+  it("regenerates a truncated decision from original context once, without repairing the partial JSON", async () => {
+    const model = new FakeLanguageModel([
+      fakeModelResponse({ toolCalls: [], text: '{"verdict":', finishReason: "LENGTH" }),
+      fakeModelResponse({
+        toolCalls: [],
+        text: JSON.stringify({ verdict: "PASS", summary: "ok", issues: [] }),
+      }),
+    ]);
+    const onResponse = vi.fn();
+    const result = await generateStructuredOutput({
+      model,
+      schema,
+      name: "localization",
+      description: "decision",
+      purpose: "LOCALIZATION",
+      messages: [{ role: "USER", content: "original evidence" }],
+      signal: new AbortController().signal,
+      settings: { maxOutputTokens: 4096 },
+      lengthRegeneration: true,
+      onResponse,
+    });
+    expect(result.regenerationAttempts).toBe(1);
+    expect(result.formatRepairAttempts).toBe(0);
+    expect(model.requests[1]?.messages).toEqual(model.requests[0]?.messages);
+    expect(model.requests[1]?.settings).toEqual({ maxOutputTokens: 4096, reasoningEffort: "none" });
+    expect(result.attempts[0]?.failure?.kind).toBe("INVALID_JSON");
+    expect(result.attempts[1]?.purpose).toBe("LOCALIZATION_LENGTH_REGENERATION");
+    expect(onResponse).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops after one empty LENGTH regeneration and records both failed attempts", async () => {
+    const model = new FakeLanguageModel(
+      Array.from({ length: 2 }, () =>
+        fakeModelResponse({ toolCalls: [], text: "", finishReason: "LENGTH" }),
+      ),
+    );
+    await expect(
+      generateStructuredOutput({
+        model,
+        schema,
+        name: "localization",
+        description: "decision",
+        purpose: "LOCALIZATION",
+        messages: [{ role: "USER", content: "evidence" }],
+        signal: new AbortController().signal,
+        lengthRegeneration: true,
+      }),
+    ).rejects.toMatchObject({
+      code: "MODEL_OUTPUT_INVALID",
+      details: {
+        attempts: [
+          { regeneration: false, finishReason: "LENGTH", error: { kind: "EMPTY_OUTPUT" } },
+          { regeneration: true, finishReason: "LENGTH", error: { kind: "EMPTY_OUTPUT" } },
+        ],
+      },
+    });
+    expect(model.requests).toHaveLength(2);
   });
 });
 

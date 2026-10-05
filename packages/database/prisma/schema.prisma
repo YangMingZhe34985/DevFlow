@@ -112,6 +112,17 @@ enum BenchmarkExecutionStatus {
   INTERRUPTED
 }
 
+// Immutable cache entries: only complete, validated values are inserted. No mutable READY pointer.
+model RepositoryIndexEntry {
+  scope     String
+  key       String
+  value     Json
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@id([scope, key])
+  @@index([createdAt])
+}
+
 model Repository {
   id            String               @id @default(uuid()) @db.Uuid
   name          String

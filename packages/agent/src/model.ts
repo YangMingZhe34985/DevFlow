@@ -41,6 +41,7 @@ export type ModelReasoningEffort = "none" | "minimal" | "low" | "medium" | "high
 
 export interface ModelGenerationSettings {
   reasoningEffort?: ModelReasoningEffort;
+  maxOutputTokens?: number;
 }
 
 export interface ModelRequest {

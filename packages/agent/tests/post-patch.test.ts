@@ -1,0 +1,165 @@
+import { randomUUID } from "node:crypto";
+import { expect, it } from "vitest";
+import { z } from "zod";
+import {
+  DefaultAgentRuntime,
+  FakeLanguageModel,
+  fakeModelResponse,
+  PostPatchController,
+  type ModelToolCall,
+} from "../src/index.js";
+import type { MutationResult } from "@devflow/shared";
+
+const write: ModelToolCall = {
+  id: "w",
+  name: "writeFile",
+  input: { path: "a.ts", content: "new" },
+};
+const finish: ModelToolCall = {
+  id: "f",
+  name: "finishPhase",
+  input: { summary: "The issue is fixed!", outcome: "CHANGED" },
+};
+const read: ModelToolCall = { id: "r", name: "readFile", input: { path: "a.ts" } };
+async function run(
+  options: {
+    auto?: boolean;
+    noop?: boolean;
+    calls?: ModelToolCall[][];
+    maxSteps?: number;
+    maxTools?: number;
+  } = {},
+) {
+  const c = new PostPatchController(["a.ts"], 4, options.auto);
+  const tools = ["writeFile", "readFile", "gitDiff", "finishPhase", "searchCode"].map((name) => ({
+    name,
+    description: name,
+    inputSchema: z.unknown(),
+  }));
+  const calls = options.calls ?? [[write], [finish]];
+  const model = new FakeLanguageModel(
+    calls.map((toolCalls, i) => async (request) => {
+      if (i > 0 && c.active) {
+        const text = JSON.stringify(request.messages);
+        expect(text).toContain("POST_PATCH_COMPLETION");
+        expect(text).not.toContain("STALE_WORKING_SET");
+        expect(text).not.toContain("EXPLORATION_HISTORY");
+        expect(request.tools.map((t) => t.name)).not.toContain("searchCode");
+        if (c.ready) {
+          expect(request.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+          expect(text).toContain("test/review steps belong to the external workflow");
+        }
+      }
+      return fakeModelResponse({
+        toolCalls,
+        usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      });
+    }),
+  );
+  const result = await new DefaultAgentRuntime(model).run(
+    {
+      maxSteps: options.maxSteps ?? calls.length,
+      maxRetries: 0,
+      timeoutMs: 3000,
+      approvedPlan: { summary: "Update a.ts", steps: [] },
+      additionalContext: "STALE_WORKING_SET EXPLORATION_HISTORY",
+      postPatch: c,
+      executionBudget: {
+        stage: "EXECUTE",
+        maxModelCalls: 10,
+        maxToolCalls: options.maxTools ?? 20,
+        maxTotalTokens: 1000,
+      },
+      emitRunLifecycle: false,
+    },
+    {
+      runId: randomUUID(),
+      signal: new AbortController().signal,
+      task: {
+        taskId: randomUUID(),
+        repositoryId: randomUUID(),
+        title: "Edit",
+        description: "Edit a.ts",
+      },
+      tools,
+      emit: async () => undefined,
+      executeTool: async (_step, request) => {
+        if (request.name === "writeFile") {
+          const mutation: MutationResult = {
+            status: options.noop ? "NO_OP" : "APPLIED",
+            executionSucceeded: true,
+            mutationAttempted: true,
+            mutationApplied: !options.noop,
+            workspaceChanged: !options.noop,
+            reason: options.noop ? "CONTENT_IDENTICAL" : "CONTENT_CHANGED",
+            beforeRevision: c.revision,
+            afterRevision: c.revision + (options.noop ? 0 : 1),
+            changedFiles: options.noop ? [] : ["a.ts"],
+            currentHashes: { "a.ts": "new" },
+          };
+          c.observeMutation(mutation, ["a.ts"]);
+          return { ok: true, output: {}, durationMs: 1, mutation };
+        }
+        if (request.name === "gitDiff")
+          c.observeDiff(
+            options.noop ? "" : "valid current diff",
+            options.noop ? [] : ["a.ts"],
+            true,
+          );
+        return { ok: true, output: { content: "new" }, durationMs: 1 };
+      },
+    },
+  );
+  return { result, model, c };
+}
+it("finishes via one minimal completion call, with truthful summary and exact postpatch accounting", async () => {
+  const { result } = await run();
+  expect(result.status).toBe("SUCCEEDED");
+  expect(result.summary).not.toContain("issue is fixed");
+  expect(result.executeCompletion).toMatchObject({
+    outcome: "PATCH_READY",
+    metrics: {
+      postPatchModelCalls: 1,
+      postPatchToolCalls: 2,
+      postPatchInputTokens: 10,
+      postPatchOutputTokens: 2,
+      postPatchGitDiffCalls: 1,
+    },
+  });
+  expect(result.metrics.toolCalls).toBe(3);
+});
+it("same-batch write + finish checks the deterministic diff first without another model call", async () => {
+  const { result } = await run({ calls: [[write, finish]] });
+  expect(result.executeCompletion).toMatchObject({
+    outcome: "PATCH_READY",
+    metrics: { postPatchModelCalls: 0 },
+  });
+});
+it("auto mode completes only the phase and remains within tool budget", async () => {
+  expect((await run({ auto: true, calls: [[write]] })).result.executeCompletion?.outcome).toBe(
+    "PATCH_READY",
+  );
+  const { result, c } = await run({ auto: true, calls: [[write]], maxTools: 1 });
+  expect(result.executeCompletion?.failure).toBe("BUDGET_EXHAUSTED_BEFORE_PATCH");
+  expect(c.active).toBe(false);
+});
+it("no-op writes and real nonprogress never become a candidate", async () => {
+  const { result } = await run({ noop: true, calls: [[write], [write]] });
+  expect(result.executeCompletion).toMatchObject({
+    outcome: "FAILED",
+    state: "NO_PATCH",
+    failure: "REAL_NO_PROGRESS",
+    metrics: { PostPatchConvergenceMs: null, postPatchModelCalls: null },
+  });
+});
+it("classifies an uncooperative ready candidate separately from real no-progress", async () => {
+  const { result } = await run({ calls: [[write], [read], [read], [read]] });
+  expect(result.status).toBe("FAILED");
+  expect(result.executeCompletion?.failure).toBe("PATCH_READY_BUT_NOT_FINISHED");
+});
+it("STOP without a valid mutation cannot claim completion", async () => {
+  const { result } = await run({ calls: [[]] });
+  expect(result.status).toBe("FAILED");
+  expect(result.executeCompletion?.state).toBe("NO_PATCH");
+  expect(result.executeCompletion?.failure).toBe("NO_VALID_PATCH");
+});

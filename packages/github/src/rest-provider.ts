@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 import {
@@ -5,6 +6,9 @@ import {
   GitHubPullRequestResultSchema,
   GitHubRepositoryTreeRequestSchema,
   GitHubRepositoryTreeSchema,
+  GitHubRepositoryFileRequestSchema,
+  type GitHubRepositoryFileRequest,
+  type GitHubRepositoryFile,
   GitHubResolveBaseRequestSchema,
   GitHubResolvedBaseSchema,
   GitHubPushRequestSchema,
@@ -37,6 +41,10 @@ const GitHubTreeResponseSchema = z
             mode: z.string().min(1),
             type: z.enum(["blob", "tree", "commit"]),
             size: z.number().int().nonnegative().optional(),
+            sha: z
+              .string()
+              .regex(/^[0-9a-f]{40}$/iu)
+              .optional(),
           })
           .passthrough(),
       )
@@ -109,9 +117,77 @@ export class GitHubRestProvider implements GitHubProvider {
               ? "SYMLINK"
               : "FILE",
         ...(entry.size === undefined ? {} : { sizeBytes: entry.size }),
+        ...(entry.type === "blob" && entry.sha ? { blobSha: entry.sha } : {}),
       })),
       truncated: response.truncated,
     });
+  }
+
+  async readRepositoryFile(
+    input: GitHubRepositoryFileRequest,
+    signal?: AbortSignal,
+  ): Promise<GitHubRepositoryFile> {
+    const request = GitHubRepositoryFileRequestSchema.parse(input);
+    const response = z
+      .object({
+        sha: z.string(),
+        encoding: z.literal("base64"),
+        content: z.string(),
+        size: z.number().int().nonnegative(),
+      })
+      .parse(
+        await this.readRequest<unknown>(
+          request.repository,
+          `/git/blobs/${request.blobSha}`,
+          signal,
+          Math.ceil(request.maxBytes * 1.5) + 8192,
+        ),
+      );
+    if (
+      response.size > request.maxBytes ||
+      response.sha.toLowerCase() !== request.blobSha.toLowerCase()
+    )
+      throw new GitHubProviderError(
+        "INVALID_REQUEST",
+        "Repository blob exceeds its bound or identity.",
+        false,
+      );
+    const encoded = response.content.replace(/\s/gu, "");
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded))
+      throw new GitHubProviderError(
+        "PROVIDER_FAILED",
+        "Repository blob is not canonical base64.",
+        false,
+      );
+    const bytes = Buffer.from(encoded, "base64");
+    const sha = createHash("sha1").update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+    if (
+      bytes.length !== response.size ||
+      bytes.length > request.maxBytes ||
+      sha !== request.blobSha.toLowerCase()
+    )
+      throw new GitHubProviderError(
+        "PROVIDER_FAILED",
+        "Repository blob content does not match its immutable identity.",
+        false,
+      );
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    } catch {
+      throw new GitHubProviderError(
+        "INVALID_REQUEST",
+        "Repository blob is not UTF-8 source.",
+        false,
+      );
+    }
+    if (content.includes("\0"))
+      throw new GitHubProviderError(
+        "INVALID_REQUEST",
+        "Repository blob contains binary data.",
+        false,
+      );
+    return { content, blobSha: sha, sizeBytes: bytes.length };
   }
 
   async pushBranch(input: GitHubPushRequest, signal?: AbortSignal): Promise<GitHubPushResult> {
@@ -380,6 +456,7 @@ export class GitHubRestProvider implements GitHubProvider {
     repository: GitHubRepository,
     suffix: string,
     signal?: AbortSignal,
+    maxResponseBytes?: number,
   ): Promise<T> {
     let token = "";
     try {
@@ -400,7 +477,10 @@ export class GitHubRestProvider implements GitHubProvider {
         },
         ...(signal === undefined ? {} : { signal }),
       });
-      const text = await response.text();
+      const text =
+        maxResponseBytes === undefined
+          ? await response.text()
+          : await boundedResponseText(response, maxResponseBytes, signal);
       if (!response.ok) {
         throw providerHttpError(response.status, parseProviderMessage(text), [token]);
       }
@@ -423,6 +503,45 @@ export class GitHubRestProvider implements GitHubProvider {
 
   private branchUrl(repository: GitHubRepository, branch: string): string {
     return `${this.webBaseUrl}/${encodeURIComponent(repository.owner)}/${encodeURIComponent(repository.name)}/tree/${encodeURIComponent(branch)}`;
+  }
+}
+
+async function boundedResponseText(
+  response: Response,
+  limit: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  if (Number(response.headers.get("content-length") ?? 0) > limit) {
+    await response.body?.cancel();
+    throw new GitHubProviderError(
+      "INVALID_REQUEST",
+      "Repository response exceeds the source byte limit.",
+      false,
+    );
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return "";
+  const parts: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      signal?.throwIfAborted();
+      const part = await reader.read();
+      if (part.done) break;
+      size += part.value.byteLength;
+      if (size > limit) {
+        await reader.cancel();
+        throw new GitHubProviderError(
+          "INVALID_REQUEST",
+          "Repository response exceeds the source byte limit.",
+          false,
+        );
+      }
+      parts.push(part.value);
+    }
+    return Buffer.concat(parts).toString("utf8");
+  } finally {
+    reader.releaseLock();
   }
 }
 

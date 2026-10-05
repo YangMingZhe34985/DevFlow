@@ -49,6 +49,30 @@ function createContext(
 }
 
 describe("DefaultAgentRuntime", () => {
+  it("checks phase capabilities even for a cached read", async () => {
+    const model = new FakeLanguageModel([
+      fakeModelResponse({ toolCalls: [{ id: "r1", name: "readFile", input: { path: "a" } }] }),
+      fakeModelResponse({ toolCalls: [{ id: "r2", name: "readFile", input: { path: "a" } }] }),
+      async (request) => {
+        expect(request.messages.at(-1)).toMatchObject({ role: "TOOL", isError: true });
+        return fakeModelResponse({ text: "Done" });
+      },
+    ]);
+    const { context } = createContext(new AbortController().signal);
+    let calls = 0,
+      executions = 0;
+    context.authorizeTool = () => (++calls > 1 ? "Budget exhausted" : undefined);
+    context.executeTool = async () => {
+      executions++;
+      return { ok: true, output: { path: "a", content: "x" }, durationMs: 1 };
+    };
+    await new DefaultAgentRuntime(model).run(
+      { maxSteps: 3, timeoutMs: 2000, maxRetries: 0 },
+      context,
+    );
+    expect(calls).toBe(2);
+    expect(executions).toBe(1);
+  });
   it("feeds a tool result back to the model and completes", async () => {
     const model = new FakeLanguageModel([
       fakeModelResponse({

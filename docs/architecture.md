@@ -1,5 +1,7 @@
 # DevFlow 架构说明
 
+v2.0 的生产阶段契约、提案式 Planner 和 Review/Repair 证据交接见 [v2 workflow](v2-workflow.md)，模型接入见 [stage models](stage-models.md)。下述组件边界继续适用；历史复杂度/执行契约兼容字段不代表新的 Planner 必填输出。
+
 ## 1. 设计目标
 
 DevFlow 将一次 AI 软件工程任务建模为可持久化、可恢复、可审批的 Run。核心目标是：

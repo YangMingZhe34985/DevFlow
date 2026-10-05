@@ -1,10 +1,13 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import type * as FileSystem from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { runInNewContext } from "node:vm";
 
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -48,6 +51,74 @@ class RecordingDockerRunner implements DockerCommandRunner {
   }
 }
 
+/** Execute the actual read script against a temporary workspace without Docker. */
+class ReadFileDockerRunner extends RecordingDockerRunner {
+  constructor(private readonly workspace: string) {
+    super();
+  }
+
+  override async run(args: readonly string[], options?: DockerCommandOptions) {
+    const recorded = await super.run(args, options);
+    const script = args.at(-3);
+    if (
+      args[0] !== "exec" ||
+      args.at(-5) !== "node" ||
+      args.at(-4) !== "-e" ||
+      script === undefined ||
+      !(args.at(-1) ?? "").startsWith("{")
+    ) {
+      return recorded;
+    }
+    const nodeRequire = createRequire(import.meta.url);
+    const fileSystem = nodeRequire("node:fs") as typeof FileSystem;
+    let stdout = "";
+    runInNewContext(
+      script,
+      {
+        Buffer,
+        require: (specifier: string) =>
+          specifier === "node:fs"
+            ? {
+                ...fileSystem,
+                realpathSync: (target: string) =>
+                  target === "/workspace"
+                    ? fileSystem.realpathSync(this.workspace)
+                    : fileSystem.realpathSync(target),
+              }
+            : nodeRequire(specifier),
+        process: {
+          argv: ["node", ...args.slice(-2)],
+          stdout: {
+            write: (value: string) => {
+              stdout += value;
+            },
+          },
+        },
+      },
+      { timeout: 1_000 },
+    );
+    const bytes = Buffer.from(stdout);
+    const maxBytes = options?.maxOutputBytes ?? bytes.length;
+    return {
+      ...recorded,
+      stdout: bytes.subarray(0, maxBytes).toString("utf8"),
+      outputTruncated: bytes.length > maxBytes,
+    };
+  }
+}
+
+async function createFileReadSession(content: string | Buffer) {
+  const workspace = await mkdtemp(path.join(tmpdir(), "devflow-read-file-"));
+  temporaryDirectories.push(workspace);
+  await writeFile(path.join(workspace, "source.txt"), content);
+  const manager = new DockerSandboxManager({
+    image: "test",
+    workspaceRoot: process.cwd(),
+    commandRunner: new ReadFileDockerRunner(workspace),
+  });
+  return await manager.create(createOptions(randomUUID()));
+}
+
 function createOptions(runId: string): SandboxCreateOptions {
   return {
     runId,
@@ -71,6 +142,178 @@ afterEach(async () => {
 });
 
 describe("DockerSandboxManager", () => {
+  it("returns complete raw file hashes and sizes independent of escaped CRLF snippet limits", async () => {
+    const source = Buffer.from("\uFEFF" + 'line "\\\r\n'.repeat(12_000) + "tail");
+    expect(source.length).toBeGreaterThan(64 * 1_024);
+    const session = await createFileReadSession(source);
+    try {
+      const expectedHash = createHash("sha256").update(source).digest("hex");
+      for (const maxBytes of [32, 64 * 1_024, source.length]) {
+        const read = await session.readFile({ path: "source.txt", maxBytes });
+        expect(read).toMatchObject({ fileSha256: expectedHash, sizeBytes: source.length });
+        expect(Buffer.byteLength(read.content)).toBeLessThanOrEqual(maxBytes);
+        expect(source.toString("utf8").startsWith(read.content)).toBe(true);
+        expect(read.content).toContain("\r\n");
+        expect(read.truncated).toBe(maxBytes < source.length);
+        if (!read.truncated) expect(read.content).toBe(source.toString("utf8"));
+      }
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  it.each<[number, string]>([
+    [1, "A"],
+    [4, "A"],
+    [5, "A😀"],
+    [7, "A😀"],
+    [8, "A😀中"],
+    [10, "A😀中\r\n"],
+    [11, "A😀中\r\nZ"],
+  ])("keeps UTF-8 characters whole at a %i-byte snippet limit", async (maxBytes, expected) => {
+    const source = "A😀中\r\nZ";
+    const session = await createFileReadSession(source);
+    try {
+      const read = await session.readFile({ path: "source.txt", maxBytes });
+      expect(read).toMatchObject({
+        content: expected,
+        fileSha256: createHash("sha256").update(source).digest("hex"),
+        sizeBytes: Buffer.byteLength(source),
+        truncated: maxBytes < Buffer.byteLength(source),
+      });
+      expect(read.content).not.toContain("\uFFFD");
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  it("hashes raw bytes even when UTF-8 decoding changes the returned text", async () => {
+    const source = Buffer.from([0xff, 0x0d, 0x0a, 0x61]);
+    const session = await createFileReadSession(source);
+    try {
+      const read = await session.readFile({ path: "source.txt" });
+      expect(read.fileSha256).toBe(createHash("sha256").update(source).digest("hex"));
+      expect(read.fileSha256).not.toBe(createHash("sha256").update(read.content).digest("hex"));
+      expect(read.sizeBytes).toBe(source.length);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  it("drains a locally cancelled command without disposing the owner's session (retrieval fallback)", async () => {
+    const local = new AbortController();
+    const owner = new AbortController();
+    class Runner extends RecordingDockerRunner {
+      override async run(args: readonly string[], options?: DockerCommandOptions) {
+        if (args.includes("--local-cancel")) {
+          local.abort();
+          // Docker client must not be detached by the nested retrieval deadline.
+          expect(options?.signal?.aborted).toBe(false);
+        }
+        return super.run(args, options);
+      }
+    }
+    const runner = new Runner();
+    const manager = new DockerSandboxManager({
+      image: "test",
+      workspaceRoot: process.cwd(),
+      commandRunner: runner,
+    });
+    const session = await manager.create(createOptions(randomUUID()), owner.signal);
+    await expect(
+      session.exec({ program: "node", args: ["--local-cancel"] }, local.signal),
+    ).rejects.toMatchObject({ code: "SANDBOX_CANCELLED" });
+    expect(runner.calls.some((c) => c[0] === "rm")).toBe(false);
+    await expect(
+      session.exec({ program: "node", args: ["--version"] }, owner.signal),
+    ).resolves.toMatchObject({ exitCode: 0 });
+    await session.dispose();
+    expect(runner.calls.filter((c) => c[0] === "rm")).toHaveLength(1);
+  });
+
+  it("fresh dispatch/recovery identities cannot be removed by old session cleanup", async () => {
+    const runner = new RecordingDockerRunner();
+    const manager = new DockerSandboxManager({
+      image: "test",
+      workspaceRoot: process.cwd(),
+      commandRunner: runner,
+    });
+    const options = createOptions(randomUUID());
+    const first = await manager.create({
+      ...options,
+      owner: { executionOwner: "worker-a", dispatchRevision: 1, segment: randomUUID() },
+    });
+    await first.dispose(); // approval releases its segment before resume
+    const second = await manager.create({
+      ...options,
+      owner: { executionOwner: "worker-b", dispatchRevision: 2, segment: randomUUID() },
+    });
+    expect(second.id).not.toBe(first.id);
+    await first.dispose();
+    await expect(first.exec({ program: "node", args: [] })).rejects.toMatchObject({
+      code: "SANDBOX_ALREADY_DISPOSED",
+      details: {
+        executionOwner: "worker-a",
+        dispatchRevision: 1,
+        lifecycleInvariantViolation: true,
+      },
+    });
+    await expect(second.exec({ program: "node", args: [] })).resolves.toMatchObject({
+      exitCode: 0,
+    });
+    expect(runner.calls.filter((c) => c[0] === "rm")).toHaveLength(1);
+    await second.dispose();
+  });
+
+  it("revoked owners cannot begin writes or report in-flight success", async () => {
+    let live = true;
+    const runner = new RecordingDockerRunner(undefined, (args) => {
+      if (args.includes("--revoke")) live = false;
+      return false;
+    });
+    const { DevflowError } = await import("@devflow/shared");
+    const manager = new DockerSandboxManager({
+      image: "test",
+      workspaceRoot: process.cwd(),
+      commandRunner: runner,
+      assertOwnership: async () => {
+        if (!live) throw new DevflowError({ code: "SANDBOX_LOST_OWNERSHIP", message: "revoked" });
+      },
+    });
+    const session = await manager.create(createOptions(randomUUID()));
+    live = false;
+    const count = runner.calls.length;
+    await expect(session.writeFile({ path: "x", content: "stale" })).rejects.toMatchObject({
+      code: "SANDBOX_LOST_OWNERSHIP",
+    });
+    expect(runner.calls).toHaveLength(count);
+    live = true;
+    await expect(session.exec({ program: "node", args: ["--revoke"] })).rejects.toMatchObject({
+      code: "SANDBOX_LOST_OWNERSHIP",
+    });
+    await session.dispose();
+  });
+
+  it("owner cancellation fences future commands and creator cleanup is idempotent", async () => {
+    const controller = new AbortController();
+    const runner = new RecordingDockerRunner();
+    const states: unknown[] = [];
+    const manager = new DockerSandboxManager({
+      image: "test",
+      workspaceRoot: process.cwd(),
+      commandRunner: runner,
+      observeLifecycle: (e) => states.push(e.state),
+    });
+    const session = await manager.create(createOptions(randomUUID()), controller.signal);
+    controller.abort();
+    await expect(session.exec({ program: "node", args: [] })).rejects.toMatchObject({
+      code: "SANDBOX_CANCELLED",
+    });
+    await Promise.all([session.dispose(), session.dispose()]);
+    expect(states).toEqual(["ACTIVE", "DISPOSING", "DISPOSED"]);
+    expect(runner.calls.filter((c) => c[0] === "rm")).toHaveLength(1);
+  });
+
   it("creates, uses and removes a container without a host execution fallback", async () => {
     const runner = new RecordingDockerRunner();
     const manager = new DockerSandboxManager({
@@ -124,7 +367,7 @@ describe("DockerSandboxManager", () => {
     });
 
     await expect(manager.create(createOptions(randomUUID()))).rejects.toMatchObject({
-      code: "SANDBOX_FAILED",
+      code: "SANDBOX_CREATE_FAILED",
     });
     expect(runner.calls.at(-1)?.slice(0, 2)).toEqual(["rm", "--force"]);
   });
@@ -150,7 +393,7 @@ describe("DockerSandboxManager", () => {
     });
 
     await expect(manager.create(createOptions(randomUUID()))).rejects.toMatchObject({
-      code: "SANDBOX_FAILED",
+      code: "SANDBOX_CREATE_FAILED",
     });
     expect(runner.calls.at(-1)?.slice(0, 2)).toEqual(["rm", "--force"]);
   });
@@ -167,7 +410,7 @@ describe("DockerSandboxManager", () => {
     });
 
     await expect(manager.create(createOptions(randomUUID()))).rejects.toMatchObject({
-      code: "SANDBOX_FAILED",
+      code: "SANDBOX_RESTORE_FAILED",
     });
     expect(runner.calls.at(-1)?.slice(0, 2)).toEqual(["rm", "--force"]);
   });

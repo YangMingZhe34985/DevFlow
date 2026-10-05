@@ -17,4 +17,5 @@ export type RunExecutionOutcome = RunResult | WaitingApprovalResult | WaitingGit
 
 export interface RunExecutionPort {
   execute(run: RunExecutionRecord, signal: AbortSignal): Promise<RunExecutionOutcome>;
+  observedMetrics?(run: RunExecutionRecord): Promise<RunResult["metrics"]>;
 }

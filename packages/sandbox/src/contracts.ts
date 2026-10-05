@@ -78,6 +78,11 @@ export const LocalRepositorySnapshotSchema = z.object({
     .regex(/^[0-9a-f]{7,64}$/u)
     .optional(),
   totalBytes: z.number().int().nonnegative(),
+  /** Identity of paths/modes/content, computed during capture/validation, never per Issue query. */
+  manifestHash: z
+    .string()
+    .regex(/^[0-9a-f]{64}$/u)
+    .optional(),
   files: z.array(z.discriminatedUnion("kind", [SnapshotFileSchema, SnapshotSymlinkSchema])),
 });
 export type LocalRepositorySnapshot = z.infer<typeof LocalRepositorySnapshotSchema>;
@@ -95,6 +100,8 @@ export type SandboxRepositorySource = z.infer<typeof SandboxRepositorySourceSche
 
 export interface SandboxCreateOptions {
   runId: RunId;
+  /** Dispatch-local identity. Never checkpoint a session or its AbortSignal. */
+  owner?: { executionOwner: string; dispatchRevision: number; segment: string };
   repository: SandboxRepositorySource;
   limits: SandboxLimits;
   environment?: Readonly<Record<string, string>>;
@@ -102,6 +109,13 @@ export interface SandboxCreateOptions {
 
 export const SandboxCreateOptionsSchema = z.object({
   runId: z.string().uuid(),
+  owner: z
+    .object({
+      executionOwner: z.string().min(1).max(512),
+      dispatchRevision: z.number().int().nonnegative(),
+      segment: z.string().uuid(),
+    })
+    .optional(),
   repository: SandboxRepositorySourceSchema,
   limits: SandboxLimitsSchema,
   environment: z.record(z.string(), z.string()).optional(),
@@ -125,6 +139,10 @@ export interface ListFilesResult {
 export interface ReadFileRequest {
   path: string;
   maxBytes?: number;
+  /** Inclusive, one-based range. Supply both bounds; at most 300 lines / 16 KiB. */
+  startLine?: number;
+  endLine?: number;
+  expectedSha256?: string;
 }
 
 export interface ReadFileResult {
@@ -132,6 +150,16 @@ export interface ReadFileResult {
   content: string;
   encoding: "utf8";
   truncated: boolean;
+  /** SHA-256 of the complete raw file bytes, independent of snippet truncation. */
+  fileSha256?: string;
+  /** Complete raw file size, not the UTF-8 size of the returned snippet. */
+  sizeBytes?: number;
+  snippetSha256?: string;
+  startLine?: number;
+  endLine?: number;
+  totalLines?: number;
+  workspaceRevision?: number;
+  recovery?: ReadFileRequest;
 }
 
 export interface WriteFileRequest {
@@ -148,9 +176,17 @@ export interface WriteFileResult {
 
 export interface ApplyPatchRequest {
   patch: string;
+  /** Host-supplied guards; never model-authorized hashes. Null means approved CREATE. */
+  expectedHashes?: Readonly<Record<string, string | null>>;
 }
 
 export interface ApplyPatchResult {
+  patchFailure?: {
+    kind: string;
+    message: string;
+    needsRead: boolean;
+    diagnostics: readonly string[];
+  };
   applied: boolean;
   changedFiles: readonly string[];
   diagnostics: readonly string[];

@@ -17,6 +17,10 @@ import {
 import { z } from "zod";
 
 import type { ModelMessage } from "./model.js";
+import {
+  ContextCompressionStateSchema,
+  type ContextCompressionState,
+} from "./context-compression.js";
 
 export const AgentPhaseSchema = z.enum([
   "IDLE",
@@ -101,6 +105,7 @@ export const AgentStateSchema = z.object({
   /** Optional so schema-version 1 checkpoints written before adaptive leases remain valid. */
   adaptiveStepBudget: AdaptiveStepBudgetStateSchema.optional(),
   plan: AgentPlanSchema.optional(),
+  contextCompression: ContextCompressionStateSchema.optional(),
   lastError: DevflowErrorShapeSchema.optional(),
   finalResult: RunResultSchema.optional(),
 });
@@ -115,6 +120,7 @@ export interface AgentState {
   updatedAt: string;
   adaptiveStepBudget?: AdaptiveStepBudgetState;
   plan?: AgentPlan;
+  contextCompression?: ContextCompressionState;
   lastError?: DevflowErrorShape;
   finalResult?: RunResult;
 }

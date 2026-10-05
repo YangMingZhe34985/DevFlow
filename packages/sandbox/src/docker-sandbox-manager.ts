@@ -1,7 +1,10 @@
 import { spawn } from "node:child_process";
+import { GUARDED_PATCH_SCRIPT } from "./guarded-patch-script.js";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { readFileContent, validateReadFileRequest } from "./read-file-content.js";
 
-import { assertCredentialFreeRepositoryUri, DevflowError, toDevflowError } from "@devflow/shared";
+import { assertCredentialFreeRepositoryUri, DevflowError } from "@devflow/shared";
 
 import {
   CommandSpecSchema,
@@ -37,6 +40,9 @@ export interface DockerSandboxManagerOptions {
   image: string;
   workspaceRoot: string;
   commandRunner?: DockerCommandRunner;
+  /** Called before and after operations; a stale dispatch must not return success. */
+  assertOwnership?: () => Promise<void>;
+  observeLifecycle?: (event: Record<string, unknown>) => void;
 }
 
 export interface DockerCommandOptions {
@@ -175,10 +181,22 @@ export class DockerSandboxManager implements SandboxManager {
       });
     }
 
-    const containerName = ("devflow-" + parsed.data.runId.replace(/[^a-zA-Z0-9_.-]/gu, "-")).slice(
-      0,
-      63,
-    );
+    const owner = {
+      runId: parsed.data.runId,
+      ...(parsed.data.owner ?? {
+        executionOwner: "standalone",
+        dispatchRevision: 0,
+        segment: randomUUID(),
+      }),
+    };
+    // Unique even for retries of the same Run: old cleanup cannot remove a new owner.
+    const containerName = `devflow-${parsed.data.runId.slice(0, 8)}-${randomUUID()}`;
+    const identity = {
+      ...owner,
+      sessionId: containerName,
+      containerId: containerName,
+    };
+    await this.options.assertOwnership?.();
     const memory = String(parsed.data.limits.memoryMb) + "m";
     const createArgs = [
       "create",
@@ -188,6 +206,12 @@ export class DockerSandboxManager implements SandboxManager {
       "devflow.managed=true",
       "--label",
       "devflow.runId=" + parsed.data.runId,
+      "--label",
+      "devflow.executionOwner=" + owner.executionOwner,
+      "--label",
+      "devflow.dispatchRevision=" + owner.dispatchRevision,
+      "--label",
+      "devflow.segment=" + owner.segment,
       "--init",
       "--security-opt",
       "no-new-privileges",
@@ -206,6 +230,7 @@ export class DockerSandboxManager implements SandboxManager {
     appendEnvironment(createArgs, parsed.data.environment);
     createArgs.push(this.options.image, "sleep", "infinity");
 
+    let restoring = false;
     try {
       ensureDockerSuccess(
         await this.runner.run(createArgs, dockerSignal(signal)),
@@ -216,6 +241,7 @@ export class DockerSandboxManager implements SandboxManager {
         "start sandbox",
       );
 
+      restoring = true;
       if (repository.kind === "SNAPSHOT") {
         await restoreLocalSnapshot(this.runner, containerName, repository.snapshot, signal);
       } else {
@@ -259,17 +285,37 @@ export class DockerSandboxManager implements SandboxManager {
         parsed.data.limits.timeoutMs,
         this.runner,
         () => this.sessions.delete(containerName),
+        identity,
+        signal,
+        this.options.assertOwnership,
+        this.options.observeLifecycle,
       );
+      await this.options.assertOwnership?.();
       this.sessions.set(containerName, session);
+      this.options.observeLifecycle?.({
+        ...identity,
+        state: "ACTIVE",
+        action: "CREATE_RESTORE",
+      });
       return session;
     } catch (error) {
       // `docker create` can produce the container and still surface an abort or
       // transport error to the client. The deterministic name makes an
       // unconditional best-effort cleanup both safe and idempotent.
       await removeContainer(this.runner, containerName).catch(() => undefined);
-      throw toDevflowError(error, {
-        code: "SANDBOX_FAILED",
-        message: "Failed to create Docker sandbox.",
+      throw new DevflowError({
+        code: signal?.aborted
+          ? "SANDBOX_CANCELLED"
+          : error instanceof DevflowError && error.code === "SANDBOX_LOST_OWNERSHIP"
+            ? error.code
+            : restoring
+              ? "SANDBOX_RESTORE_FAILED"
+              : "SANDBOX_CREATE_FAILED",
+        message: restoring
+          ? "Failed to restore Docker sandbox."
+          : "Failed to create Docker sandbox.",
+        details: identity,
+        cause: error,
       });
     }
   }
@@ -294,7 +340,10 @@ export class DockerSandboxManager implements SandboxManager {
           message: "A LOCAL snapshot cannot be used with a remote repository URI.",
         });
       }
-      return { kind: "SNAPSHOT", snapshot: validateSnapshotIntegrity(repository.snapshot) };
+      return {
+        kind: "SNAPSHOT",
+        snapshot: validateSnapshotIntegrity(repository.snapshot),
+      };
     }
     if (isRemoteRepository(repository.sourceUri)) {
       assertCredentialFreeRepositoryUri(repository.sourceUri);
@@ -317,16 +366,24 @@ class DockerSandboxSession implements SandboxSession {
   readonly workspacePath = "/workspace";
   private disposed = false;
   private disposePromise: Promise<void> | undefined;
+  private unsafe = false;
 
   constructor(
     readonly id: string,
     private readonly defaultTimeoutMs: number,
     private readonly runner: DockerCommandRunner,
     private readonly onDispose: () => void,
+    private readonly identity: Record<string, unknown>,
+    private readonly ownerSignal?: AbortSignal,
+    private readonly assertOwnership?: () => Promise<void>,
+    private readonly observeLifecycle?: (event: Record<string, unknown>) => void,
   ) {}
 
   async exec(command: CommandSpec, signal?: AbortSignal): Promise<CommandResult> {
     this.assertActive();
+    await this.assertOwnership?.();
+    this.assertActive();
+    if (signal?.aborted) throw this.cancelled();
     const parsed = CommandSpecSchema.safeParse(command);
     if (!parsed.success) {
       throw new DevflowError({
@@ -363,27 +420,38 @@ class DockerSandboxSession implements SandboxSession {
     let result: DockerCommandResult;
     try {
       result = await this.runner.run(args, {
-        ...(signal === undefined ? {} : { signal }),
+        // A child operation's deadline does not own the container. Drain the
+        // bounded command instead of detaching its Docker CLI and destroying
+        // the session. Only the execution segment can interrupt this wait.
+        ...(this.ownerSignal === undefined ? {} : { signal: this.ownerSignal }),
         ...(parsed.data.stdin === undefined ? {} : { stdin: parsed.data.stdin }),
         maxOutputBytes: parsed.data.maxOutputBytes ?? DEFAULT_COMMAND_OUTPUT_BYTES,
       });
     } catch (error) {
-      if (signal?.aborted === true) {
-        await this.dispose().catch(() => undefined);
-        throw new DevflowError({
-          code: "CANCELLED",
-          message: "Sandbox command was cancelled and its container was removed.",
-          cause: error,
-        });
-      }
-      throw toDevflowError(error, {
-        code: "SANDBOX_FAILED",
+      this.unsafe = true;
+      if (this.ownerSignal?.aborted) throw this.cancelled();
+      throw new DevflowError({
+        code: "SANDBOX_PROCESS_FAILED",
         message: "Docker could not execute the sandbox command.",
+        details: this.identity,
+        cause: error,
       });
     }
 
-    const timedOut = result.exitCode === 124;
-    if (timedOut) await this.dispose();
+    const timedOut = result.exitCode === 124 || result.exitCode === 137;
+    if (timedOut) {
+      this.unsafe = true;
+      throw new DevflowError({
+        code: "SANDBOX_RESOURCE_LIMIT",
+        message:
+          "Sandbox command exceeded its time/resource limit; owner must dispose the segment.",
+        details: { ...this.identity, exitCode: result.exitCode },
+      });
+    }
+    this.assertActive();
+    await this.assertOwnership?.();
+    this.assertActive();
+    if (signal?.aborted) throw this.cancelled();
     return {
       exitCode: result.exitCode,
       stdout: result.stdout,
@@ -419,18 +487,24 @@ class DockerSandboxSession implements SandboxSession {
   async readFile(input: ReadFileRequest, signal?: AbortSignal): Promise<ReadFileResult> {
     const requestedPath = normalizeRelativePath(input.path);
     const maxBytes = input.maxBytes ?? 200_000;
-    if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 1_000_000) {
-      throw new DevflowError({
-        code: "VALIDATION_ERROR",
-        message: "maxBytes must be between 1 and 1000000.",
-      });
+    try {
+      validateReadFileRequest(input);
+    } catch (error) {
+      throw new DevflowError({ code: "VALIDATION_ERROR", message: String(error) });
     }
     const result = await this.exec(
       {
         program: "node",
-        args: ["-e", READ_FILE_SCRIPT, requestedPath, String(maxBytes)],
+        args: [
+          "-e",
+          READ_FILE_SCRIPT,
+          requestedPath,
+          JSON.stringify({ ...input, path: requestedPath }),
+        ],
         timeoutMs: 15_000,
-        maxOutputBytes: maxBytes + 20_000,
+        // JSON escaping can expand each snippet byte to six output bytes.
+        maxOutputBytes:
+          (input.startLine === undefined ? maxBytes : Math.min(maxBytes, 16_384)) * 6 + 20_000,
       },
       signal,
     );
@@ -458,6 +532,19 @@ class DockerSandboxSession implements SandboxSession {
         code: "VALIDATION_ERROR",
         message: "Patch exceeds the 2000000 byte sandbox limit.",
       });
+    }
+    if (input.expectedHashes !== undefined) {
+      const guarded = await this.exec(
+        {
+          program: "node",
+          args: ["-e", GUARDED_PATCH_SCRIPT],
+          stdin: JSON.stringify(input),
+          timeoutMs: 30_000,
+          maxOutputBytes: 100_000,
+        },
+        signal,
+      );
+      return parseJsonCommand<ApplyPatchResult>(guarded, "guarded apply patch");
     }
     const applyResult = await this.exec(
       {
@@ -492,6 +579,12 @@ class DockerSandboxSession implements SandboxSession {
 
   async dispose(): Promise<void> {
     if (this.disposed) return;
+    if (!this.disposePromise)
+      this.observeLifecycle?.({
+        ...this.identity,
+        state: "DISPOSING",
+        action: "DISPOSE",
+      });
     this.disposePromise ??= this.remove();
     await this.disposePromise;
   }
@@ -501,6 +594,11 @@ class DockerSandboxSession implements SandboxSession {
       await removeContainer(this.runner, this.id);
       this.disposed = true;
       this.onDispose();
+      this.observeLifecycle?.({
+        ...this.identity,
+        state: "DISPOSED",
+        action: "DISPOSE",
+      });
     } finally {
       if (!this.disposed) this.disposePromise = undefined;
     }
@@ -509,10 +607,34 @@ class DockerSandboxSession implements SandboxSession {
   private assertActive(): void {
     if (this.disposed || this.disposePromise !== undefined) {
       throw new DevflowError({
-        code: "SANDBOX_FAILED",
+        code: "SANDBOX_ALREADY_DISPOSED",
         message: "Sandbox '" + this.id + "' has already been disposed.",
+        details: {
+          ...this.identity,
+          lifecycleInvariantViolation: true,
+          state: this.disposed ? "DISPOSED" : "DISPOSING",
+        },
       });
     }
+    if (this.ownerSignal?.aborted) throw this.cancelled();
+    if (this.unsafe)
+      throw new DevflowError({
+        code: "SANDBOX_PROCESS_FAILED",
+        message: "Sandbox command state is uncertain; only owner disposal is allowed.",
+        details: this.identity,
+      });
+  }
+
+  private cancelled(): DevflowError {
+    const reason: unknown = this.ownerSignal?.reason;
+    return new DevflowError({
+      code:
+        reason instanceof DevflowError && reason.code === "SANDBOX_LOST_OWNERSHIP"
+          ? reason.code
+          : "SANDBOX_CANCELLED",
+      message: "Sandbox operation cancelled; execution-segment creator retains disposal ownership.",
+      details: this.identity,
+    });
   }
 }
 
@@ -829,17 +951,12 @@ const LIST_FILES_SCRIPT = [
 
 const READ_FILE_SCRIPT = [
   WORKSPACE_GUARD_SCRIPT,
+  'const crypto = require("node:crypto");',
   "const requested = process.argv[1];",
-  "const maxBytes = Number(process.argv[2]);",
+  "const input = JSON.parse(process.argv[2]);",
   "const absolute = guardReal(guardLexical(requested));",
   "const source = fs.readFileSync(absolute);",
-  "const selected = source.subarray(0, maxBytes);",
-  "process.stdout.write(JSON.stringify({",
-  "  path: requested,",
-  '  content: selected.toString("utf8"),',
-  '  encoding: "utf8",',
-  "  truncated: source.length > selected.length,",
-  "}));",
+  `process.stdout.write(JSON.stringify((${readFileContent.toString()})(source, input, crypto)));`,
 ].join("\n");
 
 const WRITE_FILE_SCRIPT = [

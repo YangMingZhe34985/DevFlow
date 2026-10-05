@@ -1,6 +1,6 @@
 {
   "name": "@devflow/agent",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -23,8 +23,8 @@
   "dependencies": {
     "@ai-sdk/openai": "4.0.70",
     "@ai-sdk/openai-compatible": "3.0.52",
-    "@devflow/shared": "0.1.0",
-    "@devflow/tools": "0.1.0",
+    "@devflow/shared": "2.0.0",
+    "@devflow/tools": "2.0.0",
     "ai": "7.0.106",
     "zod": "4.6.5"
   }

@@ -129,8 +129,8 @@ describe("GitHubRestProvider", () => {
     expect(tree).toEqual({
       entries: [
         { path: "src", kind: "DIRECTORY" },
-        { path: "src/index.ts", kind: "FILE", sizeBytes: 42 },
-        { path: "current", kind: "SYMLINK", sizeBytes: 12 },
+        { path: "src/index.ts", kind: "FILE", sizeBytes: 42, blobSha: "2".repeat(40) },
+        { path: "current", kind: "SYMLINK", sizeBytes: 12, blobSha: "3".repeat(40) },
         { path: "vendor/sdk", kind: "DIRECTORY" },
       ],
       truncated: true,

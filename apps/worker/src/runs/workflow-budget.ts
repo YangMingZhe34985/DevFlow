@@ -544,7 +544,12 @@ export class WorkflowBudgetLedger {
   }
 
   remainingTotalTokens(metrics: RunMetrics): number {
-    return Math.max(0, this.maxTotalTokens - metrics.tokenUsage.totalTokens);
+    return Math.max(
+      0,
+      this.maxTotalTokens -
+        metrics.tokenUsage.totalTokens -
+        (metrics.contextCompressionReservedTokens ?? 0),
+    );
   }
 
   /** Advances recovery state monotonically; replaying an older checkpoint cannot rewind it. */
@@ -611,7 +616,8 @@ export class WorkflowBudgetLedger {
         agentSteps: this.consumedAgentSteps,
         modelCalls: metrics.modelCalls,
         toolCalls: metrics.toolCalls,
-        totalTokens: metrics.tokenUsage.totalTokens,
+        totalTokens:
+          metrics.tokenUsage.totalTokens + (metrics.contextCompressionReservedTokens ?? 0),
         elapsedMs: Math.max(0, Date.now() - this.startedAt),
       },
       deadlineAt: new Date(this.deadlineAt).toISOString(),
@@ -626,8 +632,16 @@ export class WorkflowBudgetLedger {
     if (metrics.toolCalls > this.maxToolCalls) {
       this.exceeded(stage, "toolCalls", this.maxToolCalls, metrics.toolCalls);
     }
-    if (metrics.tokenUsage.totalTokens > this.maxTotalTokens) {
-      this.exceeded(stage, "totalTokens", this.maxTotalTokens, metrics.tokenUsage.totalTokens);
+    if (
+      metrics.tokenUsage.totalTokens + (metrics.contextCompressionReservedTokens ?? 0) >
+      this.maxTotalTokens
+    ) {
+      this.exceeded(
+        stage,
+        "totalTokens",
+        this.maxTotalTokens,
+        metrics.tokenUsage.totalTokens + (metrics.contextCompressionReservedTokens ?? 0),
+      );
     }
     const now = Date.now();
     if (now >= this.deadlineAt) {

@@ -4,3 +4,6 @@ export * from "./events.js";
 export * from "./ids.js";
 export * from "./queue.js";
 export * from "./repository-uri.js";
+export * from "./completion.js";
+export * from "./execution.js";
+export * from "./proposal.js";

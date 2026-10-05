@@ -1,4 +1,5 @@
 import type { ModelToolDescriptor } from "@devflow/agent";
+import { PhaseCompletionSchema } from "@devflow/shared";
 import { z } from "zod";
 
 export type AgentPhasePurpose = "IMPLEMENTATION" | "TEST_REPAIR" | "REVIEW_REPAIR";
@@ -11,12 +12,14 @@ const COMMON_PROMPT = [
 ].join(" ");
 
 const IMPLEMENTATION_TOOLS = new Set([
+  "locateIssue",
   "listFiles",
   "readFile",
   "batchReadFiles",
   "searchCode",
   "batchSearchCode",
   "writeFile",
+  "replaceText",
   "applyPatch",
   "gitStatus",
   "gitDiff",
@@ -24,9 +27,11 @@ const IMPLEMENTATION_TOOLS = new Set([
 ]);
 
 const REPAIR_TOOLS = new Set([
+  "readEvidenceArtifact",
   "readFile",
   "batchReadFiles",
   "writeFile",
+  "replaceText",
   "applyPatch",
   "gitStatus",
   "gitDiffSummary",
@@ -39,7 +44,8 @@ export const FinishPhaseTool: ModelToolDescriptor = {
   inputSchema: z
     .object({
       summary: z.string().min(1).max(2_000),
-      outcome: z.enum(["CHANGED", "ALREADY_SATISFIED"]),
+      outcome: PhaseCompletionSchema.shape.outcome,
+      evidence: PhaseCompletionSchema.shape.evidence,
     })
     .strict(),
   readOnly: true,
@@ -54,9 +60,12 @@ export function stageSystemPrompt(purpose: AgentPhasePurpose): string {
     case "TEST_REPAIR":
       return `${COMMON_PROMPT} Repair only the supplied failing test. Start from the current diff, failed command, concise output, and relevant files already provided. Do not restart broad repository exploration and do not run tests yourself. Stop immediately after the targeted edit, using finishPhase as the final action.`;
     case "REVIEW_REPAIR":
-      return `${COMMON_PROMPT} Address only the supplied independent review findings. Preserve already-passing behavior, do not run tests yourself, and do not broaden scope. Stop immediately after the targeted edit, using finishPhase as the final action.`;
+      return `${COMMON_PROMPT} Check the supplied independent review findings against the current source first. SOURCE_LINKED means its quote exists, not that its reasoning is proven; UNVERIFIED findings are hypotheses. Preserve already-passing behavior, do not run tests yourself, and do not broaden scope. Fix confirmed defects. If a finding is already satisfied or contradicted by current code, use finishPhase with ALREADY_SATISFIED or CONTRADICTED and evidence (path, exact quote, complete fileSha256); do not manufacture a no-op edit. Report INSUFFICIENT_EVIDENCE or SCOPE_CONFLICT when blocked. These reports never bypass deterministic tests or independent Review. Stop immediately after the targeted edit or evidence response.`;
   }
 }
+
+export const EVIDENCE_ACTION_PROMPT =
+  "The WorkingSet is the result of repository localization, not proof of root cause. Use its current code to validate the approved target and make the minimal edit; do not restart repository exploration. If evidence is incomplete, use a targeted read before editing. readFile returns a complete file up to its stated cap; use writeFile for a small complete file, preserving all unrelated content. applyPatch requires a standard unified Git diff, not a Begin Patch envelope. Put finishPhase after the successful edit in the same tool-call response when no more evidence is needed; the workflow still performs Test and independent Review.";
 
 export function toolsForStage(
   tools: readonly ModelToolDescriptor[],

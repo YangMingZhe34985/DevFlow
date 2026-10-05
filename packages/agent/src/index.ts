@@ -3,3 +3,8 @@ export * from "./model.js";
 export * from "./runtime.js";
 export * from "./state.js";
 export * from "./vercel-ai-model.js";
+export * from "./working-set.js";
+export * from "./post-patch.js";
+export * from "./pre-patch.js";
+export * from "./stage-context.js";
+export * from "./context-compression.js";

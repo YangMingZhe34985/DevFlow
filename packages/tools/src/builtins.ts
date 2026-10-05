@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import type { GitService } from "@devflow/git";
 import { z } from "zod";
+import { replaceText } from "./replace-text.js";
 
 import type { ToolContext } from "./contracts.js";
 import type { ToolRegistry } from "./registry.js";
@@ -13,6 +14,7 @@ export const CORE_TOOL_NAMES = [
   "searchCode",
   "batchSearchCode",
   "writeFile",
+  "replaceText",
   "applyPatch",
   "runCommand",
   "gitStatus",
@@ -31,6 +33,12 @@ const listFilesInput = z.object({
 const readFileInput = z.object({
   path: z.string().min(1),
   maxBytes: z.number().int().positive().max(1_000_000).default(200_000),
+  startLine: z.number().int().positive().optional(),
+  endLine: z.number().int().positive().optional(),
+  expectedSha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/u)
+    .optional(),
 });
 
 const batchReadFilesInput = z.object({
@@ -93,6 +101,25 @@ const gitDiffInput = z.object({
 
 export function registerCoreTools(registry: ToolRegistry, git: GitService): void {
   registry.register({
+    name: "replaceText",
+    description:
+      "Replace exact literal text in one existing UTF-8 file. Supply its current complete expectedSha256, oldText and newText. Default expectedOccurrences=1 rejects ambiguous matches; never use regex. A mismatch writes nothing. Returns APPLIED/NO_OP and the new complete hash. Supports sequential edits after reading the updated version.",
+    inputSchema: z.object({
+      path: z.string().min(1),
+      oldText: z.string().min(1),
+      newText: z.string(),
+      expectedSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      expectedOccurrences: z.number().int().positive().max(20).default(1),
+    }),
+    outputSchema: z.unknown(),
+    permission: "WRITE",
+    timeoutMs: 20000,
+    readOnly: false,
+    parallelSafe: false,
+    mutatesWorkspace: true,
+    execute: replaceText,
+  });
+  registry.register({
     name: "listFiles",
     description: "List files and directories inside the repository workspace.",
     inputSchema: listFilesInput,
@@ -107,7 +134,8 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
 
   registry.register({
     name: "readFile",
-    description: "Read a UTF-8 text file inside the repository workspace.",
+    description:
+      "Read a repository UTF-8 file. For search hits, supply inclusive startLine/endLine (both required, at most 300 lines / 16 KiB); do not enlarge the file prefix to reach distant symbols. Reports actual range, complete fileSha256, snippetSha256 and recovery range. Optional expectedSha256 rejects stale evidence. Omitted bounds retain prefix reading.",
     inputSchema: readFileInput,
     outputSchema: z.unknown(),
     permission: "READ",
@@ -115,13 +143,23 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
     readOnly: true,
     parallelSafe: true,
     mutatesWorkspace: false,
-    execute: (input, context) => context.sandbox.readFile(input, context.signal),
+    execute: (input, context) =>
+      context.sandbox.readFile(
+        {
+          path: input.path,
+          maxBytes: input.maxBytes,
+          ...(input.startLine === undefined ? {} : { startLine: input.startLine }),
+          ...(input.endLine === undefined ? {} : { endLine: input.endLine }),
+          ...(input.expectedSha256 === undefined ? {} : { expectedSha256: input.expectedSha256 }),
+        },
+        context.signal,
+      ),
   });
 
   registry.register({
     name: "batchReadFiles",
     description:
-      "Read up to 12 UTF-8 repository files in one call. Each file is limited to 64 KiB and the combined content to 256 KiB.",
+      "Read up to 12 UTF-8 repository files in one call. Returned snippets are limited to 64 KiB per file and 256 KiB combined. fileSha256 identifies the complete raw file; contentHash and the legacy sha256 identify only the returned snippet.",
     inputSchema: batchReadFilesInput,
     outputSchema: z.object({
       files: z.array(
@@ -133,9 +171,16 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
             encoding: z.literal("utf8"),
             contentBytes: z.number().int().nonnegative(),
             sha256: z.string(),
+            contentHash: z.string(),
+            fileSha256: z.string().optional(),
+            sizeBytes: z.number().int().nonnegative().optional(),
             truncated: z.boolean(),
           }),
-          z.object({ ok: z.literal(false), path: z.string(), error: z.string() }),
+          z.object({
+            ok: z.literal(false),
+            path: z.string(),
+            error: z.string(),
+          }),
         ]),
       ),
       totalBytes: z.number().int().nonnegative(),
@@ -155,7 +200,11 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
           );
           return { ok: true as const, result };
         } catch (error) {
-          return { ok: false as const, path: filePath, error: errorMessage(error) };
+          return {
+            ok: false as const,
+            path: filePath,
+            error: errorMessage(error),
+          };
         }
       });
       let remainingBytes = 256 * 1_024;
@@ -165,6 +214,7 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
         const perFileBounded = truncateUtf8(read.result.content, input.maxBytesPerFile);
         const bounded = truncateUtf8(perFileBounded.value, remainingBytes);
         const contentBytes = Buffer.byteLength(bounded.value);
+        const contentHash = createHash("sha256").update(bounded.value).digest("hex");
         remainingBytes -= contentBytes;
         const truncated = read.result.truncated || perFileBounded.truncated || bounded.truncated;
         anyTruncated ||= truncated;
@@ -174,11 +224,18 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
           content: bounded.value,
           encoding: "utf8" as const,
           contentBytes,
-          sha256: createHash("sha256").update(bounded.value).digest("hex"),
+          sha256: contentHash,
+          contentHash,
+          ...(read.result.fileSha256 === undefined ? {} : { fileSha256: read.result.fileSha256 }),
+          ...(read.result.sizeBytes === undefined ? {} : { sizeBytes: read.result.sizeBytes }),
           truncated,
         };
       });
-      return { files, totalBytes: 256 * 1_024 - remainingBytes, truncated: anyTruncated };
+      return {
+        files,
+        totalBytes: 256 * 1_024 - remainingBytes,
+        truncated: anyTruncated,
+      };
     },
   });
 
@@ -186,7 +243,10 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
     name: "searchCode",
     description: "Search repository text with ripgrep and return matching lines.",
     inputSchema: searchCodeInput,
-    outputSchema: z.object({ matches: z.array(z.string()), truncated: z.boolean() }),
+    outputSchema: z.object({
+      matches: z.array(z.string()),
+      truncated: z.boolean(),
+    }),
     permission: "READ",
     timeoutMs: 30_000,
     readOnly: true,
@@ -211,7 +271,11 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
             matches: z.array(z.string()),
             truncated: z.boolean(),
           }),
-          z.object({ ok: z.literal(false), query: z.string(), error: z.string() }),
+          z.object({
+            ok: z.literal(false),
+            query: z.string(),
+            error: z.string(),
+          }),
         ]),
       ),
       totalMatches: z.number().int().nonnegative(),
@@ -228,7 +292,11 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
           const result = await searchCode(search, context);
           return { ok: true as const, query: search.query, ...result };
         } catch (error) {
-          return { ok: false as const, query: search.query, error: errorMessage(error) };
+          return {
+            ok: false as const,
+            query: search.query,
+            error: errorMessage(error),
+          };
         }
       });
       let remainingMatches = 160;
@@ -280,7 +348,8 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
 
   registry.register({
     name: "applyPatch",
-    description: "Apply a unified Git patch inside the repository workspace.",
+    description:
+      "Apply a standard unified Git diff with explicit --- a/path, +++ b/path and numbered @@ -oldStart,oldCount +newStart,newCount @@ hunks. Include unchanged context. Do not use Begin/End Patch markers. A rejected patch changes no files; correct the reported format/context error rather than rereading unchanged source.",
     inputSchema: applyPatchInput,
     outputSchema: z.unknown(),
     permission: "WRITE",
@@ -288,7 +357,14 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
     readOnly: false,
     parallelSafe: false,
     mutatesWorkspace: true,
-    execute: (input, context) => context.sandbox.applyPatch(input, context.signal),
+    execute: (input, context) =>
+      context.sandbox.applyPatch(
+        {
+          ...input,
+          ...(context.patchGuard ? { expectedHashes: context.patchGuard } : {}),
+        },
+        context.signal,
+      ),
   });
 
   registry.register({
@@ -388,7 +464,12 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
 }
 
 async function searchCode(
-  input: { query: string; path: string; glob?: string | undefined; maxResults: number },
+  input: {
+    query: string;
+    path: string;
+    glob?: string | undefined;
+    maxResults: number;
+  },
   context: ToolContext,
 ): Promise<{ matches: string[]; truncated: boolean }> {
   const args = ["--line-number", "--column", "--no-heading", "--color", "never"];
@@ -436,6 +517,17 @@ function truncateUtf8(value: string, maxBytes: number): { value: string; truncat
     const middle = Math.ceil((low + high) / 2);
     if (Buffer.byteLength(value.slice(0, middle)) <= maxBytes) low = middle;
     else high = middle - 1;
+  }
+  // The byte search may stop between the two UTF-16 units of an astral character.
+  if (
+    low > 0 &&
+    low < value.length &&
+    value.charCodeAt(low - 1) >= 0xd800 &&
+    value.charCodeAt(low - 1) <= 0xdbff &&
+    value.charCodeAt(low) >= 0xdc00 &&
+    value.charCodeAt(low) <= 0xdfff
+  ) {
+    low--;
   }
   return { value: value.slice(0, low), truncated: true };
 }

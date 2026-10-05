@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { config } from "dotenv";
 import { z } from "zod";
+import { parseStageModels, type StageModels } from "./stage-models.js";
 
 const packageDirectory = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 config({ path: resolve(packageDirectory, "../../.env"), quiet: true });
@@ -42,11 +43,79 @@ const WorkerEnvironmentSchema = z.object({
   LLM_STRUCTURED_OUTPUT_MODE: z.enum(["auto", "json-schema", "json-object"]).default("auto"),
   LLM_REASONING_PROFILE: z.enum(["efficient", "provider-default"]).default("efficient"),
   DEVFLOW_MAX_RETRIES: z.coerce.number().int().min(0).default(2),
+  DEVFLOW_RELATION_GRAPH_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  DEVFLOW_CONTEXT_COMPRESSION_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  DEVFLOW_CONTEXT_COMPRESSION_MAX_CALLS: z.coerce.number().int().min(0).max(3).default(1),
+  DEVFLOW_CONTEXT_COMPRESSION_MAX_INPUT_TOKENS: z.coerce
+    .number()
+    .int()
+    .min(512)
+    .max(16000)
+    .default(6000),
+  DEVFLOW_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: z.coerce
+    .number()
+    .int()
+    .min(256)
+    .max(4096)
+    .default(2048),
   DEVFLOW_MAX_MODEL_CALLS: optionalPositiveInteger,
   DEVFLOW_MAX_TOOL_CALLS: optionalPositiveInteger,
   DEVFLOW_MAX_TOTAL_TOKENS: z.coerce.number().int().positive().default(250_000),
   DEVFLOW_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(900_000),
   DEVFLOW_STATE_DIR: z.string().min(1).default(".devflow/state"),
+  DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: z.coerce.number().int().positive().default(12000).optional(),
+  DEVFLOW_PLAN_AGENT_MAX_MODEL_CALLS: z.coerce.number().int().positive().default(6).optional(),
+  DEVFLOW_PLAN_AGENT_TIMEOUT_MS: z.coerce.number().int().positive().default(120000).optional(),
+  DEVFLOW_PREPATCH_EFFICIENCY_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
+  DEVFLOW_PREPATCH_CONTEXT_TOKEN_CAP: z.coerce
+    .number()
+    .int()
+    .min(512)
+    .max(12000)
+    .default(6000)
+    .optional(),
+  DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
+  DEVFLOW_POST_PATCH_AUTOFINISH_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
+  DEVFLOW_EFFICIENCY_TRACE_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
+  DEVFLOW_EVIDENCE_ACTION_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
+  DEVFLOW_EXPLORATION_READS: z.coerce.number().int().min(1).max(24).default(4).optional(),
+  DEVFLOW_EXPLORATION_SEARCHES: z.coerce.number().int().min(0).max(8).default(2).optional(),
+  DEVFLOW_EXPLORATION_RELOCATIONS: z.coerce.number().int().min(0).max(1).default(1).optional(),
+  DEVFLOW_WHOLE_FILE_WRITE_BYTES: z.coerce.number().int().min(0).max(8192).default(4096).optional(),
+  DEVFLOW_LOCALIZATION_SMALL_REPO_FILES: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(512)
+    .default(64)
+    .optional(),
+  DEVFLOW_LOCALIZATION_FAST_FILES: z.coerce.number().int().min(1).max(8).default(3).optional(),
   DEVFLOW_SANDBOX_IMAGE: z.string().min(1).default("devflow-sandbox:local"),
   DEVFLOW_SANDBOX_CPUS: z.coerce.number().positive().max(64).default(2),
   DEVFLOW_SANDBOX_MEMORY_MB: z.coerce.number().int().min(6).default(2_048),
@@ -63,10 +132,15 @@ const WorkerEnvironmentSchema = z.object({
   DEVFLOW_GITHUB_WEB_BASE_URL: z.string().url().default("https://github.com"),
 });
 
-export type WorkerEnvironment = z.infer<typeof WorkerEnvironmentSchema>;
+export type WorkerEnvironment = z.infer<typeof WorkerEnvironmentSchema> & {
+  stageModels?: StageModels;
+};
 
 export function loadWorkerEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
 ): WorkerEnvironment {
-  return WorkerEnvironmentSchema.parse(environment);
+  return {
+    ...WorkerEnvironmentSchema.parse(environment),
+    stageModels: parseStageModels(environment),
+  };
 }

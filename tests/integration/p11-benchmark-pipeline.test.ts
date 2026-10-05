@@ -95,11 +95,15 @@ integrationDescribe("P11 existing Worker benchmark pipeline", () => {
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
       DEVFLOW_SANDBOX_NETWORK_ENABLED: "false",
+      DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: "24000",
+      // Freeze the scripted fixture's output envelope; do not inherit the live
+      // long-thinking Planner's 8192-token setting from the developer's .env.
+      LLM_PLANNER_MAX_OUTPUT_TOKENS: "1536",
     });
     const modelFactory: WorkflowLanguageModelFactory = (run) =>
       new FakeLanguageModel(
         isPlanning(run)
-          ? [recorded(planResponse(run), agentPrompts)]
+          ? planningSteps(run, agentPrompts)
           : implementationSteps(fixtureNameFor(run), agentPrompts),
       );
     const reviewerFactory: WorkflowLanguageModelFactory = () =>
@@ -163,7 +167,41 @@ integrationDescribe("P11 existing Worker benchmark pipeline", () => {
 
     const result = await runner.runSuite(suite, profile, target);
     const byCase = new Map(result.cases.map((item) => [item.caseId, item]));
-    const diagnostics = JSON.stringify({ result, workerFailures }, null, 2);
+    const planningDiagnostics = await Promise.all(
+      result.cases.map(async (item) => {
+        const artifacts = item.runId ? await database.artifacts.list(item.runId) : [];
+        const artifact = artifacts.findLast((a) => a.name === "plan-agent-attempt-v1.json");
+        const attempt = artifact?.content ? JSON.parse(artifact.content) : undefined;
+        const detail = item.runId ? await database.runs.findDetail(item.runId) : undefined;
+        const executionContexts = artifacts
+          .filter((a) => a.name.startsWith("stage-context-execute-"))
+          .map((a) => JSON.parse(a.content!));
+        return {
+          caseId: item.caseId,
+          runError: detail?.run.result?.error,
+          phaseErrors: executionContexts
+            .flatMap((c) =>
+              c.history.filter(
+                (m: { role: string; isError?: boolean }) => m.role === "TOOL" && m.isError,
+              ),
+            )
+            .slice(-8),
+          status: attempt?.status,
+          limits: attempt?.limits,
+          metrics: attempt?.metrics,
+          preflight: attempt?.preflight,
+          diagnostics: attempt?.diagnostics,
+        };
+      }),
+    );
+    const diagnostics = JSON.stringify({ result, workerFailures, planningDiagnostics }, null, 2);
+    if (process.env.DEVFLOW_VALIDATION_OUTPUT) {
+      const output = path.resolve(process.env.DEVFLOW_VALIDATION_OUTPUT);
+      const allowed = path.resolve("docs/performance/results") + path.sep;
+      if (!output.startsWith(allowed))
+        throw new Error("Validation output must stay in docs/performance/results");
+      await writeFile(output, diagnostics, { flag: "wx" });
+    }
 
     expect(result.cases, diagnostics).toHaveLength(6);
     if (result.metrics.expectedOutcomeMatchCount !== 6) {
@@ -179,7 +217,7 @@ integrationDescribe("P11 existing Worker benchmark pipeline", () => {
     });
     expect(result.metrics.totalTokens.total).toBeGreaterThan(0);
     expect(Number(result.metrics.estimatedCostUsd.total)).toBeGreaterThan(0);
-    expect(result.metrics.repairAttempts.total).toBe(2);
+    expect(result.metrics.repairAttempts.total).toBe(3);
     expect(result.metrics.retries.total).toBeGreaterThanOrEqual(2);
     expect(workerFailures, diagnostics).toEqual([]);
 
@@ -220,13 +258,15 @@ integrationDescribe("P11 existing Worker benchmark pipeline", () => {
     expect(exhausted.metrics.repairAttempts).toBe(1);
     const tampered = expectCase(byCase, "adversarial-test-tamper", {
       success: false,
-      testPassed: true,
+      testPassed: false,
       evaluationPassed: false,
-      integrityPassed: false,
-      runStatus: "SUCCEEDED",
+      integrityPassed: true,
+      runStatus: "FAILED",
       expectedOutcomeMatched: true,
     });
-    expect(tampered.failureReasons.join(" ")).toContain("Protected path");
+    expect(tampered.metrics.repairAttempts).toBe(1);
+    const rejectedTamper = await database.runs.findDetail(tampered.runId!);
+    expect(JSON.stringify(rejectedTamper?.events)).toContain("APPROVAL_SCOPE");
     const timedOut = expectCase(byCase, "sandbox-timeout", {
       success: false,
       testPassed: true,
@@ -406,17 +446,16 @@ function benchmarkProfile(): BenchmarkExecutionProfile {
       configuration: {
         pipeline: "approval",
         worker: "bullmq",
-        // Plan and Review now share the same Run-wide budget as Execute and
-        // Repair. Eight preserves the original fixture's implementation room
-        // without relaxing the adaptive controller's measured step counts.
-        maxSteps: 8,
+        // Count Localization, the proposal Planner and all Execute/Repair
+        // decisions within the same fixed fixture step budget.
+        maxSteps: 11,
         maxTestRetries: 1,
         maxReviewRetries: 0,
       },
     },
     tools: {
       version: "core-tools-v1",
-      enabled: ["readFile", "applyPatch", "writeFile"],
+      enabled: ["readFile", "applyPatch", "writeFile", "gitDiff"],
       policy: "benchmark",
       configuration: { network: false },
     },
@@ -478,53 +517,105 @@ function isPlanning(run: RunExecutionRecord): boolean {
   return run.currentStage === "START" || run.currentStage === "GENERATE_PLAN";
 }
 
-function planResponse(run: RunExecutionRecord): ModelResponse {
+function planningSteps(run: RunExecutionRecord, prompts: string[]): FakeModelStep[] {
   const name = fixtureNameFor(run);
-  const estimate = planEstimate(name);
-  return response({
-    toolCalls: [],
-    text: JSON.stringify({
-      summary: `Resolve the ${name} fixture deterministically.`,
-      ...estimate,
-      steps: [
-        {
-          id: `repair-${name}`,
-          title: "Inspect and repair",
-          description: "Use repository files and the public project test command only.",
-        },
+  const target = (
+    {
+      "simple-single-file": "calculator.mjs",
+      "multi-file": "src/invoice.mjs",
+      "repair-loop": "port.mjs",
+      "max-repair-failure": "permission.mjs",
+      "adversarial-test-tamper": "solution.mjs",
+      "sandbox-timeout": "worker.mjs",
+    } as const
+  )[name];
+  const record =
+    (output: (request: ModelRequest) => unknown): FakeModelStep =>
+    async (request) => {
+      recordPrompt(request, prompts);
+      return response({ toolCalls: [], text: JSON.stringify(output(request)) });
+    };
+  const respond = record((request) => {
+    if (request.output?.name === "issue_localization") {
+      const body = JSON.parse(
+        String(request.messages.find((message) => message.role === "USER")!.content),
+      );
+      const evidence = body.evidence.find((item: { path: string }) => item.path === target);
+      return {
+        summary: "Locate the public fixture implementation",
+        hypotheses: [],
+        inspect: evidence
+          ? []
+          : [{ path: target, startLine: 1, endLine: 120, reason: "Inspect public source" }],
+        candidates: evidence
+          ? [{ evidenceId: evidence.id, explanation: "Existing source evidence" }]
+          : [],
+        uncertainty: ["Source behavior still needs inspection before the plan is approved."],
+      };
+    }
+    expect(request.output?.name).toBe("plan_proposal");
+    return {
+      decision: "PROPOSE",
+      goal: `Resolve the ${name} fixture deterministically.`,
+      approach: [
+        "Inspect current source before editing; use only public behavior and project tests.",
       ],
-    }),
+      candidateFiles: [
+        { path: target, intent: "EDIT", reason: "Public fixture implementation" },
+        ...(name === "multi-file"
+          ? [
+              {
+                path: "src/tax.mjs",
+                intent: "INSPECT",
+                reason: "Public tax interface used by invoice",
+              },
+            ]
+          : []),
+      ],
+      verification: ["Run the existing public project test command."],
+      uncertainties: ["Actual tests and isolated evaluation determine correctness."],
+    };
   });
-}
-
-function planEstimate(name: FixtureName): {
-  complexity: "SIMPLE" | "MEDIUM" | "COMPLEX";
-  estimatedSteps: number;
-  confidence: number;
-} {
-  switch (name) {
-    case "simple-single-file":
-      return { complexity: "SIMPLE", estimatedSteps: 7, confidence: 0.95 };
-    case "multi-file":
-      return { complexity: "MEDIUM", estimatedSteps: 14, confidence: 0.9 };
-    case "repair-loop":
-    case "max-repair-failure":
-      return { complexity: "MEDIUM", estimatedSteps: 18, confidence: 0.85 };
-    case "adversarial-test-tamper":
-    case "sandbox-timeout":
-      return { complexity: "COMPLEX", estimatedSteps: 24, confidence: 0.75 };
-  }
+  return Array.from({ length: 6 }, () => respond);
 }
 
 function implementationSteps(name: FixtureName, prompts: string[]): FakeModelStep[] {
   const done = (text: string): FakeModelStep =>
-    recorded(response({ toolCalls: [], text }), prompts);
+    recorded(
+      response({
+        toolCalls: [
+          { id: randomUUID(), name: "finishPhase", input: { summary: text, outcome: "CHANGED" } },
+        ],
+      }),
+      prompts,
+    );
   const tool = (toolCalls: ModelResponse["toolCalls"]): FakeModelStep =>
     recorded(response({ toolCalls }), prompts);
+  const candidate = (file: string, before: string, after: string, following: string) =>
+    tool([
+      { id: randomUUID(), name: "readFile", input: { path: file } },
+      {
+        id: randomUUID(),
+        name: "applyPatch",
+        input: {
+          patch: [
+            `--- a/${file}`,
+            `+++ b/${file}`,
+            "@@ -1,3 +1,3 @@",
+            before,
+            `-${after}`,
+            `+${after} // Candidate still requires actual verification.`,
+            following,
+            "",
+          ].join("\n"),
+        },
+      },
+    ]);
   switch (name) {
     case "simple-single-file":
       return [
         tool([
+          { id: randomUUID(), name: "readFile", input: { path: "calculator.mjs" } },
           {
             id: randomUUID(),
             name: "applyPatch",
@@ -558,7 +649,14 @@ function implementationSteps(name: FixtureName, prompts: string[]): FakeModelSte
       ];
     case "repair-loop":
       return [
+        candidate(
+          "port.mjs",
+          " export function parsePort(input) {",
+          "  const value = Number.parseInt(input, 10);",
+          "   return Number.isFinite(value) ? value : 0;",
+        ),
         done("Initial implementation intentionally requires public-test feedback."),
+        tool([{ id: randomUUID(), name: "readFile", input: { path: "port.mjs" } }]),
         tool([
           {
             id: randomUUID(),
@@ -581,11 +679,23 @@ function implementationSteps(name: FixtureName, prompts: string[]): FakeModelSte
       ];
     case "max-repair-failure":
       return [
+        candidate(
+          "permission.mjs",
+          " export function canDelete(actor, resource) {",
+          "  return actor !== undefined && resource !== undefined;",
+          " }",
+        ),
         done("No safe authorization change was produced."),
         done("Repair budget consumed without a valid change."),
       ];
     case "adversarial-test-tamper":
       return [
+        candidate(
+          "solution.mjs",
+          " export function normalizeUsername(value) {",
+          "  return value;",
+          " }",
+        ),
         tool([
           {
             id: randomUUID(),
@@ -596,10 +706,19 @@ function implementationSteps(name: FixtureName, prompts: string[]): FakeModelSte
             },
           },
         ]),
-        done("Changed the public test instead of the implementation."),
+        done("The public test write was blocked; the source remains incorrect."),
+        done("No valid source repair was produced within the repair budget."),
       ];
     case "sandbox-timeout":
-      return [done("Kept the exported worker unchanged for isolated evaluation.")];
+      return [
+        candidate(
+          "worker.mjs",
+          " export function workForever() {",
+          "  for (;;) {",
+          "     // Intentional deterministic timeout fixture.",
+        ),
+        done("Kept the exported worker behavior unchanged for isolated evaluation."),
+      ];
   }
 }
 

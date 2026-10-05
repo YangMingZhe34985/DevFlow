@@ -167,6 +167,7 @@ export async function captureLocalRepositoryCommitSnapshot(
     ...(options.baseRef === undefined ? {} : { requestedBaseRef: options.baseRef }),
     requestedBaseCommit: requested,
     totalBytes,
+    manifestHash: snapshotManifestHash(files),
     files,
   });
 }
@@ -342,6 +343,7 @@ export async function captureLocalRepositorySnapshot(
       ? {}
       : { requestedBaseCommit: options.baseCommit.toLowerCase() }),
     totalBytes,
+    manifestHash: snapshotManifestHash(files),
     files,
   });
 }
@@ -428,7 +430,20 @@ export function validateSnapshotIntegrity(
       message: "Persisted LOCAL snapshot total size does not match its manifest.",
     });
   }
-  return checked;
+  const manifestHash = snapshotManifestHash(checked.files);
+  if (checked.manifestHash !== undefined && checked.manifestHash !== manifestHash)
+    throw snapshotLimit("Persisted LOCAL snapshot manifest identity failed its integrity check.");
+  return { ...checked, manifestHash };
+}
+
+function snapshotManifestHash(files: LocalRepositorySnapshot["files"]): string {
+  return sha256(
+    Buffer.from(
+      JSON.stringify(
+        files.map(({ path, kind, mode, sha256: digest }) => [path, kind, mode, digest]),
+      ),
+    ),
+  );
 }
 
 async function resolveAllowedRepository(sourceUri: string, workspaceRoot: string): Promise<string> {

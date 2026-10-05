@@ -14,6 +14,8 @@ import {
   type DevflowErrorShape,
   type NewAgentEvent,
   RunMetricsSchema,
+  ExecuteCompletionSchema,
+  VerificationContractSchema,
   type RunResult,
   type RunStatus,
   type TaskStatus,
@@ -55,6 +57,7 @@ import type {
   PersistedRunTransition,
   RepositoryRecord,
   RepositoryStore,
+  RepositoryIndexStore,
   ResolveApprovalInput,
   RunExecutionRecord,
   RunDetailRecord,
@@ -77,6 +80,7 @@ type RunWithTaskAndRepository = Prisma.RunGetPayload<{
 }>;
 
 export class PrismaDatabaseAdapter implements DatabaseAdapter {
+  readonly repositoryIndexes: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
@@ -87,6 +91,21 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   readonly events: EventStore;
 
   constructor(readonly client: PrismaClient) {
+    this.repositoryIndexes = {
+      get: async (scope, key) => {
+        const entry = await client.repositoryIndexEntry.findUnique({
+          where: { scope_key: { scope, key } },
+        });
+        return entry?.value;
+      },
+      publish: async (scope, key, value) => {
+        // Unique immutable keys fence stale builders; no update/upsert can overwrite a publication.
+        await client.repositoryIndexEntry.createMany({
+          data: [{ scope, key, value: JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue }],
+          skipDuplicates: true,
+        });
+      },
+    };
     this.repositories = new PrismaRepositoryStore(client);
     this.tasks = new PrismaTaskStore(client);
     this.runs = new PrismaRunStore(client);
@@ -523,7 +542,13 @@ class PrismaRunStore implements RunRepository {
               inputTokens: result.metrics.tokenUsage.inputTokens,
               outputTokens: result.metrics.tokenUsage.outputTokens,
               totalTokens: result.metrics.tokenUsage.totalTokens,
-              metricsDetail: jsonInput(result.metrics),
+              metricsDetail: jsonInput({
+                ...result.metrics,
+                ...(result.executeCompletion
+                  ? { executeCompletion: result.executeCompletion }
+                  : {}),
+                ...(result.verification ? { verification: result.verification } : {}),
+              }),
               ...(result.metrics.tokenUsage.costUsd === undefined
                 ? {}
                 : { costUsd: result.metrics.tokenUsage.costUsd }),
@@ -1948,12 +1973,17 @@ function resultFromRun(run: PrismaRun): RunResult | undefined {
   };
   const parsedMetrics = RunMetricsSchema.safeParse(run.metricsDetail);
   const persistedMetrics = parsedMetrics.success ? parsedMetrics.data : undefined;
+  const detail = run.metricsDetail as Record<string, unknown> | null;
+  const completion = ExecuteCompletionSchema.safeParse(detail?.executeCompletion);
+  const verification = VerificationContractSchema.safeParse(detail?.verification);
   return {
     runId: run.id,
     status: run.status,
     ...(run.summary === null ? {} : { summary: run.summary }),
     metrics: persistedMetrics ?? legacyMetrics,
     ...(error === undefined ? {} : { error }),
+    ...(completion.success ? { executeCompletion: completion.data } : {}),
+    ...(verification.success ? { verification: verification.data } : {}),
   };
 }
 

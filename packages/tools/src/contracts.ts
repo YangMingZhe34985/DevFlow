@@ -1,10 +1,19 @@
 import type { SandboxSession } from "@devflow/sandbox";
-import type { DevflowErrorShape, NewAgentEvent, RunId, StepId, ToolCallId } from "@devflow/shared";
+import type {
+  DevflowErrorShape,
+  NewAgentEvent,
+  RunId,
+  StepId,
+  ToolCallId,
+  MutationResult,
+} from "@devflow/shared";
 import type { z } from "zod";
 
 export type ToolPermission = "READ" | "WRITE" | "EXECUTE" | "GIT";
 
 export interface ToolContext {
+  /** Supplied only by the owning workflow after approval/version validation. */
+  patchGuard?: Readonly<Record<string, string | null>>;
   runId: RunId;
   stepId: StepId;
   sandbox: SandboxSession;
@@ -45,13 +54,14 @@ export interface ToolExecutionRequest {
   input: unknown;
 }
 
-export type ToolExecutionResult =
+export type ToolExecutionResult = { mutation?: MutationResult } & (
   | { ok: true; output: unknown; durationMs: number }
   | {
       ok: false;
       error: DevflowErrorShape;
       durationMs: number;
-    };
+    }
+);
 
 export interface ToolExecutor {
   execute(request: ToolExecutionRequest, context: ToolContext): Promise<ToolExecutionResult>;

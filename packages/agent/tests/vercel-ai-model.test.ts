@@ -297,6 +297,11 @@ describe("VercelAiLanguageModel", () => {
     });
     expect(bodies[0]).not.toHaveProperty("reasoning_effort");
     expect(bodies[0]).not.toHaveProperty("enable_thinking");
+    expect(JSON.stringify(bodies[0])).toContain("required output schema");
+    const messages = (bodies[0] as { messages: { content: string }[] }).messages;
+    const contract = JSON.parse(messages[0]!.content.split("\n").at(-1)!);
+    expect(contract.required).toEqual(["answer"]);
+    expect(contract.additionalProperties).toBe(false);
   });
 });
 
@@ -317,3 +322,25 @@ function usage() {
     outputTokens: { total: 3, text: 3, reasoning: 0 },
   };
 }
+
+it("enforces request output limits without increasing a tighter pinned model limit", async () => {
+  const model = modelReturning("done");
+  await new VercelAiLanguageModel(model, { maxOutputTokens: 2000 }).generate(
+    {
+      messages: [{ role: "USER", content: "bounded" }],
+      tools: [],
+      settings: { maxOutputTokens: 1536 },
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(model.doGenerateCalls[0]?.maxOutputTokens).toBe(1536);
+  await new VercelAiLanguageModel(model, { maxOutputTokens: 1000 }).generate(
+    {
+      messages: [{ role: "USER", content: "bounded" }],
+      tools: [],
+      settings: { maxOutputTokens: 1536 },
+    },
+    { signal: new AbortController().signal },
+  );
+  expect(model.doGenerateCalls[1]?.maxOutputTokens).toBe(1000);
+});

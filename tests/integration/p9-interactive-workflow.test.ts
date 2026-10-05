@@ -1,6 +1,6 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import { cp, mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { createServer } from "node:net";
 import os from "node:os";
@@ -26,6 +26,7 @@ import {
   type WorkflowLanguageModelFactory,
 } from "../../apps/worker/src/runs/approval-workflow-run-executor.js";
 import { RunProcessor } from "../../apps/worker/src/runs/run.processor.js";
+import { relationGraphDigest } from "../../apps/worker/src/localization/relation-graph.js";
 
 const execFileAsync = promisify(execFile);
 const integrationEnabled = process.env.DEVFLOW_P9_INTEGRATION === "1";
@@ -51,11 +52,13 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
   let webProcess: ChildProcess | undefined;
   let webBaseUrl: string;
   let webDistributionDirectory: string | undefined;
+  let originalNextEnvironment: string | undefined;
   let webOutput = "";
   let browser: Browser | undefined;
   let reviewerCalls = 0;
 
   beforeAll(async () => {
+    originalNextEnvironment = await readFile("apps/web/next-env.d.ts", "utf8");
     temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "devflow-p9-"));
     workspace = path.join(temporaryRoot, "repository");
     process.env.DEVFLOW_LOCAL_REPOSITORY_ROOT = temporaryRoot;
@@ -85,6 +88,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
       REDIS_URL: redisUrl,
       RUN_QUEUE_NAME: queueName,
       DEVFLOW_TIMEOUT_MS: "60000",
+      DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: "60000",
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
       DEVFLOW_SANDBOX_NETWORK_ENABLED: "false",
@@ -166,6 +170,9 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
   afterAll(async () => {
     await browser?.close();
     await stopProcessTree(webProcess);
+    if (originalNextEnvironment !== undefined) {
+      await writeFile("apps/web/next-env.d.ts", originalNextEnvironment);
+    }
     await queueWorker?.close();
     await workerQueue?.close();
     await workerRedis?.quit();
@@ -200,7 +207,8 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
 
     const runForm = page.getByTestId("run-form");
     await runForm.getByLabel("Task").selectOption({ label: taskTitle });
-    await runForm.getByLabel("Max steps").fill("8");
+    // Both the initial plan and rejection recovery now include two read-only Agents.
+    await runForm.getByLabel("Max steps").fill("16");
     await runForm.getByLabel("Max repair").fill("2");
     await runForm.getByRole("button", { name: "创建并启动 Run" }).click();
     await expect.poll(() => page.url(), { timeout: 30_000 }).toContain("/runs/");
@@ -257,6 +265,63 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
     expect(planningPrompts.some((prompt) => prompt.includes(feedback))).toBe(true);
     expect(reviewerCalls).toBe(1);
     expect(reviewRequests[0]?.tools).toHaveLength(0);
+    {
+      expect(planningPrompts.some((prompt) => prompt.includes('"hostState"'))).toBe(true);
+      expect(detail!.artifacts.map((artifact) => artifact.name)).toEqual(
+        expect.arrayContaining([
+          "issue-localization-agent-plan-v1.json",
+          "plan-agent-attempt-v1.json",
+        ]),
+      );
+      const graphArtifact = detail!.artifacts.findLast(
+        (a) => a.name === "repository-relations-plan-v1.json",
+      )!;
+      const issueArtifact = detail!.artifacts.findLast(
+        (a) => a.name === "issue-local-graph-plan-v1.json",
+      )!;
+      expect(graphArtifact).toBeDefined();
+      expect(issueArtifact).toBeDefined();
+      const graph = JSON.parse(graphArtifact.content!);
+      const issueGraph = JSON.parse(issueArtifact.content!);
+      expect(graph.files).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "src/calculator.js",
+            state: "CURRENT",
+            sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          }),
+        ]),
+      );
+      expect(issueGraph).toMatchObject({
+        artifactId: graphArtifact.id,
+        graphSha256: relationGraphDigest(graph),
+        baseCommitSha: graph.baseCommitSha,
+        workspaceRevision: 0,
+      });
+      expect(planningPrompts.some((prompt) => prompt.includes(issueGraph.graphSha256))).toBe(true);
+      const evidence = detail!.artifacts.filter((artifact) =>
+        artifact.name.startsWith("issue-evidence-"),
+      );
+      expect(evidence.map((artifact) => artifact.name)).toEqual(
+        expect.arrayContaining(["issue-evidence-plan.json"]),
+      );
+      expect(evidence.every((artifact) => JSON.parse(artifact.content!).evidence.length > 0)).toBe(
+        true,
+      );
+      expect(detail!.artifacts.some((a) => a.name === "execution-packet-v1.json")).toBe(true);
+      expect(await database.client.repositoryIndexEntry.count()).toBeGreaterThan(0);
+      const plans = evidence.filter((artifact) => artifact.name === "issue-evidence-plan.json");
+      expect(JSON.parse(plans.at(-1)!.content!).metrics.parsedFiles).toBe(0);
+      await database.repositoryIndexes.publish("p9-cache-test", "immutable-key", { version: 1 });
+      await Promise.all([
+        database.repositoryIndexes.publish("p9-cache-test", "immutable-key", { version: 2 }),
+        database.repositoryIndexes.publish("p9-cache-test", "immutable-key", { version: 3 }),
+      ]);
+      expect(await database.repositoryIndexes.get("p9-cache-test", "immutable-key")).toEqual({
+        version: 1,
+      });
+      expect(await database.repositoryIndexes.get("other-scope", "immutable-key")).toBeUndefined();
+    }
 
     const sequences = detail!.events.map(({ sequence }) => sequence);
     expect(new Set(sequences).size).toBe(sequences.length);
@@ -273,11 +338,11 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
     const task = await request("POST", "/tasks", {
       repositoryId: repository.id,
       title: "Never repairs",
-      description: "Exercise the maximum repair limit.",
+      description: "Exercise the maximum repair limit for src/calculator.js subtract().",
     });
     const created = await request("POST", "/runs", {
       taskId: task.id,
-      maxSteps: 3,
+      maxSteps: 8,
       maxTestRetries: 1,
     });
     const runId = (created.run as { id: string }).id;
@@ -332,69 +397,106 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
 
 function workflowModel(run: RunExecutionRecord, planningPrompts: string[]): FakeLanguageModel {
   if (run.currentStage === "START" || run.currentStage === "GENERATE_PLAN") {
-    return new FakeLanguageModel([
-      async (request) => {
-        planningPrompts.push(request.messages.map(({ content }) => String(content)).join("\n"));
-        const revised = run.currentStage === "GENERATE_PLAN";
+    const response = async (request: ModelRequest) => {
+      planningPrompts.push(request.messages.map(({ content }) => String(content)).join("\n"));
+      const body = JSON.parse(String(request.messages.find((m) => m.role === "USER")!.content));
+      if (request.output?.name === "issue_localization") {
+        const candidate = body.evidence.find(
+          (item: { path: string }) => item.path === "src/calculator.js",
+        );
         return fakeModelResponse({
           toolCalls: [],
           text: JSON.stringify({
-            summary: revised ? "Revised test-first calculator plan" : "Initial calculator plan",
-            complexity: "SIMPLE",
-            estimatedSteps: revised ? 9 : 8,
-            confidence: 0.9,
-            steps: [
-              {
-                id: revised ? "inspect-tests-revised" : "inspect-tests",
-                title: "Inspect existing calculator tests",
-                description: revised
-                  ? "Inspect tests first, preserve add(), then repair subtract()."
-                  : "Inspect the failing subtraction behavior.",
-              },
-            ],
+            summary: "Locate calculator source",
+            hypotheses: [],
+            inspect: candidate
+              ? []
+              : [
+                  {
+                    path: "src/calculator.js",
+                    startLine: 1,
+                    endLine: 8,
+                    reason: "Inspect calculator implementation",
+                  },
+                ],
+            candidates: candidate
+              ? [{ evidenceId: candidate.id, explanation: "Verified calculator source" }]
+              : [],
+            uncertainty: ["Tests have not run."],
           }),
         });
-      },
-    ]);
+      }
+      expect(request.output?.name).toBe("plan_proposal");
+      const revised = run.currentStage === "GENERATE_PLAN";
+      return fakeModelResponse({
+        toolCalls: [],
+        text: JSON.stringify({
+          decision: "PROPOSE",
+          goal: revised
+            ? "Revised subtraction repair preserving add()"
+            : "Repair calculator subtraction",
+          approach: [
+            revised
+              ? "Inspect tests first, preserve add(), then repair subtract()."
+              : "Confirm the subtraction behavior and repair it.",
+          ],
+          candidateFiles: [
+            { path: "src/calculator.js", intent: "EDIT", reason: "Arithmetic implementation" },
+            {
+              path: "test/calculator.test.js",
+              intent: "INSPECT",
+              reason: "Public arithmetic behavior",
+            },
+          ],
+          verification: ["Run the existing public test suite."],
+          uncertainties: ["Behavior is unverified until tests run."],
+        }),
+      });
+    };
+    return new FakeLanguageModel(Array.from({ length: 6 }, () => response));
   }
-
-  if (run.task.title === "Never repairs") {
-    return new FakeLanguageModel([
-      fakeModelResponse({ toolCalls: [], text: "Implementation intentionally made no change." }),
-      fakeModelResponse({ toolCalls: [], text: "Repair intentionally made no change." }),
-    ]);
-  }
-
+  const finish = {
+    id: crypto.randomUUID(),
+    name: "finishPhase",
+    input: { summary: "Candidate ready for actual tests", outcome: "CHANGED" },
+  };
+  const patch = (correct: boolean) =>
+    [
+      "--- a/src/calculator.js",
+      "+++ b/src/calculator.js",
+      "@@ -5,4 +5,4 @@",
+      " export function subtract(left, right) {",
+      correct
+        ? "-  // Candidate requires actual test verification."
+        : "-  // Intentional fixture bug: the agent should change + to -.",
+      "-  return left + right;",
+      correct
+        ? "+  // Subtraction must preserve the left-to-right operand order."
+        : "+  // Candidate requires actual test verification.",
+      correct ? "+  return left - right;" : "+  return left + right;",
+      " }",
+      "",
+    ].join("\n");
+  const badCandidate = fakeModelResponse({
+    toolCalls: [
+      { id: crypto.randomUUID(), name: "applyPatch", input: { patch: patch(false) } },
+      finish,
+    ],
+  });
+  if (run.task.title === "Never repairs")
+    return new FakeLanguageModel([badCandidate, fakeModelResponse({ toolCalls: [finish] })]);
   return new FakeLanguageModel([
-    fakeModelResponse({
-      toolCalls: [],
-      text: "Inspected the task; independent tests will identify the defect.",
-    }),
+    badCandidate,
     fakeModelResponse({
       toolCalls: [
-        {
-          id: crypto.randomUUID(),
-          name: "applyPatch",
-          input: {
-            patch: [
-              "--- a/src/calculator.js",
-              "+++ b/src/calculator.js",
-              "@@ -5,4 +5,4 @@",
-              " export function subtract(left, right) {",
-              "-  // Intentional fixture bug: the agent should change + to -.",
-              "-  return left + right;",
-              "+  // Subtraction must preserve the left-to-right operand order.",
-              "+  return left - right;",
-              " }",
-              "",
-            ].join("\n"),
-          },
-        },
+        { id: crypto.randomUUID(), name: "readFile", input: { path: "src/calculator.js" } },
       ],
     }),
     fakeModelResponse({
-      toolCalls: [],
-      text: "Repaired subtract after analyzing the test failure.",
+      toolCalls: [
+        { id: crypto.randomUUID(), name: "applyPatch", input: { patch: patch(true) } },
+        finish,
+      ],
     }),
   ]);
 }

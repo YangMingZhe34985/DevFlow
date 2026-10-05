@@ -6,7 +6,6 @@ import type { CommandResult } from "@devflow/sandbox";
 import {
   buildGitHubRepositoryComplexityProfile,
   buildRepositoryComplexityProfile,
-  buildPlanContext,
   buildReviewContext,
   testResultFingerprint,
 } from "../src/runs/workflow-context.js";
@@ -40,17 +39,6 @@ describe("workflow context bounds and fingerprints", () => {
     expect(context).toContain("...[truncated]");
   });
 
-  it("bounds Plan context by UTF-8 bytes for multibyte task and feedback", () => {
-    const context = buildPlanContext({
-      title: "任务标题 🛠️".repeat(20_000),
-      description: "需求描述 🧪".repeat(30_000),
-      feedback: { reason: "审批反馈 🔍".repeat(20_000) },
-    });
-
-    expect(Buffer.byteLength(context, "utf8")).toBeLessThanOrEqual(STRUCTURED_CONTEXT_MAX_BYTES);
-    expect(context).toContain("...[truncated]");
-  });
-
   it("profiles repository signals used by the existing PLAN call", () => {
     const profile = buildRepositoryComplexityProfile(
       [
@@ -75,16 +63,6 @@ describe("workflow context bounds and fingerprints", () => {
     });
     expect(profile.languageIndicators).toContain("TypeScript/React");
     expect(profile.frameworkIndicators).toEqual(expect.arrayContaining(["Next.js", "Prisma"]));
-
-    const context = buildPlanContext({
-      title: "Fix login form",
-      description: "Repair login validation",
-      repositoryProfile: profile,
-      hardLimit: 100,
-    });
-    expect(context).toContain('"relevantFileCount": 2');
-    expect(context).toContain("cross-module dependencies");
-    expect(context).toContain("100 steps");
   });
 
   it("profiles a GitHub repository for PLAN from the Task's pinned commit SHA", async () => {
@@ -121,11 +99,7 @@ describe("workflow context bounds and fingerprints", () => {
     });
     expect(profile.languageIndicators).toContain("TypeScript/React");
     expect(profile.frameworkIndicators).toEqual(expect.arrayContaining(["Next.js", "Prisma"]));
-    const planContext = buildPlanContext({
-      title: "Fix login form",
-      description: "Repair login validation",
-      repositoryProfile: profile,
-    });
+    const planContext = JSON.stringify({ repositoryProfile: profile }, null, 2);
     expect(planContext).toContain('"availability": "TRUNCATED"');
     expect(planContext).toContain('"fileCount": 4');
   });
@@ -152,9 +126,7 @@ describe("workflow context bounds and fingerprints", () => {
       testAvailability: "UNKNOWN",
       testIndicators: [],
     });
-    expect(
-      buildPlanContext({ title: "Fix login", description: "Repair", repositoryProfile: profile }),
-    ).not.toContain(secret);
+    expect(JSON.stringify(profile)).not.toContain(secret);
   });
 });
 

@@ -96,8 +96,11 @@ try {
     [
       path.resolve("node_modules/vitest/vitest.mjs"),
       "run",
-      "packages/eval/tests",
-      "tests/integration/p11-benchmark-pipeline.test.ts",
+      ...(process.env.DEVFLOW_EF_INTEGRATION === "1"
+        ? ["tests/integration/stage-ef-docker.test.ts"]
+        : process.env.DEVFLOW_LOCALIZATION_LIVE === "1"
+          ? ["tests/integration/localization-live.test.ts"]
+          : ["packages/eval/tests", "tests/integration/p11-benchmark-pipeline.test.ts"]),
       ...process.argv.slice(2),
     ],
     environment,

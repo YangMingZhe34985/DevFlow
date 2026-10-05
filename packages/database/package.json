@@ -1,6 +1,6 @@
 {
   "name": "@devflow/database",
-  "version": "0.1.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -27,8 +27,8 @@
     "db:studio": "prisma studio"
   },
   "dependencies": {
-    "@devflow/github": "0.1.0",
-    "@devflow/shared": "0.1.0",
+    "@devflow/github": "2.0.0",
+    "@devflow/shared": "2.0.0",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
     "dotenv": "18.0.0",

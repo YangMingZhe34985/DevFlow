@@ -10,6 +10,60 @@ import { RunProcessor } from "../src/runs/run.processor.js";
 import { RunRecovery } from "../src/runs/run-recovery.js";
 
 describe("RunProcessor", () => {
+  it("preserves persisted PLAN usage when EXECUTE infrastructure fails", async () => {
+    const run = executionRecord();
+    const runs = runRepository({ claim: vi.fn(async () => run) });
+    const metrics = {
+      ...succeeded(run.id).metrics,
+      modelCalls: 1,
+      tokenUsage: { inputTokens: 31, outputTokens: 19, totalTokens: 50 },
+    };
+    const executor: RunExecutionPort = {
+      execute: async () => {
+        throw new DevflowError({ code: "SANDBOX_RESTORE_FAILED", message: "root restore error" });
+      },
+      observedMetrics: async () => metrics,
+    };
+    await createProcessor(runs, executor).process(job(run.id));
+    expect(runs.complete).toHaveBeenCalledWith(
+      run.id,
+      expect.any(String),
+      expect.objectContaining({
+        metrics,
+        error: expect.objectContaining({ message: "root restore error" }),
+      }),
+    );
+  });
+
+  it("metrics recovery failure never replaces the original error", async () => {
+    const run = executionRecord();
+    const runs = runRepository({ claim: vi.fn(async () => run) });
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await createProcessor(runs, {
+        execute: async () => {
+          throw new DevflowError({ code: "SANDBOX_CREATE_FAILED", message: "original" });
+        },
+        observedMetrics: async () => {
+          throw new Error("flush failure");
+        },
+      }).process(job(run.id));
+      expect(runs.complete).toHaveBeenCalledWith(
+        run.id,
+        expect.any(String),
+        expect.objectContaining({
+          error: expect.objectContaining({ code: "SANDBOX_CREATE_FAILED", message: "original" }),
+        }),
+      );
+      expect(log).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ incomplete: true }),
+      );
+    } finally {
+      log.mockRestore();
+    }
+  });
+
   it("executes a run only once when the same job is consumed concurrently", async () => {
     const run = executionRecord();
     let claimed = false;

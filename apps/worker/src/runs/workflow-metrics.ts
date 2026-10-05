@@ -127,6 +127,8 @@ export function mergeAgentPhaseMetrics(
   phase.toolLatencyMs += source.toolLatencyMs;
   phase.wallLatencyMs += nonnegativeInteger(wallLatencyMs);
   addUsage(target.tokenUsage, source.tokenUsage);
+  target.contextCompressionReservedTokens =
+    (target.contextCompressionReservedTokens ?? 0) + (source.contextCompressionReservedTokens ?? 0);
   addUsage(phase.tokenUsage, source.tokenUsage);
   const reasoning = nonnegativeInteger(
     source.reasoningTokens ?? source.tokenUsage.reasoningTokens ?? 0,

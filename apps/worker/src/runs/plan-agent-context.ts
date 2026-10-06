@@ -244,6 +244,28 @@ export function planEvidenceRows(
       reason: item.reason,
     });
   };
+  if (
+    input.localizationEvidence?.baseCommitSha === input.baseCommitSha &&
+    input.localizationEvidence.evidenceState?.workspaceRevision === input.workspaceRevision
+  ) {
+    for (const item of input.localizationEvidence.implementationEvidence ?? [])
+      add({
+        ...item,
+        repositoryId: input.repositoryId,
+        baseCommitSha: input.baseCommitSha,
+        viewRevision: input.evidence?.viewRevision ?? String(input.workspaceRevision),
+        reason: item.explanation,
+        retrievalSource: ["IMPLEMENTATION_NAVIGATION"],
+        score: 1,
+        language: item.language ?? "unknown",
+        module: item.module ?? "",
+        fileType: item.fileType ?? "SOURCE",
+        parseStatus: item.parseStatus ?? "PARSED",
+        signature: null,
+        directImports: item.directImports ?? [],
+        truncated: true,
+      });
+  }
   for (const item of input.evidence?.evidence ?? []) add(item);
   if (input.localizationEvidence?.baseCommitSha === input.baseCommitSha) {
     for (const item of input.localizationEvidence.candidates) {
@@ -322,6 +344,30 @@ export function planContextText(
           : {
               summary: input.localizationEvidence.summary,
               uncertainty: input.localizationEvidence.uncertainty,
+              ...(input.localizationEvidence.evidenceState?.workspaceRevision ===
+              host.workspaceRevision
+                ? {
+                    evidenceState: {
+                      ...input.localizationEvidence.evidenceState,
+                      observedImplementations:
+                        input.localizationEvidence.evidenceState.observedImplementations.map(
+                          (ref) => ({
+                            evidenceIds: rows
+                              .filter(
+                                (row) =>
+                                  row.path === ref.path &&
+                                  row.contentHash === ref.contentHash &&
+                                  row.startLine <= ref.endLine &&
+                                  row.endLine >= ref.startLine,
+                              )
+                              .map((row) => row.id),
+                            path: ref.path,
+                            symbol: ref.symbol,
+                          }),
+                        ),
+                    },
+                  }
+                : {}),
               ...(input.localizationEvidence.graph?.baseCommitSha === host.baseCommitSha &&
               input.localizationEvidence.graph.workspaceRevision === host.workspaceRevision
                 ? { graph: input.localizationEvidence.graph }

@@ -62,10 +62,38 @@ export function normalizePatchCandidate(input: {
       );
   }
   // Standard multi-file/create/delete patches remain under the existing Git path.
-  if (headers.length !== 1)
+  if (headers.length !== 1) {
+    const diagnostics: string[] = [];
+    const paths = headers.map((i) => lines[i]!.slice(4));
+    if (new Set(paths).size < paths.length)
+      diagnostics.push(
+        "Repeated file sections: use one file header with non-overlapping hunks, or replaceText for exact edits.",
+      );
+    for (let i = 0; i < lines.length; i++) {
+      const hunk = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/u.exec(lines[i]!);
+      if (!hunk) continue;
+      let oldCount = 0,
+        newCount = 0;
+      for (let j = i + 1; j < lines.length && !/^(?:@@|--- |diff --git )/u.test(lines[j]!); j++) {
+        const prefix = lines[j]![0];
+        if (prefix === " " || prefix === "-") oldCount++;
+        if (prefix === " " || prefix === "+") newCount++;
+      }
+      if (Number(hunk[1] ?? 1) !== oldCount || Number(hunk[2] ?? 1) !== newCount)
+        diagnostics.push(
+          `Line ${i + 1}: hunk declares ${hunk[1] ?? 1}/${hunk[2] ?? 1} old/new lines; body has ${oldCount}/${newCount}.`,
+        );
+    }
+    if (diagnostics.some((s) => s.startsWith("Line ")))
+      return reject(
+        "FORMAT_INVALID",
+        diagnostics.slice(0, 9).join(" ") +
+          " No edit was applied; correct the patch without rereading unchanged source.",
+      );
     return needsRepair || lines.some((l) => l === "@@")
       ? reject("UNSUPPORTED_PATCH", "Compatibility accepts one existing MODIFY file only.")
       : { status: "UNCHANGED", patch: input.patch };
+  }
   const header = headers[0]!;
   const from = lines[header]!.match(/^--- a\/(.+)$/u)?.[1];
   const to = lines[header + 1]?.match(/^\+\+\+ b\/(.+)$/u)?.[1];

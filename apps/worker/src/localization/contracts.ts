@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 
-export const INDEX_VERSION = "localization-v1.5";
+export const INDEX_VERSION = "localization-v1.6";
 export const INDEX_CONFIG = {
   filter: "safe-text-v1",
   resolution: "unresolved-direct-specifiers-v1",
@@ -61,6 +61,10 @@ export interface IssueSignals {
   testNames: string[];
   moduleHints: string[];
   constraints: string[];
+  /** Names declared in the Issue's reproduction are hints, not repository definitions. */
+  exampleLocals?: string[];
+  apiSymbols?: string[];
+  versionHints?: string[];
 }
 export interface EvidenceItem {
   repositoryId: string;
@@ -120,6 +124,7 @@ export interface EvidencePack {
     postingsVisited?: number;
     filesInspected?: number;
     indexBuildReadBytes?: number;
+    targetedSearchFiles?: number;
   };
 }
 
@@ -150,38 +155,117 @@ export function exclusionReason(input: string): string | undefined {
   return undefined;
 }
 
-export function tokens(text: string): string[] {
+export function tokens(text: string, limit = 64): string[] {
   const full = text.match(/[\p{L}\p{N}_./-]+/gu) ?? [];
   const split = text.replace(/([a-z0-9])([A-Z])/gu, "$1 $2").split(/[^\p{L}\p{N}]+/u);
   return [
     ...new Set(
       [...full, ...split].map((part) => part.toLowerCase()).filter((part) => part.length >= 2),
     ),
+  ].slice(0, limit);
+}
+
+export type SourceRole = "IMPLEMENTATION" | "TEST" | "BENCHMARK" | "ENTRY" | "METADATA";
+export function sourceRole(path: string): SourceRole {
+  if (isTestFile(path)) return "TEST";
+  if (/(?:^|\/)(?:bench(?:marks?)?|examples?|fixtures?|treeshake)(?:\/|$)/iu.test(path))
+    return "BENCHMARK";
+  if (/(?:^|\/)(?:docs?|website)(?:\/|$)/iu.test(path)) return "METADATA";
+  if (/(?:^|\/)(?:index|external)\.[cm]?[jt]sx?$/iu.test(path)) return "ENTRY";
+  if (!/\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|c|cpp|h|cs)$/iu.test(path)) return "METADATA";
+  return "IMPLEMENTATION";
+}
+
+/** Retrieval priority only; a filename/role match never proves implementation or root cause. */
+export function sourcePathPriority(path: string, signals?: IssueSignals): number {
+  const role = sourceRole(path);
+  let score = { IMPLEMENTATION: 20, TEST: -10, BENCHMARK: -35, ENTRY: -5, METADATA: -25 }[role];
+  if (/(?:^|\/)(?:core|internal|shared|runtime)(?:\/|$)/iu.test(path)) score += 8;
+  if (signals) {
+    const normalized = path.toLowerCase().replace(/[^a-z0-9]/gu, "");
+    for (const symbol of signals.symbols) {
+      const name = symbol.toLowerCase().replace(/[^a-z0-9]/gu, "");
+      if (name.length > 3 && normalized.includes(name)) score += 30;
+    }
+    for (const hint of signals.moduleHints) if (hint && path.startsWith(hint + "/")) score += 20;
+    const version = path.match(/(?:^|\/)(v\d+)(?:\/|$)/iu)?.[1]?.toLowerCase();
+    if (version && signals.versionHints?.length)
+      score += signals.versionHints.includes(version) ? 35 : -35;
+  }
+  return score;
+}
+
+export function issueSearchTerms(signals: IssueSignals): string[] {
+  return [
+    ...new Set([...signals.symbols.map((s) => s.toLowerCase()), ...tokens(signals.description)]),
   ].slice(0, 64);
 }
+
+const fileExtension =
+  /\.(?:[cm]?[jt]sx?|jsonc?|ya?ml|toml|md|txt|py|go|rs|rb|java|c|cpp|h|cs|sh|sql|vue|svelte|html|css)$/iu;
+const commonCalls = new Set([
+  "test",
+  "it",
+  "expect",
+  "log",
+  "require",
+  "if",
+  "for",
+  "while",
+  "function",
+]);
 
 export function extractIssueSignals(description: string): IssueSignals {
   const text = description.slice(0, 16_000);
   const paths = [...new Set(text.match(/(?:[\w@.-]+\/)*[\w.-]+\.[a-zA-Z][a-zA-Z0-9]*/gu) ?? [])]
-    .filter((p) => exclusionReason(p) !== "FORBIDDEN")
+    .filter((p) => fileExtension.test(p) && exclusionReason(p) !== "FORBIDDEN")
     .slice(0, 16);
   const stackFrames = [
     ...text.matchAll(/((?:[\w@.-]+\/)*[\w.-]+\.[a-zA-Z][a-zA-Z0-9]*):(\d+)(?::\d+)?/gu),
   ]
+    .filter((m) => fileExtension.test(m[1]!) && exclusionReason(m[1]!) !== "FORBIDDEN")
     .slice(0, 16)
     .map((m) => ({ path: m[1]!, line: Number(m[2]) }));
+  const exampleLocals = [
+    ...new Set(
+      [...text.matchAll(/\b(?:const|let|var|function|class)\s+([\w$]+)/gu)].map((m) => m[1]!),
+    ),
+  ];
+  const apiSymbols = [
+    ...new Set(
+      [
+        ...text.matchAll(
+          /\b[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*\.([A-Za-z_$][\w$]*)\s*(?=\(|`|[;,\s])/gu,
+        ),
+      ].map((m) => m[1]!),
+    ),
+  ];
   const symbols = [
     ...new Set([
+      ...apiSymbols,
       ...(text.match(/\b[a-zA-Z_$][\w$]*(?=\s*\()/gu) ?? []),
       ...[...text.matchAll(/`([\w$]+)`/gu)].map((m) => m[1]!),
     ]),
-  ].slice(0, 24);
+  ]
+    .filter((name) => !exampleLocals.includes(name) && !commonCalls.has(name))
+    .slice(0, 24);
+  const versionHints = [
+    ...new Set([
+      ...[...text.matchAll(/\bv(\d+)(?:\.\d+)*\b/giu)].map((m) => `v${m[1]}`),
+      ...[...text.matchAll(/\b(?:version|版本)\s*[:：=]?\s*["']?(\d+)\.\d+(?:\.\d+)?/giu)].map(
+        (m) => `v${m[1]}`,
+      ),
+    ]),
+  ];
   return {
     description: text,
     expectedBehavior: text.match(/(?:expected|预期)[:：]\s*([^\n]+)/iu)?.[1] ?? "",
     actualBehavior: text.match(/(?:actual|实际)[:：]\s*([^\n]+)/iu)?.[1] ?? "",
     paths,
     symbols,
+    apiSymbols,
+    exampleLocals,
+    versionHints,
     stackFrames,
     errorStrings: [...text.matchAll(/["“]([^"”\n]{3,160})["”]/gu)].map((m) => m[1]!).slice(0, 8),
     testNames: [...text.matchAll(/(?:test|测试)[:：]\s*([^\n]+)/giu)].map((m) => m[1]!).slice(0, 8),

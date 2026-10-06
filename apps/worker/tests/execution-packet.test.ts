@@ -344,7 +344,7 @@ it("actual Worker PLAN emits the contract before approval; runAgentPhase receive
       hardLimit: 12,
       onLimitReached: () => ({ action: "STOP", reason: "NO_PROGRESS" }),
     },
-    timeoutMs: 5000,
+    timeoutMs: 900000,
     executionBudget: {
       stage: "EXECUTE",
       maxModelCalls: 12,

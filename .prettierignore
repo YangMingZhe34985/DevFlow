@@ -12,6 +12,7 @@ test-results
 .devflow
 .codex
 .claude
+.VSCodeCounter
 docs/Devflow-*
 docs/current-technical-report.md
 docs/performance

@@ -13,7 +13,8 @@ import {
   INDEX_CONFIG_HASH,
   INDEX_VERSION,
   isTestFile,
-  tokens,
+  issueSearchTerms,
+  sourcePathPriority,
   type EvidenceItem,
   type EvidencePack,
   type IndexEntry,
@@ -76,7 +77,7 @@ export class IssueLocalizer {
     const signal = AbortSignal.any([input.signal, AbortSignal.timeout(20_000)]);
     const scope = hash(`${input.accessScope}:${input.repositoryId}`);
     const signals = extractIssueSignals(input.description);
-    const terms = tokens(input.description);
+    const terms = issueSearchTerms(signals);
     const metrics: EvidencePack["metrics"] = {
       indexMs: 0,
       retrievalMs: 0,
@@ -110,6 +111,7 @@ export class IssueLocalizer {
     metrics.manifestEntriesVisited = routed.manifestEntriesVisited;
     metrics.postingsVisited = routed.postingsVisited;
     metrics.indexBuildReadBytes = routed.indexBuildReadBytes;
+    metrics.targetedSearchFiles = routed.targetedSearchFiles;
     metrics.readBytes = routed.indexBuildReadBytes;
     metrics.parsedFiles += routed.anchorParses;
     metrics.toolExecutions++;
@@ -225,6 +227,7 @@ export class IssueLocalizer {
       (a, b) =>
         Number(anchors.includes(b.entry.path)) - Number(anchors.includes(a.entry.path)) ||
         b.score - a.score ||
+        sourcePathPriority(b.entry.path, signals) - sourcePathPriority(a.entry.path, signals) ||
         compare(a.entry.path, b.entry.path),
     );
     const pathLane = rankedPaths
@@ -349,11 +352,22 @@ export class IssueLocalizer {
     incomplete ||= cachedQuery?.success ? cachedQuery.data.incomplete : read.size < entries.length;
     const lexicalLane = [...read]
       .filter(([, file]) => file.lexical > 0)
-      .sort(([a, av], [b, bv]) => bv.lexical - av.lexical || compare(a, b))
+      .sort(
+        ([a, av], [b, bv]) =>
+          bv.lexical +
+            sourcePathPriority(b, signals) / 4 -
+            (av.lexical + sourcePathPriority(a, signals) / 4) || compare(a, b),
+      )
       .slice(0, 40)
       .map(([path]) => path);
     const candidates = [...new Set([...anchors, ...pathLane, ...lexicalLane])]
       .filter((path) => read.has(path))
+      .sort(
+        (a, b) =>
+          Number(anchors.includes(b)) - Number(anchors.includes(a)) ||
+          sourcePathPriority(b, signals) - sourcePathPriority(a, signals) ||
+          lexicalLane.indexOf(a) - lexicalLane.indexOf(b),
+      )
       .slice(0, 40);
     await mapBounded(candidates.slice(0, INDEX_CONFIG.maxEvidenceFiles), async (path) => {
       const file = read.get(path)!;
@@ -385,7 +399,8 @@ export class IssueLocalizer {
           .get(path)
           ?.parsed?.symbols.some(
             (symbol) =>
-              signals.symbols.includes(symbol.name) || terms.includes(symbol.name.toLowerCase()),
+              signals.symbols.includes(symbol.name.replace(/^\$/u, "")) ||
+              terms.includes(symbol.name.toLowerCase()),
           ),
       )
       .slice(0, 40);
@@ -404,7 +419,14 @@ export class IssueLocalizer {
             }))
         : cachedQuery?.success
           ? cachedQuery.data.ranking
-          : reciprocalRankFusion([pathLane, symbolLane, lexicalLane], anchors);
+          : reciprocalRankFusion([pathLane, symbolLane, lexicalLane], anchors).sort(
+              (a, b) =>
+                Number(anchors.includes(b.path)) - Number(anchors.includes(a.path)) ||
+                b.score +
+                  sourcePathPriority(b.path, signals) / 1000 -
+                  (a.score + sourcePathPriority(a.path, signals) / 1000) ||
+                compare(a.path, b.path),
+            );
     if (immutable && !cachedQuery?.success && routed.route !== "FAST_PATH")
       await this.store?.publish(scope, queryKey, {
         paths: ranked
@@ -439,9 +461,17 @@ export class IssueLocalizer {
         continue;
       }
       const lines = file.content.split(/\r?\n/u);
-      const symbol = file.parsed?.symbols.find(
-        (s) => signals.symbols.includes(s.name) || terms.includes(s.name.toLowerCase()),
-      );
+      const symbol = file.parsed?.symbols
+        .filter(
+          (s) =>
+            signals.symbols.includes(s.name.replace(/^\$/u, "")) ||
+            terms.includes(s.name.toLowerCase()),
+        )
+        .sort(
+          (a, b) =>
+            signals.symbols.indexOf(a.name.replace(/^\$/u, "")) -
+            signals.symbols.indexOf(b.name.replace(/^\$/u, "")),
+        )[0];
       const requestedHit =
         signals.stackFrames.find((frame) => frame.path === row.path)?.line ??
         symbol?.startLine ??

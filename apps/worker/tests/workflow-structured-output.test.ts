@@ -13,6 +13,38 @@ const schema = z
   .strict();
 
 describe("generateStructuredOutput", () => {
+  it("uses explicit compact Review recovery settings and discards even valid truncated JSON", async () => {
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [],
+        text: JSON.stringify({ verdict: "PASS", summary: "partial", issues: [] }),
+        finishReason: "LENGTH",
+      }),
+      fakeModelResponse({
+        toolCalls: [],
+        text: JSON.stringify({ verdict: "FAIL", summary: "fresh", issues: [] }),
+      }),
+    ]);
+    const result = await generateStructuredOutput({
+      model,
+      schema,
+      name: "review_result",
+      description: "Review",
+      purpose: "REVIEW",
+      messages: [{ role: "USER", content: "original large evidence" }],
+      settings: { reasoningEffort: "high", maxOutputTokens: 16384 },
+      rejectLength: true,
+      lengthRegeneration: true,
+      lengthRecovery: {
+        messages: [{ role: "USER", content: "complete current evidence and counterevidence" }],
+        settings: { reasoningEffort: "low", maxOutputTokens: 16384 },
+      },
+      signal: new AbortController().signal,
+    });
+    expect(result.value.verdict).toBe("FAIL");
+    expect(model.requests[1]?.settings).toEqual({ reasoningEffort: "low", maxOutputTokens: 16384 });
+    expect(JSON.stringify(model.requests[1]?.messages)).not.toContain("partial");
+  });
   it("accepts one valid schema-conforming result", async () => {
     const model = new FakeLanguageModel([
       fakeModelResponse({

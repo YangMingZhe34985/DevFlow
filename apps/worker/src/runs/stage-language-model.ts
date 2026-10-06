@@ -31,7 +31,14 @@ export function stageLanguageModel(input: {
       // thinking here can consume its entire output envelope before any JSON.
       const settings = {
         ...request.settings,
-        ...(configured.reasoningEffort && request.settings?.reasoningEffort !== "none"
+        ...(configured.reasoningEffort &&
+        request.settings?.reasoningEffort !== "none" &&
+        !(
+          input.stage === "REVIEW" &&
+          request.settings?.reasoningEffort === "low" &&
+          request.output?.name === "review_result" &&
+          request.tools.length === 0
+        )
           ? { reasoningEffort: configured.reasoningEffort }
           : {}),
         ...(outputCap === undefined ? {} : { maxOutputTokens: outputCap }),

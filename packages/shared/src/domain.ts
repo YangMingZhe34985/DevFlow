@@ -89,9 +89,56 @@ export const FreshAgentPlanWithContractSchema = FreshAgentPlanOutputSchema.exten
   executionContract: ExecutionContractSchema,
 });
 
+export const ReviewBehaviorSchema = z.object({
+  scenario: z.string().min(1).max(2000),
+  expected: z.string().min(1).max(2000),
+  actual: z.string().min(1).max(2000),
+  requirementBasis: z.enum(["ISSUE", "PUBLIC_API", "REGRESSION"]),
+  requirement: z.string().min(1).max(2000),
+  evidenceBasis: z.enum(["STATIC_DERIVATION", "PUBLIC_PROBE"]).optional(),
+});
+
+export const ReviewScopeAssessmentSchema = z.object({
+  category: z.enum([
+    "ISSUE_UNRESOLVED",
+    "PATCH_REGRESSION",
+    "PREEXISTING_UNRELATED",
+    "UNDETERMINED",
+  ]),
+  explanation: z.string().min(1).max(2000),
+  taskQuote: z.string().min(1).max(2000).optional(),
+  baselineEvidence: z
+    .object({ path: z.string().min(1), quote: z.string().min(1).max(4000) })
+    .optional(),
+});
+
 export const ReviewFindingSchema = z.object({
+  findingId: z.string().min(1).optional(),
+  kind: z.enum(["DEFECT", "EVIDENCE_GAP", "SUGGESTION"]).optional(),
   severity: z.enum(["INFO", "WARNING", "ERROR"]),
   message: z.string().min(1),
+  behavior: ReviewBehaviorSchema.optional(),
+  scopeAssessment: ReviewScopeAssessmentSchema.optional(),
+  blocking: z.boolean().optional(),
+  blockingReason: z
+    .enum([
+      "NONE",
+      "ISSUE_UNRESOLVED",
+      "PATCH_REGRESSION",
+      "ESSENTIAL_EVIDENCE_MISSING",
+      "SCOPE_UNDETERMINED",
+      "UNVERIFIED_BEHAVIOR",
+    ])
+    .optional(),
+  probeIds: z.array(z.string().min(1)).max(2).optional(),
+  probeAssessment: z
+    .object({
+      probeId: z.string().min(1),
+      conclusion: z.enum(["CONFIRMED", "CONTRADICTED", "INCONCLUSIVE"]),
+      explanation: z.string().min(1).max(2000),
+    })
+    .optional(),
+  disposition: z.enum(["OPEN", "CONFIRMED", "RESOLVED", "CONTRADICTED", "DEFERRED"]).optional(),
   path: z.string().min(1).optional(),
   evidenceStatus: z.enum(["SOURCE_LINKED", "UNVERIFIED"]).optional(),
   evidence: z
@@ -103,7 +150,50 @@ export const ReviewFindingSchema = z.object({
     .optional(),
 });
 
+export const ReviewProbeRequestSchema = z
+  .object({
+    probeId: z.string().min(1).optional(),
+    findingId: z.string().min(1),
+    publicEntrypoint: z.string().min(1).max(1024),
+    language: z.enum(["JS", "TS"]),
+    code: z
+      .string()
+      .min(1)
+      .max(16 * 1024),
+    expectedObservation: z.string().min(1).max(2000),
+    taskBasis: z.string().min(1).max(2000),
+  })
+  .strict();
+
+export const ReviewHostFeedbackSchema = z.object({
+  findingId: z.string().min(1).optional(),
+  category: z.enum(["SOURCE", "BEHAVIOR", "TASK_SCOPE", "REQUEST_FORMAT"]),
+  code: z.string().min(1),
+  field: z.string().optional(),
+  value: z.string().optional(),
+  message: z.string().min(1),
+});
+
 export const ReviewResultSchema = z.object({
+  hostFeedback: z.array(ReviewHostFeedbackSchema).optional(),
+  probeRequests: z.array(ReviewProbeRequestSchema).max(2).optional(),
+  decision: z.enum(["PASS", "FAIL", "NEEDS_EVIDENCE"]).optional(),
+  decisionReason: z
+    .enum(["NO_BLOCKING_FINDINGS", "BLOCKING_FINDINGS", "MISSING_EVIDENCE"])
+    .optional(),
+  evidenceRequests: z
+    .array(
+      z
+        .object({
+          path: z.string().min(1).max(1024).optional(),
+          symbol: z.string().min(1).max(256).optional(),
+          view: z.enum(["CURRENT", "BASELINE"]).optional(),
+          question: z.string().min(1).max(2000),
+        })
+        .strict(),
+    )
+    .max(3)
+    .optional(),
   approved: z.boolean(),
   summary: z.string().min(1),
   findings: z.array(ReviewFindingSchema).default([]),
@@ -199,7 +289,53 @@ export type RunMetrics = z.infer<typeof RunMetricsSchema>;
 
 export const TerminalRunStatusSchema = z.enum(["SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"]);
 
+export const RepairFindingResponseSchema = z
+  .object({
+    findingId: z.string().min(1),
+    outcome: z.enum([
+      "CHANGED",
+      "ALREADY_SATISFIED",
+      "CONTRADICTED",
+      "INSUFFICIENT_EVIDENCE",
+      "SCOPE_CONFLICT",
+    ]),
+    summary: z.string().min(1).max(2000),
+    evidence: z
+      .array(
+        z
+          .object({
+            path: z.string().min(1),
+            quote: z.string().min(1).max(2000),
+            fileSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+          })
+          .strict(),
+      )
+      .max(4)
+      .optional(),
+  })
+  .strict();
 export const PhaseCompletionSchema = z.object({
+  findingResponses: z
+    .array(
+      RepairFindingResponseSchema.extend({
+        evidenceStatus: z.enum(["CURRENT_SOURCE_LINKED", "UNVERIFIED"]).optional(),
+        findingStatus: z.enum(["MATCHED", "UNKNOWN", "DUPLICATE"]).optional(),
+      }),
+    )
+    .max(8)
+    .optional(),
+  unansweredFindingIds: z.array(z.string().min(1)).max(8).optional(),
+  summary: z.string().min(1).max(2000).optional(),
+  findingIds: z.array(z.string().min(1)).max(8).optional(),
+  findingStatus: z.enum(["MATCHED", "UNKNOWN"]).optional(),
+  evidenceStatuses: z
+    .array(
+      z.object({
+        index: z.number().int().nonnegative(),
+        status: z.enum(["CURRENT_SOURCE_LINKED", "UNVERIFIED"]),
+      }),
+    )
+    .optional(),
   outcome: z.enum([
     "CHANGED",
     "ALREADY_SATISFIED",

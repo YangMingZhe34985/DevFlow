@@ -23,6 +23,7 @@ const finish: ModelToolCall = {
 const read: ModelToolCall = { id: "r", name: "readFile", input: { path: "a.ts" } };
 async function run(
   options: {
+    reserve?: boolean;
     auto?: boolean;
     noop?: boolean;
     calls?: ModelToolCall[][];
@@ -64,11 +65,17 @@ async function run(
       approvedPlan: { summary: "Update a.ts", steps: [] },
       additionalContext: "STALE_WORKING_SET EXPLORATION_HISTORY",
       postPatch: c,
+      ...(options.reserve
+        ? {
+            modelSettings: { maxOutputTokens: 512 },
+            convergenceReserve: { downstreamSteps: 0, downstreamTokens: 100 },
+          }
+        : {}),
       executionBudget: {
         stage: "EXECUTE",
         maxModelCalls: 10,
         maxToolCalls: options.maxTools ?? 20,
-        maxTotalTokens: 1000,
+        maxTotalTokens: options.reserve ? 10000 : 1000,
       },
       emitRunLifecycle: false,
     },
@@ -134,6 +141,12 @@ it("same-batch write + finish checks the deterministic diff first without anothe
     outcome: "PATCH_READY",
     metrics: { postPatchModelCalls: 0 },
   });
+});
+it("closing model exploration preserves the authoritative post-write diff probe and handoff", async () => {
+  const { result } = await run({ reserve: true, calls: [[write], [finish]] });
+  expect(result.status).toBe("SUCCEEDED");
+  expect(result.executeCompletion?.outcome).toBe("PATCH_READY");
+  expect(result.executeCompletion?.metrics.postPatchGitDiffCalls).toBe(1);
 });
 it("auto mode completes only the phase and remains within tool budget", async () => {
   expect((await run({ auto: true, calls: [[write]] })).result.executeCompletion?.outcome).toBe(

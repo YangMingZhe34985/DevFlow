@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 import type { WorkingCode } from "@devflow/agent";
+import { graphPathAllowed } from "../localization/relation-graph.js";
 
 import type { SandboxGitService } from "@devflow/git";
 import { parseGitHubRepositoryUri, type GitHubProvider } from "@devflow/github";
@@ -49,6 +50,7 @@ interface RepositoryProfileTask {
 }
 
 export interface RepairContext extends DeterministicContext {
+  stableTaskContext: string;
   currentSources: WorkingCode[];
   diffFingerprint: string;
   testFingerprint: string;
@@ -235,15 +237,29 @@ export async function buildRepairContext(
     git.diff(sandbox, { maxBytes: 80 * 1024 }, signal),
   ]);
   let executions = 2;
-  const changedFiles = status.files
-    .map(({ path }) => path.split(" -> ").at(-1) ?? path)
-    .filter(isUsefulTextPath)
+  const diagnostics = extractRepairDiagnostics(test.stdout + "\n" + test.stderr);
+  const changedPaths = status.files.map(({ path }) => path.split(" -> ").at(-1) ?? path);
+  for (const diagnostic of diagnostics) {
+    const matches = changedPaths.filter(
+      (path) => path === diagnostic.path || path.endsWith("/" + diagnostic.path),
+    );
+    if (matches.length === 1) diagnostic.path = matches[0]!;
+  }
+  const changedFiles = [
+    ...new Set([
+      ...diagnostics.map((d) => d.path),
+      ...status.files.map(({ path }) => path.split(" -> ").at(-1) ?? path).filter(isUsefulTextPath),
+    ]),
+  ]
+    .filter(graphPathAllowed)
     .slice(0, RELEVANT_FILE_LIMIT);
   const relevantFiles = await Promise.all(
     changedFiles.map(async (path) => {
       try {
         const section = diff.patch.split(`+++ b/${path}`)[1]?.split(/^diff --git /mu)[0] ?? "";
-        const changedLine = Number(section.match(/^@@ [^+]*\+(\d+)/mu)?.[1] ?? 1);
+        const changedLine =
+          diagnostics.find((d) => d.path === path)?.line ??
+          Number(section.match(/^@@ [^+]*\+(\d+)/mu)?.[1] ?? 1);
         const startLine = Math.max(1, changedLine - 8);
         const file = await sandbox.readFile(
           { path, startLine, endLine: startLine + 79, maxBytes: 8192 },
@@ -315,6 +331,13 @@ export async function buildRepairContext(
   );
   return {
     text,
+    stableTaskContext: [
+      stableRepairRequirements(extra ?? ""),
+      "Unfinished diagnostic requirements (remain tasks after source edits):",
+      JSON.stringify(diagnostics),
+      `Last public test outcome (not automatically cleared by an edit): exitCode=${test.exitCode}\n${excerpt(testText, 8192)}`,
+      "Preserve already-passing behavior and host scope. Report every supplied finding ID; source versions are separate evidence. A reply never bypasses Test or independent Review.",
+    ].join("\n"),
     currentSources,
     toolExecutions: executions,
     toolLatencyMs: Math.max(0, Date.now() - startedAt),
@@ -324,6 +347,56 @@ export async function buildRepairContext(
     diffFingerprint: sha256(diff.patch),
     testFingerprint: stableTestFingerprint,
   };
+}
+
+function stableRepairRequirements(extra: string): string {
+  const start = extra.indexOf("[");
+  if (start >= 0) {
+    try {
+      const findings = JSON.parse(extra.slice(start));
+      if (Array.isArray(findings))
+        return (
+          extra.slice(0, start) +
+          JSON.stringify(
+            findings.map((f) => ({
+              findingId: f.findingId,
+              kind: f.kind,
+              severity: f.severity,
+              message: f.message,
+              behavior: f.behavior,
+              note: "Original source citations are versioned evidence; refresh before edits or evidence responses.",
+            })),
+          )
+        );
+    } catch {
+      /* Plain diagnostic context remains stable text. */
+    }
+  }
+  return extra;
+}
+
+export function extractRepairDiagnostics(
+  output: string,
+): { path: string; line: number; diagnostic: string }[] {
+  const rows: { path: string; line: number; diagnostic: string }[] = [];
+  const cleaned = stripVTControlCharacters(output).replaceAll("\\", "/");
+  for (const line of cleaned.split("\n")) {
+    const match = line.match(
+      /(?:^|\s|\()((?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_.-]+\.[cm]?[jt]sx?)(?::(\d+)(?::\d+)?|\((\d+),\d+\))/u,
+    );
+    if (!match) continue;
+    const path = match[1]!.replace(/^workspace\//u, "");
+    const position = Number(match[2] ?? match[3]);
+    if (
+      graphPathAllowed(path) &&
+      Number.isSafeInteger(position) &&
+      position > 0 &&
+      !rows.some((r) => r.path === path && r.line === position)
+    )
+      rows.push({ path, line: position, diagnostic: line.slice(0, 2000) });
+    if (rows.length >= 8) break;
+  }
+  return rows;
 }
 
 // Raw stdout/stderr remain in TEST_RESULT and artifacts. Only prompt presentation changes.
@@ -362,6 +435,7 @@ export function buildReviewContext(input: {
   test: CommandResult & { skipped?: boolean };
   diff: string;
   sourceEvidence?: unknown;
+  compact?: boolean;
 }): string {
   // Internal policy can name private evaluator paths. Only its public rules
   // belong in the model projection; source reads still use the full policy.
@@ -376,16 +450,109 @@ export function buildReviewContext(input: {
         },
       }
     : { unavailable: ["No current source supplied; do not assume missing branches are absent."] };
-  return truncate(
-    [
-      `Task:\n${truncate(`${input.title}\n${input.description}`, 24 * 1024)}`,
-      `Approved plan:\n${truncate(JSON.stringify(input.plan, null, 2), 32 * 1024)}`,
-      `Current source and host protection policy:\n${truncate(JSON.stringify(publicEvidence), 64 * 1024)}`,
-      `Test evidence${input.test.skipped === true ? " (SKIPPED: no supported command was detected)" : ""}:\n${compactTestOutput(input.test)}`,
-      `Diff:\n${truncate(input.diff, 96 * 1024)}`,
-    ].join("\n\n"),
-    REVIEW_CONTEXT_LIMIT,
+  const boundedEvidence = publicEvidence as typeof publicEvidence & {
+    sources?: { path?: string; content?: string; fileSha256?: string; view?: string }[];
+    findingHistory?: {
+      path?: string;
+      evidence?: { quote: string; fileSha256: string };
+      scopeAssessment?: { baselineEvidence?: { path: string; quote: string } };
+    }[];
+    omittedSourceRanges?: number;
+    repairResponse?: {
+      evidenceStatus?: string;
+      evidence?: { path: string; quote: string; fileSha256: string }[];
+      findingResponses?: {
+        evidenceStatus?: string;
+        evidence?: { path: string; quote: string; fileSha256: string }[];
+      }[];
+    };
+  };
+  if (boundedEvidence.sources) {
+    boundedEvidence.sources = [...boundedEvidence.sources];
+    if (input.compact) {
+      // Remove identical/covered records, never truncate a source or finding JSON record.
+      boundedEvidence.sources = boundedEvidence.sources.filter(
+        (row, index, rows) =>
+          !rows.some(
+            (other, j) =>
+              j !== index &&
+              other.path === row.path &&
+              (other.view ?? "CURRENT") === (row.view ?? "CURRENT") &&
+              other.fileSha256 === row.fileSha256 &&
+              ((other.content === row.content && j < index) ||
+                (other.content !== row.content &&
+                  Boolean(other.content?.includes(row.content ?? "")))),
+          ),
+      );
+    }
+    const counterevidence = [
+      ...(boundedEvidence.repairResponse?.evidenceStatus === "CURRENT_SOURCE_LINKED"
+        ? (boundedEvidence.repairResponse.evidence ?? [])
+        : []),
+      ...(boundedEvidence.repairResponse?.findingResponses ?? []).flatMap((a) =>
+        a.evidenceStatus === "CURRENT_SOURCE_LINKED" ? (a.evidence ?? []) : [],
+      ),
+    ];
+    while (
+      Buffer.byteLength(JSON.stringify(boundedEvidence)) > 64 * 1024 &&
+      boundedEvidence.sources.length
+    ) {
+      const removable = boundedEvidence.sources.findIndex(
+        (s) =>
+          !counterevidence.some(
+            (c) =>
+              s.path === c.path && s.fileSha256 === c.fileSha256 && s.content?.includes(c.quote),
+          ) &&
+          !boundedEvidence.findingHistory?.some(
+            (f) =>
+              (s.view !== "BASELINE" &&
+                s.path === f.path &&
+                s.fileSha256 === f.evidence?.fileSha256 &&
+                Boolean(s.content?.includes(f.evidence!.quote))) ||
+              (s.view === "BASELINE" &&
+                s.path === f.scopeAssessment?.baselineEvidence?.path &&
+                Boolean(
+                  f.scopeAssessment?.baselineEvidence &&
+                  s.content?.includes(f.scopeAssessment.baselineEvidence.quote),
+                )),
+          ),
+      );
+      if (removable < 0)
+        throw new Error("Review current counterevidence exceeds source cap; no request issued.");
+      boundedEvidence.sources.splice(removable, 1);
+      boundedEvidence.omittedSourceRanges = (boundedEvidence.omittedSourceRanges ?? 0) + 1;
+    }
+  }
+  const planJson = JSON.stringify(
+    input.compact
+      ? {
+          summary: (input.plan as { summary?: string })?.summary,
+          approvalScope: (input.plan as { approvalScope?: unknown })?.approvalScope ?? null,
+        }
+      : input.plan,
+    null,
+    2,
   );
+  const safePlan =
+    Buffer.byteLength(planJson) <= 32 * 1024
+      ? planJson
+      : JSON.stringify({
+          omitted: "Plan details exceeded projection cap; host scope still applies",
+          approvalScope: (input.plan as { approvalScope?: unknown })?.approvalScope ?? null,
+        });
+  const sections = [
+    `Task:\nSOURCE=ORIGINAL_ISSUE; authoritative task requirements.\n${truncate(`${input.title}\n${input.description}`, 24 * 1024)}`,
+    `Approved plan:\nSOURCE=PLAN_INTERPRETATION; cannot independently expand task requirements.\n${safePlan}`,
+    `Current source and host protection policy:\n${JSON.stringify(boundedEvidence)}`,
+    `Test evidence${input.test.skipped === true ? " (SKIPPED: no supported command was detected)" : ""}:\n${truncate(compactTestOutput(input.test), (input.compact ? 8 : 32) * 1024)}`,
+  ];
+  const remaining = REVIEW_CONTEXT_LIMIT - Buffer.byteLength(sections.join("\n\n")) - 16;
+  if (remaining < 64)
+    throw new Error("Review mandatory evidence exceeds projection cap; no request issued.");
+  sections.push(
+    `Diff:\n${truncate(input.diff, Math.min((input.compact ? 16 : 96) * 1024, remaining))}`,
+  );
+  return sections.join("\n\n");
 }
 
 export function progressFingerprint(diffFingerprint: string, testFingerprint: string): string {

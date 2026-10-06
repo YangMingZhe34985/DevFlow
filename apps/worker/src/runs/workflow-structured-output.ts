@@ -39,7 +39,16 @@ export interface GenerateStructuredOutputInput<T> {
   settings?: ModelGenerationSettings;
   /** One new semantic decision from the original context, never a repair of truncated JSON. */
   lengthRegeneration?: boolean;
-  onRequest?(input: { purpose: string; formatRepair: boolean }): Promise<void>;
+  /** Review-specific semantic recovery; other stages retain their existing policy. */
+  lengthRecovery?: { messages: readonly ModelMessage[]; settings: ModelGenerationSettings };
+  rejectLength?: boolean;
+  /** Optional host request deadlines; unset for other stages. */
+  requestTimeoutMs?: { normal: number; recovery: number };
+  onRequest?(input: {
+    purpose: string;
+    formatRepair: boolean;
+    request: ModelRequest;
+  }): Promise<void>;
   onResponse?(attempt: StructuredOutputAttempt): Promise<void>;
   onGenerationError?(input: {
     purpose: string;
@@ -67,7 +76,16 @@ export async function generateStructuredOutput<T>(
   const attempts: StructuredOutputAttempt[] = [];
   const initial = await generateAttempt(input, input.messages, false);
   attempts.push(initial);
-  const initialValue = validatedValue(initial.response, input.schema);
+  const initialValue =
+    input.rejectLength && initial.response.finishReason === "LENGTH"
+      ? {
+          success: false as const,
+          failure: {
+            kind: "EMPTY_OUTPUT" as const,
+            message: "Truncated semantic output is not a complete decision.",
+          },
+        }
+      : validatedValue(initial.response, input.schema);
   if (initialValue.success) {
     await input.onResponse?.(initial);
     return {
@@ -81,8 +99,22 @@ export async function generateStructuredOutput<T>(
   await input.onResponse?.(attempts[0]!);
 
   if (input.lengthRegeneration && initial.response.finishReason === "LENGTH") {
-    const regenerated = await generateAttempt(input, input.messages, false, true);
-    const value = validatedValue(regenerated.response, input.schema);
+    const regenerated = await generateAttempt(
+      input,
+      input.lengthRecovery?.messages ?? input.messages,
+      false,
+      true,
+    );
+    const value =
+      input.rejectLength && regenerated.response.finishReason === "LENGTH"
+        ? {
+            success: false as const,
+            failure: {
+              kind: "EMPTY_OUTPUT" as const,
+              message: "Semantic recovery was also truncated.",
+            },
+          }
+        : validatedValue(regenerated.response, input.schema);
     attempts.push(value.success ? regenerated : { ...regenerated, failure: value.failure });
     await input.onResponse?.(attempts.at(-1)!);
     if (value.success)
@@ -112,7 +144,13 @@ export async function generateStructuredOutput<T>(
   ];
   const repaired = await generateAttempt(input, repairMessages, true);
   attempts.push(repaired);
-  const repairedValue = validatedValue(repaired.response, input.schema);
+  const repairedValue =
+    input.rejectLength && repaired.response.finishReason === "LENGTH"
+      ? {
+          success: false as const,
+          failure: { kind: "EMPTY_OUTPUT" as const, message: "Formatting recovery was truncated." },
+        }
+      : validatedValue(repaired.response, input.schema);
   if (repairedValue.success) {
     await input.onResponse?.(repaired);
     return {
@@ -138,7 +176,6 @@ async function generateAttempt<T>(
     : formatRepair
       ? `${input.purpose}_FORMAT_REPAIR`
       : input.purpose;
-  await input.onRequest?.({ purpose, formatRepair });
   const request: ModelRequest = {
     messages,
     tools: [],
@@ -149,12 +186,26 @@ async function generateAttempt<T>(
     },
     settings: {
       ...input.settings,
-      ...(formatRepair || regeneration ? { reasoningEffort: "none" as const } : {}),
+      ...(formatRepair
+        ? { reasoningEffort: "none" as const }
+        : regeneration
+          ? (input.lengthRecovery?.settings ?? { reasoningEffort: "none" as const })
+          : {}),
     },
   };
+  await input.onRequest?.({ purpose, formatRepair, request });
   const startedAt = Date.now();
+  const requestDeadline = input.requestTimeoutMs
+    ? AbortSignal.timeout(
+        formatRepair || regeneration
+          ? input.requestTimeoutMs.recovery
+          : input.requestTimeoutMs.normal,
+      )
+    : undefined;
   try {
-    const response = await input.model.generate(request, { signal: input.signal });
+    const response = await input.model.generate(request, {
+      signal: requestDeadline ? AbortSignal.any([input.signal, requestDeadline]) : input.signal,
+    });
     return { purpose, formatRepair, ...(regeneration ? { regeneration: true } : {}), response };
   } catch (error) {
     await input.onGenerationError?.({
@@ -163,6 +214,21 @@ async function generateAttempt<T>(
       latencyMs: Math.max(0, Date.now() - startedAt),
       error,
     });
+    if (requestDeadline?.aborted && !input.signal.aborted)
+      throw new DevflowError({
+        code: "TIMEOUT",
+        message: "Structured review request timed out; no complete judgment.",
+        details: {
+          stage: input.purpose,
+          reviewIncomplete: true,
+          requestIssued: true,
+          purpose,
+          requestTimeoutMs:
+            formatRepair || regeneration
+              ? input.requestTimeoutMs!.recovery
+              : input.requestTimeoutMs!.normal,
+        },
+      });
     throw error;
   }
 }

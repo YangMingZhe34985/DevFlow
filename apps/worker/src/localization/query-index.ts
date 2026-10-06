@@ -10,6 +10,9 @@ import {
   INDEX_CONFIG,
   INDEX_CONFIG_HASH,
   INDEX_VERSION,
+  issueSearchTerms,
+  sourcePathPriority,
+  sourceRole,
   tokens,
   type IndexEntry,
   type IndexSource,
@@ -26,6 +29,7 @@ export const ROUTER_DEFAULTS = {
   maxTermsPerFile: 128,
   maxIndexTerms: 200_000,
   maxPostingBytes: 16 * 1024 * 1024,
+  targetedSearchFiles: 24,
 } as const;
 export type RouterConfig = { [K in keyof typeof ROUTER_DEFAULTS]: number };
 type Lane = "path" | "token" | "symbol";
@@ -33,6 +37,7 @@ const Root = z.object({
   files: z.number(),
   bytes: z.number(),
   incomplete: z.boolean(),
+  catalogue: z.array(z.string()).optional(),
   buckets: z.record(
     z.string().regex(/^[0-9a-f]{2}$/u),
     z.string().regex(/^posting-bucket:[0-9a-f]{64}$/u),
@@ -70,7 +75,8 @@ export async function routeQuery(
   let manifestEntriesVisited = 0,
     postingsVisited = 0,
     indexBuildReadBytes = 0,
-    anchorParses = 0;
+    anchorParses = 0,
+    targetedSearchFiles = 0;
   let prepared: Awaited<ReturnType<IndexSource["manifest"]>> | undefined;
   const manifest = async () => {
     if (prepared === undefined) {
@@ -168,6 +174,7 @@ export async function routeQuery(
       skippedBroadSearch: true,
       verifiedPaths: verified.map((entry) => entry.path),
       anchorParses,
+      targetedSearchFiles,
     };
   };
   if (verified.length > 0 && verified.length === signals.paths.length)
@@ -186,6 +193,7 @@ export async function routeQuery(
       skippedBroadSearch: false,
       verifiedPaths: [] as string[],
       anchorParses,
+      targetedSearchFiles,
     };
 
   const base = source.base ?? source;
@@ -243,7 +251,24 @@ export async function routeQuery(
       list.paths = kept.map((entry) => entry.path);
       postings.set(key, list);
     };
-    for (const raw of input.entries.slice(0, INDEX_CONFIG.maxFiles)) {
+    const catalogueEntries = input.entries
+      .slice(0, INDEX_CONFIG.maxFiles)
+      .filter((raw) => {
+        const parsed = EntrySchema.safeParse(raw);
+        return parsed.success && parsed.data.kind === "FILE" && !exclusionReason(parsed.data.path);
+      })
+      .sort(
+        (a, b) =>
+          sourcePathPriority(b.path) - sourcePathPriority(a.path) || compare(a.path, b.path),
+      );
+    const catalogue: string[] = [];
+    for (let offset = 0; offset < catalogueEntries.length; offset += 500) {
+      const chunk = catalogueEntries.slice(offset, offset + 500);
+      const key = `source-catalogue:${hash(JSON.stringify(chunk))}`;
+      await publish(key, chunk);
+      catalogue.push(key);
+    }
+    for (const raw of catalogueEntries) {
       if (files % 128 === 0) {
         signal.throwIfAborted();
         await setImmediate();
@@ -266,7 +291,7 @@ export async function routeQuery(
       readFiles++;
       const lexicalKey =
         entry.contentHash || entry.blobId
-          ? `lexical:${hash(`${entry.contentHash ? `sha256:${entry.contentHash}` : `git:${entry.blobId}`}:terms-v1`)}`
+          ? `lexical:${hash(`${entry.contentHash ? `sha256:${entry.contentHash}` : `git:${entry.blobId}`}:terms-v2`)}`
           : undefined;
       const lexicalSchema = z.object({
         tokens: z.array(z.string()).max(128),
@@ -287,7 +312,7 @@ export async function routeQuery(
           }
           // Lexical declarations are candidates; AST validation still happens only on selected files.
           lexical = lexicalSchema.safeParse({
-            tokens: tokens(content.content).slice(0, config.maxTermsPerFile),
+            tokens: tokens(content.content, config.maxTermsPerFile),
             symbols: [
               ...content.content.matchAll(
                 /\b(?:class|function|interface|def|const|let)\s+([\w$]+)/gu,
@@ -329,6 +354,7 @@ export async function routeQuery(
       bytes: totalBytes,
       incomplete: incomplete || input.entries.length > INDEX_CONFIG.maxFiles,
       buckets: published,
+      catalogue,
     };
     // Failed reads are retryable: never pin an incomplete transient build as the reusable root.
     if (transientFailure) local.set(`${prefix}:root`, metadata);
@@ -363,7 +389,10 @@ export async function routeQuery(
     postingsVisited++;
     const name = posting.data.paths[0]!,
       entry = await lookup(name);
-    if (!entry) continue;
+    if (!entry || sourceRole(name) !== "IMPLEMENTATION") continue;
+    const version = name.match(/(?:^|\/)(v\d+)(?:\/|$)/iu)?.[1]?.toLowerCase();
+    if (version && signals.versionHints?.length && !signals.versionHints.includes(version))
+      continue;
     const file = await source.read(name, signal);
     if (file.truncated) continue;
     const extension = name.split(".").at(-1) ?? "";
@@ -377,7 +406,14 @@ export async function routeQuery(
       anchorParses++;
       await store?.publish(parseScope, key, parsed);
     }
-    if (parsed.status === "PARSED" && parsed.symbols.some((item) => item.name === symbol))
+    if (
+      parsed.status === "PARSED" &&
+      parsed.symbols.some(
+        (item) =>
+          item.name === symbol &&
+          !/^\s*(?:export\s+)?(?:declare\s+)?(?:type|interface)\b/u.test(item.signature),
+      )
+    )
       return await fastPath([entry], new Map([[name, file]]));
     indexBuildReadBytes += Buffer.byteLength(file.content);
   }
@@ -407,7 +443,7 @@ export async function routeQuery(
     }
   }
   for (const lane of lanes)
-    for (const term of tokens(description)) {
+    for (const term of issueSearchTerms(signals)) {
       const key = `${lane}:${term}`,
         id = bucket(key);
       const reference = root.success ? root.data.buckets[id] : undefined;
@@ -432,9 +468,87 @@ export async function routeQuery(
       scores.set(entry.path, (scores.get(entry.path) ?? 0) + 4);
     }
   }
+  // A partial content index cannot establish that a symbol is absent. Search a
+  // query-directed slice of its persisted catalogue, including on a warm query.
+  // Do not re-enumerate the source or persist a query-specific negative root.
+  const targeted = new Map<string, IndexEntry>();
+  let hasDefinitionPosting = true;
+  for (const symbol of signals.symbols.slice(0, 2)) {
+    const posting = await readPosting("symbol", symbol);
+    if (
+      posting.success &&
+      posting.data.paths.some((name) => sourceRole(name) === "IMPLEMENTATION")
+    ) {
+      continue;
+    }
+    hasDefinitionPosting = false;
+  }
+  if (root.success && root.data.incomplete && signals.symbols.length && !hasDefinitionPosting) {
+    const catalogueEntries: IndexEntry[] = [];
+    for (const key of root.data.catalogue ?? []) {
+      signal.throwIfAborted();
+      const chunk = z
+        .array(EntrySchema)
+        .max(500)
+        .safeParse(await get(key));
+      if (chunk.success) catalogueEntries.push(...chunk.data);
+    }
+    const deleted = new Set(changed?.deleted ?? []);
+    for (const entry of changed?.entries ?? []) targeted.set(entry.path, entry);
+    const selected = topK(
+      catalogueEntries
+        .filter((entry) => !deleted.has(entry.path) && entry.sizeBytes <= INDEX_CONFIG.maxFileBytes)
+        .map((entry) => ({ path: entry.path, score: sourcePathPriority(entry.path, signals) })),
+      config.targetedSearchFiles,
+    );
+    const catalogueByPath = new Map(catalogueEntries.map((entry) => [entry.path, entry]));
+    for (const row of selected) {
+      if (indexBuildReadBytes + INDEX_CONFIG.maxFileBytes > config.indexReadBytes) break;
+      const entry = await lookup(row.path);
+      if (!entry) continue;
+      try {
+        const file = await source.read(entry.path, signal);
+        targetedSearchFiles++;
+        indexBuildReadBytes += Buffer.byteLength(file.content);
+        if (
+          file.truncated ||
+          Buffer.byteLength(file.content) > INDEX_CONFIG.maxFileBytes ||
+          file.content.includes("\0") ||
+          (entry.contentHash && hash(file.content) !== entry.contentHash)
+        )
+          continue;
+        const declarations = [
+          ...file.content.matchAll(
+            /\b(?:class|function|interface|type|const|let|var)\s+([\w$]+)/gu,
+          ),
+        ].map((m) => m[1]!);
+        const matches = signals.symbols.filter(
+          (name) => declarations.includes(name) || declarations.includes(`$${name}`),
+        );
+        const lexical = issueSearchTerms(signals).filter((term) =>
+          file.content.toLowerCase().includes(term),
+        ).length;
+        if (matches.length || lexical > 1) {
+          scores.set(entry.path, (scores.get(entry.path) ?? 0) + matches.length * 12 + lexical);
+          targeted.set(entry.path, entry);
+        }
+      } catch {
+        signal.throwIfAborted();
+        incomplete = true;
+      }
+    }
+    // Path/role candidates remain available even if the bounded search found no definition.
+    for (const row of selected.slice(0, 8)) {
+      const entry = catalogueByPath.get(row.path);
+      if (entry && !targeted.has(entry.path)) targeted.set(entry.path, entry);
+    }
+  }
   const entries: IndexEntry[] = [];
   for (const row of topK(
-    [...scores].map(([path, score]) => ({ path, score })),
+    [...new Set([...scores.keys(), ...targeted.keys()])].map((name) => ({
+      path: name,
+      score: (scores.get(name) ?? 0) + sourcePathPriority(name, signals) / 10,
+    })),
     config.queryCandidates,
   )) {
     const entry = await lookup(row.path);
@@ -450,5 +564,6 @@ export async function routeQuery(
     skippedBroadSearch: false,
     verifiedPaths: [] as string[],
     anchorParses,
+    targetedSearchFiles,
   };
 }

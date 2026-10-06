@@ -1,8 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { loadWorkerEnvironment } from "../src/config/env.js";
 import { resolveStageModel } from "../src/config/stage-models.js";
 import { stageLanguageModel } from "../src/runs/stage-language-model.js";
-import { FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
+import {
+  FakeLanguageModel,
+  fakeModelResponse,
+  createConfiguredLanguageModel,
+} from "@devflow/agent";
+afterEach(() => vi.unstubAllGlobals());
 
 const env = {
   DATABASE_URL: "test",
@@ -13,6 +19,64 @@ const env = {
   LLM_PROVIDER_NAME: "bailian",
 };
 describe("stage model bindings", () => {
+  it.each(["REVIEW", "REPAIR"] as const)(
+    "forwards the public %s configuration to HTTP without a smaller internal output cap",
+    async (stage) => {
+      const example = Object.fromEntries(
+        readFileSync(".env.example", "utf8")
+          .split(/\r?\n/u)
+          .flatMap((line) => {
+            const match = line.match(/^(LLM_[A-Z_]+)=(.*)$/u);
+            return match ? [[match[1]!, match[2]!]] : [];
+          }),
+      );
+      const configured = loadWorkerEnvironment({
+        ...example,
+        DATABASE_URL: "test",
+        LLM_API_KEY: "mock-only-key",
+      });
+      const binding = resolveStageModel(stage, configured),
+        bodies: Record<string, unknown>[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (_url: unknown, init: RequestInit) => {
+          bodies.push(JSON.parse(String(init.body)));
+          return new Response(
+            JSON.stringify({
+              id: "mock",
+              object: "chat.completion",
+              created: 1,
+              model: binding.config.model,
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: "Done" },
+                  finish_reason: "stop",
+                },
+              ],
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        }),
+      );
+      await createConfiguredLanguageModel(binding.config).generate(
+        {
+          messages: [{ role: "USER", content: "Finish current stage" }],
+          tools: [],
+          settings: binding.settings,
+        },
+        { signal: new AbortController().signal },
+      );
+      expect(bodies[0]).toMatchObject({
+        model: stage === "REVIEW" ? "deepseek-v4-pro-0813" : "glm-5.3",
+        max_tokens: 16384,
+        enable_thinking: true,
+        reasoning_effort: stage === "REVIEW" ? "high" : "low",
+      });
+      expect(configured.stageModels?.[stage]?.contextTokens).toBe(64000);
+    },
+  );
   it("resolves independent models/settings while inheriting default transport and credentials", () => {
     const configured = loadWorkerEnvironment({
       ...env,

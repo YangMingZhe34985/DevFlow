@@ -105,7 +105,7 @@ function execute(f: ReturnType<typeof fixture>, model: FakeLanguageModel) {
       hardLimit: 6,
       onLimitReached: () => ({ action: "STOP", reason: "NO_PROGRESS" }),
     },
-    timeoutMs: 5000,
+    timeoutMs: 900000,
     executionBudget: {
       stage: "EXECUTE",
       maxModelCalls: 6,

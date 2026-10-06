@@ -66,6 +66,17 @@ it("recounts malformed counts but preserves valid standard patches verbatim", ()
     prepare(fixed.patch.replace(/@@ -\d+,\d+ \+\d+,\d+ @@/, "@@ -1,999 +1,999 @@")),
   ).toMatchObject({ status: "NORMALIZED" });
 });
+it("diagnoses malformed repeated file sections without guessing or writing", () => {
+  const patch =
+    "--- a/a.ts\n+++ b/a.ts\n@@ -1,6 +1,12 @@\n-old\n+new\n--- a/a.ts\n+++ b/a.ts\n@@ -4,7 +4,9 @@\n-old2\n+new2\n";
+  expect(prepare(patch)).toMatchObject({ status: "REJECTED", kind: "FORMAT_INVALID" });
+  const result = prepare(patch);
+  if (result.status !== "REJECTED") throw new Error("expected rejection");
+  expect(result.message).toContain("Repeated file sections");
+  expect(result.message).toContain("Line 3");
+  expect(result.message).toContain("Line 8");
+  expect(result.message).toContain("without rereading unchanged source");
+});
 it("never guesses among zero or duplicate old-block matches, stale hashes or unknown envelopes", () => {
   expect(prepare(malformed, source.replace("a.start", "changed"))).toMatchObject({
     status: "REJECTED",

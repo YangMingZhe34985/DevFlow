@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { posix } from "node:path";
 import type { LanguageModelPort, ModelRequest, ModelResponse } from "@devflow/agent";
 import { readFileContent } from "@devflow/sandbox";
 import {
@@ -11,10 +10,7 @@ import {
 import { PROPOSAL_PROMPT, PROPOSAL_MAX_BYTES, prepareProposalHandoff } from "./plan-proposal.js";
 import { z } from "zod";
 import type { EvidencePack, IndexEntry, IndexSource } from "../localization/contracts.js";
-import {
-  implementationAnchors,
-  rankIssueCandidates,
-} from "../localization/implementation-anchors.js";
+import { navigateImplementation } from "../localization/implementation-navigation.js";
 import type { StructuredOutputAttempt } from "./workflow-structured-output.js";
 import {
   boundPlanSnippet,
@@ -444,254 +440,67 @@ class PlanSession {
     );
   }
   private async discoverCandidates(): Promise<void> {
-    let slots = 6;
-    const visited = new Set<string>();
-    const hasSnippetSpace = () => {
-      const remaining =
-        this.limits.maxSnippetBytes - this.attempt.metrics.supplementarySnippetBytes;
-      if (remaining >= 512) return true;
+    const candidates = this.input.discoveryCandidates ?? [];
+    if (!candidates.length) return;
+    for (const candidate of candidates) this.path(candidate.path);
+    const available = this.limits.maxSnippetBytes - this.attempt.metrics.supplementarySnippetBytes;
+    if (available < 512) {
       this.diagnostic(
         "PLAN_DISCOVERY_SNIPPET_RESERVE",
-        "Optional investigation stopped before IO; finalize from verified evidence instead of failing the complete proposal.",
-        { remainingBytes: remaining, requiredBytes: 512, readIssued: false },
+        "Optional investigation stopped before IO; finalize from current verified evidence.",
+        { remainingBytes: available, requiredBytes: 512, readIssued: false },
       );
-      this.observations.push(
-        `Optional investigation snippet budget has ${remaining} bytes left; further reads omitted. Unobserved code remains uncertain; finalize from the current verified evidence.`,
-      );
-      return false;
-    };
-    const issueDirection = `${this.input.title}\n${this.input.description}`;
-    const queue: (PlanProposal["candidateFiles"][number] & {
-      originPath?: string;
-    })[] = rankIssueCandidates(this.input.discoveryCandidates ?? [], issueDirection)
-      .slice(0, 3)
-      .map((c) => ({ ...c, originPath: c.path }));
-    for (let cursor = 0; cursor < queue.length && cursor < 9; cursor++) {
-      const candidate = queue[cursor]!;
-      if (slots <= 0 || !hasSnippetSpace()) break;
-      let path: string;
-      try {
-        path = this.path(candidate.path);
-      } catch (error) {
-        this.readFeedback(error, candidate.path);
-        continue;
-      }
-      const entry = await this.lookup(path);
-      const paths = entry?.kind === "FILE" ? [path] : [];
-      if (!paths.length) {
-        this.observations.push(
-          `PLAN_SOURCE_UNAVAILABLE: ${path}; candidate is unverified and grants no write authority.`,
+      return;
+    }
+    const navigation = await navigateImplementation({
+      repositoryId: this.input.repositoryId,
+      baseCommitSha: this.input.baseCommitSha,
+      source: {
+        ...this.input.source,
+        read: async (path) => {
+          const file = this.verifiedFiles.get(path) ?? (await this.readFile(path, "SUPPLEMENTARY"));
+          return { content: file.content, truncated: false };
+        },
+      },
+      description: this.input.title + "\n" + this.input.description,
+      candidates,
+      signal: this.signal,
+      maxReads: 8,
+      maxSourceBytes: Math.max(0, this.limits.maxSourceBytes - this.attempt.metrics.sourceBytes),
+      maxSnippetBytes: available,
+      maxLines: Math.min(96, this.limits.maxReadLines),
+    });
+    for (const window of navigation.windows) {
+      const file = this.verifiedFiles.get(window.path);
+      if (file)
+        this.addReadRange(
+          {
+            path: window.path,
+            startLine: window.startLine,
+            endLine: window.endLine,
+            reason: `${window.kind}: ${window.reason}`.slice(0, 500),
+          },
+          file,
+          4096,
         );
+    }
+    this.observations.push(
+      ...navigation.observations.slice(0, 8),
+      ...navigation.missing.slice(0, 8),
+    );
+    for (const candidate of candidates) {
+      if (!(await this.lookup(candidate.path)))
         this.diagnostic(
           "PLAN_SOURCE_UNAVAILABLE",
-          "Discovery candidate was not found; other candidates remain available.",
-          { path },
+          "Discovery candidate was not found; observed alternatives grant no write authority.",
+          { path: candidate.path },
         );
-        // Basename lookup supplies alternate hypotheses, never silent correction
-        // or inherited approval. Actual file contents still require full SHA verification.
-        const manifest = await this.input.source.manifest(this.signal);
-        const version = path.match(/(?:^|\/)(v\d+)(?:\/|$)/iu)?.[1];
-        const structural: string[] = [];
-        for (let parent = posix.dirname(path); parent !== "."; parent = posix.dirname(parent)) {
-          if (manifest.entries.some((e) => e.kind === "FILE" && e.path === parent + ".ts"))
-            structural.push(parent + ".ts");
-        }
-        paths.push(
-          ...[
-            ...structural,
-            ...manifest.entries
-              .filter(
-                (e) =>
-                  e.kind === "FILE" &&
-                  posix.basename(e.path) === posix.basename(path) &&
-                  (!version || e.path.split("/").includes(version)) &&
-                  !/(?:^|\/)(?:benchmarks?|tests?)(?:\/|$)/u.test(e.path),
-              )
-              .map((e) => e.path),
-          ]
-            .filter((p, i, all) => all.indexOf(p) === i)
-            .slice(0, 2),
-        );
-      }
-      for (const target of paths) {
-        if (visited.has(target)) continue;
-        visited.add(target);
-        if (slots-- <= 0 || !hasSnippetSpace()) break;
-        try {
-          const file =
-            this.verifiedFiles.get(target) ?? (await this.readFile(target, "SUPPLEMENTARY"));
-          const lines = file.content.split(/\r?\n/u);
-          const anchors = implementationAnchors(
-            file.content,
-            `${candidate.reason}\n${issueDirection}`,
-            candidate.symbol,
-          );
-          const symbolLine = anchors[0] ? anchors[0].line - 1 : undefined;
-          const existing = this.rows.find(
-            (r) =>
-              r.path === target && r.symbol && (!candidate.symbol || r.symbol === candidate.symbol),
-          );
-          const anchor = symbolLine === undefined ? existing?.startLine : symbolLine + 1;
-          if (anchors[0])
-            this.observations.push(
-              `Candidate anchor ${target}:${anchors[0].line} is lexical ${anchors[0].kind}; root cause remains unverified.`,
-            );
-          if (anchor === undefined && lines.length > 100) {
-            this.observations.push(
-              `DISCOVERY_NO_ANCHOR: ${target}; no candidate symbol or public search range matched; only a small header is available.`,
-            );
-          }
-          const startLine = Math.max(1, (anchor ?? 1) - 8);
-          this.addReadRange(
-            {
-              path: target,
-              startLine,
-              endLine: Math.min(
-                lines.length,
-                startLine + Math.min(this.limits.maxReadLines, 160) - 1,
-              ),
-              reason: `Read-only candidate investigation: ${candidate.reason}`.slice(0, 500),
-            },
-            file,
-            6144,
-          );
-          // Follow an implementation's observed helper/initializer in this file,
-          // not arbitrary global keyword matches or unobserved paths.
-          const observedCode = this.rows.at(-1)?.snippet ?? "";
-          const called = [
-            ...observedCode.matchAll(/(\$[A-Za-z]\w*)\.init\s*\(|\b([A-Za-z_]\w*)\s*\(/gu),
-          ]
-            .map((m) => m[1] ?? m[2]!)
-            .filter(
-              (name) =>
-                name.length > 6 && !/(?:Type|Schema|Constructor|Check)$|^constructor$/u.test(name),
-            );
-          const helper = implementationAnchors(
-            file.content,
-            called.map((name) => `${name}()`).join(" "),
-          ).find(
-            (a) =>
-              a.kind === "IMPLEMENTATION" &&
-              a.score >= 160 &&
-              Math.abs(a.line - (anchor ?? 1)) > 80,
-          );
-          if (helper && hasSnippetSpace()) {
-            const helperStart = Math.max(1, helper.line - 8);
-            this.addReadRange(
-              {
-                path: target,
-                startLine: helperStart,
-                endLine: Math.min(
-                  lines.length,
-                  helperStart + Math.min(this.limits.maxReadLines, 160) - 1,
-                ),
-                reason: "Observed helper/initializer requires implementation verification.",
-              },
-              file,
-              3072,
-            );
-          }
-          const related = [...file.content.matchAll(/(?:from\s+|import\s*)["'](\.[^"']+)["']/gu)]
-            .map((m) => ({
-              specifier: m[1]!,
-              statement: lines[file.content.slice(0, m.index).split("\n").length - 1] ?? "",
-            }))
-            .filter(
-              (m) =>
-                lines.length < 120 ||
-                (candidate.symbol &&
-                  new RegExp(
-                    `\\b([A-Za-z_$][\\w$]*)\\.${candidate.symbol.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
-                  ).test(observedCode) &&
-                  new RegExp(
-                    `\\b${m.statement.match(/(?:as\s+|import\s+\*\s+as\s+)(\w+)/u)?.[1] ?? "<no namespace>"}\\.${candidate.symbol.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}`,
-                  ).test(observedCode)),
-            )
-            .sort(
-              (a, b) =>
-                Number(
-                  posix.basename(b.specifier).replace(/\.[^.]+$/u, "") ===
-                    posix.basename(candidate.originPath ?? target).replace(/\.[^.]+$/u, ""),
-                ) -
-                Number(
-                  posix.basename(a.specifier).replace(/\.[^.]+$/u, "") ===
-                    posix.basename(candidate.originPath ?? target).replace(/\.[^.]+$/u, ""),
-                ),
-            );
-          for (const item of related.slice(0, 1)) {
-            const relative = posix.normalize(posix.join(posix.dirname(target), item.specifier));
-            const imported = /\.[cm]?jsx?$/u.test(relative)
-              ? relative.replace(/\.[cm]?jsx?$/u, ".ts")
-              : relative + ".ts";
-            if (!visited.has(imported) && (await this.lookup(imported))?.kind === "FILE")
-              queue.splice(cursor + 1, 0, {
-                ...candidate,
-                path: imported,
-                intent: "INSPECT",
-                reason: `${candidate.reason} (observed relative import/export from ${target})`,
-              });
-          }
-          // A type/interface anchor can precede the actual traversal by hundreds
-          // of lines. Add one disjoint implementation window from a literal
-          // behavioral match; it remains observed code, not a root-cause claim.
-          const direction = `${candidate.reason} ${this.input.title} ${this.input.description}`;
-          const behavior = /cycl|recurs/iu.test(direction)
-            ? /seen\.(?:get|set)|(?:cycles|cycle)\s*[=:]/iu
-            : /prefault/iu.test(direction)
-              ? /prefault|innerType/iu
-              : /locale|french|translation/iu.test(direction)
-                ? /TypeDictionary|issue\.origin/iu
-                : undefined;
-          const match = behavior
-            ? lines.findIndex(
-                (line) =>
-                  !/^\s*(?:\/\/|\*|interface\b)/u.test(line) &&
-                  /[=(]/u.test(line) &&
-                  behavior.test(line),
-              )
-            : -1;
-          const observed = this.rows.at(-1);
-          if (
-            match >= 0 &&
-            (match + 1 < (observed?.startLine ?? startLine) ||
-              match + 40 > (observed?.endLine ?? startLine))
-          ) {
-            const implementationStart = Math.max(1, match + 1 - 8);
-            this.addReadRange(
-              {
-                path: target,
-                startLine: implementationStart,
-                endLine: Math.min(
-                  lines.length,
-                  implementationStart + Math.min(this.limits.maxReadLines, 160) - 1,
-                ),
-                reason:
-                  "Public behavioral search hit in candidate implementation; hypothesis requires verification.",
-              },
-              file,
-              4096,
-            );
-          }
-          if (target !== path)
-            this.observations.push(
-              `Alternate observed source ${target} differs from missing candidate ${path}; requires a new proposal and approval before writing.`,
-            );
-        } catch (error) {
-          if (error instanceof Error && error.message.startsWith("READ_LINE_TOO_LARGE:")) {
-            this.diagnostic(
-              "PLAN_DISCOVERY_LINE_UNAVAILABLE",
-              "Candidate line could not fit the bounded snippet; no fragment was inferred.",
-              { path: target },
-            );
-            this.observations.push(
-              `No snippet returned for ${target}: ${error.message}; continue from existing evidence or report UNKNOWN.`,
-            );
-            continue;
-          }
-          this.readFeedback(error, target);
-        }
-      }
     }
+    this.diagnostic(
+      "PLAN_IMPLEMENTATION_NAVIGATION",
+      "Shared read-only symbol navigation completed; observed source is not root-cause proof or edit authorization.",
+      { ...navigation.metrics },
+    );
   }
   private outputRequest(messages: ModelRequest["messages"], repair = false): ModelRequest {
     return {

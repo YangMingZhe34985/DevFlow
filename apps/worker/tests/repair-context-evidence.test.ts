@@ -7,6 +7,57 @@ import { prepareStageContext } from "@devflow/agent";
 import { createTools } from "../src/runs/approval-workflow-run-executor.js";
 
 describe("bounded Repair input with recoverable public evidence", () => {
+  it("prioritizes diagnostic line 2357 over the first hunk, and keeps tasks separate from old SHA", async () => {
+    const git = {
+      status: async () => ({ files: [{ path: "packages/zod/src/v4/core/schemas.ts" }] }),
+      diff: async () => ({
+        patch:
+          "diff --git a/packages/zod/src/v4/core/schemas.ts b/packages/zod/src/v4/core/schemas.ts\n+++ b/packages/zod/src/v4/core/schemas.ts\n@@ -12 +12 @@\n-old\n+new",
+        filesChanged: 1,
+        truncated: false,
+      }),
+    } as unknown as SandboxGitService;
+    const readFile = vi.fn(async (input) => ({
+      path: input.path,
+      content: "const primitive: Primitive = value;",
+      startLine: input.startLine,
+      endLine: input.startLine,
+      fileSha256: "a".repeat(64),
+      truncated: true,
+    }));
+    const extra =
+      "Findings:\n" +
+      JSON.stringify([
+        {
+          findingId: "finding-one",
+          message: "Preserve Primitive type",
+          behavior: { requirement: "API" },
+          evidence: { quote: "old", fileSha256: "a".repeat(64) },
+        },
+      ]);
+    const context = await buildRepairContext(
+      git,
+      { readFile } as unknown as SandboxSession,
+      {
+        exitCode: 1,
+        stdout:
+          "src/v4/core/schemas.ts(2357,9): error TS2322: Type unknown is not assignable to Primitive.",
+        stderr: "",
+        durationMs: 1,
+        timedOut: false,
+        outputTruncated: false,
+      },
+      new AbortController().signal,
+      extra,
+    );
+    expect(readFile).toHaveBeenCalledWith(
+      expect.objectContaining({ path: "packages/zod/src/v4/core/schemas.ts", startLine: 2349 }),
+      expect.any(AbortSignal),
+    );
+    expect(context.stableTaskContext).toContain("finding-one");
+    expect(context.stableTaskContext).toContain("TS2322");
+    expect(context.stableTaskContext).not.toContain("a".repeat(64));
+  });
   it("rejects unknown or changed SHA, unknown sections and out-of-range recovery, and caps returned bytes", () => {
     const evidence = {
       version: "repair-evidence-v1" as const,

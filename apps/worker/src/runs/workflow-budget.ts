@@ -16,6 +16,8 @@ export interface WorkflowBudgetOptions {
   maxToolCalls?: number;
   maxTotalTokens?: number;
   startedAt?: number;
+  /** Persisted absolute deadline; configuration changes cannot extend an existing run. */
+  deadlineAt?: number;
   /** Restores the run-wide counter after approval, retry, or Worker recovery. */
   initialAgentSteps?: number;
 }
@@ -517,7 +519,8 @@ export class WorkflowBudgetLedger {
     this.maxTotalTokens = options.maxTotalTokens ?? 250_000;
     this.startedAt = options.startedAt ?? Date.now();
     this.timeoutMs = positiveInteger(options.timeoutMs, "timeoutMs");
-    this.deadlineAt = this.startedAt + this.timeoutMs;
+    this.deadlineAt = Math.min(options.deadlineAt ?? Infinity, this.startedAt + this.timeoutMs);
+    if (!Number.isFinite(this.deadlineAt)) throw Error("Invalid workflow deadline");
     this.consumedAgentSteps = optionalNonnegativeInteger(
       options.initialAgentSteps,
       "initialAgentSteps",
@@ -655,6 +658,10 @@ export class WorkflowBudgetLedger {
       this.exceeded(stage, "timeoutMs", this.timeoutMs, Date.now() - this.startedAt);
     }
     return Math.max(1, remaining);
+  }
+
+  get remainingTimeMs(): number {
+    return Math.max(0, this.deadlineAt - Date.now());
   }
 
   private exceeded(

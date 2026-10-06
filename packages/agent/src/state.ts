@@ -106,10 +106,26 @@ export const AgentStateSchema = z.object({
   adaptiveStepBudget: AdaptiveStepBudgetStateSchema.optional(),
   plan: AgentPlanSchema.optional(),
   contextCompression: ContextCompressionStateSchema.optional(),
+  executionRecovery: z
+    .object({
+      pending: z.boolean(),
+      used: z.boolean(),
+      explorationClosed: z.boolean(),
+      handoffPending: z.boolean().optional(),
+      correctionReason: z.enum(["FORMAT_INVALID", "OUTPUT_LENGTH"]).optional(),
+    })
+    .optional(),
   lastError: DevflowErrorShapeSchema.optional(),
   finalResult: RunResultSchema.optional(),
 });
 export interface AgentState {
+  executionRecovery?: {
+    pending: boolean;
+    used: boolean;
+    explorationClosed: boolean;
+    handoffPending?: boolean;
+    correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH";
+  };
   schemaVersion: 1;
   runId: RunId;
   phase: AgentPhase;

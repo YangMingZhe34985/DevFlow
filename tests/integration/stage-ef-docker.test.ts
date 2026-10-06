@@ -4,7 +4,12 @@ import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { pathToFileURL } from "node:url";
-import { FakeLanguageModel, fakeModelResponse, type ModelRequest } from "@devflow/agent";
+import {
+  DefaultAgentRuntime,
+  FakeLanguageModel,
+  fakeModelResponse,
+  type ModelRequest,
+} from "@devflow/agent";
 import { PrismaDatabaseAdapter } from "@devflow/database";
 import { DockerSandboxManager } from "@devflow/sandbox";
 import { SandboxGitService } from "@devflow/git";
@@ -16,6 +21,8 @@ import {
   relationGraphDigest,
 } from "../../apps/worker/src/localization/relation-graph.js";
 import { sandboxSource } from "../../apps/worker/src/localization/sources.js";
+import { normalizePatchCandidate } from "@devflow/sandbox";
+import { FinishPhaseTool } from "../../apps/worker/src/runs/workflow-stage-policy.js";
 import {
   ApprovalWorkflowRunExecutor,
   createTools,
@@ -83,6 +90,125 @@ integration("E/F real Docker and database integration", () => {
       await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
+
+  it("corrects a malformed patch at a soft boundary in a real sandbox, without changing source on rejection", async () => {
+    const runId = randomUUID();
+    const sandbox = await new DockerSandboxManager({
+      image: "devflow-sandbox:local",
+      workspaceRoot: fixtureRoot,
+    }).create({
+      runId,
+      repository: { sourceUri: pathToFileURL(fixtureRoot).href },
+      limits: { cpuCount: 1, memoryMb: 256, pids: 64, timeoutMs: 60000, networkEnabled: false },
+    });
+    try {
+      const patch =
+        "--- a/src/calculator.js\n+++ b/src/calculator.js\n@@ -1,99 +1,99 @@\n-old\n+new\n--- a/src/calculator.js\n+++ b/src/calculator.js\n@@ -1,99 +1,99 @@\n-old\n+new\n";
+      const { executor, tools } = createTools(new SandboxGitService());
+      const model = new FakeLanguageModel([
+        call("applyPatch", { patch }),
+        fakeModelResponse({
+          toolCalls: [
+            {
+              id: randomUUID(),
+              name: "replaceText",
+              input: {
+                path: "src/calculator.js",
+                oldText:
+                  "// Intentional fixture bug: the agent should change + to -.\n  return left + right;",
+                newText:
+                  "// Intentional fixture bug: the agent should change + to -.\n  return left - right;",
+                expectedSha256: sha(original),
+                expectedOccurrences: 1,
+              },
+            },
+            {
+              id: randomUUID(),
+              name: "finishPhase",
+              input: { summary: "Subtraction corrected", outcome: "CHANGED" },
+            },
+          ],
+        }),
+      ]);
+      const result = await new DefaultAgentRuntime(model).run(
+        {
+          maxSteps: 3,
+          timeoutMs: 60000,
+          maxRetries: 0,
+          modelSettings: { maxOutputTokens: 512 },
+          executionBudget: {
+            stage: "EXECUTE",
+            maxModelCalls: 3,
+            maxToolCalls: 5,
+            maxTotalTokens: 10000,
+          },
+          adaptiveStepBudget: {
+            initialLimit: 1,
+            hardLimit: 3,
+            onLimitReached: (s) =>
+              s.editCorrectionPending
+                ? { action: "EXTEND", additionalSteps: 1 }
+                : { action: "STOP", reason: "NO_PROGRESS" },
+          },
+        },
+        {
+          runId,
+          task: {
+            taskId: randomUUID(),
+            repositoryId: randomUUID(),
+            title: "Fix subtraction",
+            description: "Preserve tests",
+          },
+          signal: AbortSignal.timeout(60000),
+          tools: [...tools, FinishPhaseTool],
+          emit: async () => {},
+          executeTool: async (stepId, request, signal) => {
+            if (request.name === "applyPatch") {
+              const current = await sandbox.readFile({ path: "src/calculator.js" });
+              const check = normalizePatchCandidate({
+                patch,
+                targets: [{ path: current.path, operation: "MODIFY" }],
+                current: new Map([
+                  [current.path, { content: current.content, expectedHash: sha(original) }],
+                ]),
+              });
+              expect(check.status).toBe("REJECTED");
+              expect(current.content).toBe(original);
+              if (check.status !== "REJECTED") throw new Error("expected rejection");
+              return {
+                ok: false,
+                durationMs: 0,
+                error: {
+                  code: "TOOL_FAILED",
+                  message: check.message,
+                  retryable: false,
+                  details: { patchFailure: { kind: check.kind, needsRead: false } },
+                },
+              };
+            }
+            return executor.execute(request, {
+              runId,
+              stepId,
+              sandbox,
+              signal: signal!,
+              emit: async () => {},
+            });
+          },
+        },
+      );
+      expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+      expect(model.requests).toHaveLength(2);
+      expect((await sandbox.readFile({ path: "src/calculator.js" })).content).toBe(
+        original.replace(
+          "// Intentional fixture bug: the agent should change + to -.\n  return left + right;",
+          "// Intentional fixture bug: the agent should change + to -.\n  return left - right;",
+        ),
+      );
+      expect((await sandbox.exec({ program: "npm", args: ["test"] })).exitCode).toBe(0);
+    } finally {
+      await sandbox.dispose();
+    }
+  }, 120000);
 
   it.each([false, true])(
     "persists graph invalidation, precise edits and bounded summary recovery (summary failure=%s)",
@@ -200,7 +326,10 @@ integration("E/F real Docker and database integration", () => {
             const currentGraph = request.messages.findLast(
               (m) => m.role === "TOOL" && m.toolName === "queryRelations",
             );
-            expect(JSON.stringify(currentGraph?.content)).toContain(sha(corrected));
+            expect(
+              JSON.stringify(currentGraph?.content),
+              JSON.stringify(currentGraph?.content),
+            ).toContain(sha(corrected));
           }
           if (!action) throw new Error("Unexpected extra main request");
           return call(action[0], action[1]);
@@ -235,7 +364,7 @@ integration("E/F real Docker and database integration", () => {
             hardLimit: 20,
             onLimitReached: () => ({ action: "STOP", reason: "NO_PROGRESS" }),
           },
-          timeoutMs: 60000,
+          timeoutMs: 900000,
           executionBudget: {
             stage: "EXECUTE",
             maxModelCalls: 20,

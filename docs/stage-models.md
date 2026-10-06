@@ -8,7 +8,7 @@ Copy `.env.example` to `.env`, set the platform credential and restart the Worke
 | Planner      | Propose a repair direction, intended files, verification and uncertainty                            | `deepseek-v4-pro-0813`              |
 | Execute      | Confirm current code and implement the approved change                                              | `glm-5.3`                           |
 | Repair       | Check test/review findings, make targeted edits or return source-backed disagreement                | `glm-5.3`                           |
-| Review       | Independently assess current source, diff and test evidence; no repository tools                    | `LLM_MODEL`                         |
+| Review       | Independently assess current source, diff and test evidence; no repository tools                    | `deepseek-v4-pro-0813`              |
 
 Localization benefits from reliable search and tool calling; a smaller model can work within its bounded responsibilities. Planner benefits from stronger reasoning. Execute/Repair need reliable code editing and tool calling. Review needs independent reasoning about behavior. The host builds the static graph and manages permissions, revisions and budgets; models do not own these authoritative states.
 
@@ -29,6 +29,19 @@ LLM_STAGE_CONTEXT_TOKENS=32000
 
 Blank stage fields inherit the corresponding global `LLM_*` setting (or the Run's provider/model when supplied). Stage overrides take precedence. A different provider or endpoint requires its own stage API key; the host refuses automatic credential forwarding between providers. Model identifiers, reasoning options and quota availability must be checked with your provider.
 
-The supplied example uses Bailian's compatible endpoint for all stages, with one global credential. Localization disables thinking and reserves 4,096 output tokens; Planner reserves 8,192, Execute/Repair 8,192, Review 4,096. Output settings are counted in the same request preflight as input and recovery reserves. A reasoning-only truncated response is not treated as a completed decision.
+The supplied example uses Bailian's compatible endpoint for all stages, with one global credential. Localization disables thinking and reserves 4,096 output tokens; Planner reserves 8,192 and Execute 8,192. Review uses DeepSeek V4 Pro 0813 with thinking enabled and high reasoning effort. Review/Repair reserve 16,384 output tokens and allow 64,000 total context tokens. Output includes reasoning and the final answer; GLM-5.3 ignores `thinking_budget`. Output settings are counted in the same request preflight as input and recovery reserves. A reasoning-only truncated response is not treated as a completed decision. See [Bailian's compatible API](https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions).
+
+Normal Review requests use these configured reasoning settings. Review-only semantic recovery after `LENGTH` keeps thinking enabled and uses `low`, a compact current evidence view and the same output cap. The stage wrapper preserves that request override; normal requests remain high. The supported DeepSeek V4 Pro 0813 efforts are low/high/max, with no medium setting. Only context-free format conversion uses `none`. Both recoveries share two persisted credits per workflow, at most one per decision. Repair's tool-calling recovery is separate. See [Bailian DeepSeek parameters](https://help.aliyun.com/zh/model-studio/deepseek-api) and [validation](validation-v2.md); historical no-thinking recovery measurements remain historical results.
 
 Run limits remain independent: `DEVFLOW_MAX_STEPS`, `DEVFLOW_MAX_TOTAL_TOKENS`, `DEVFLOW_TIMEOUT_MS`, and Planner's `DEVFLOW_PLAN_AGENT_*` limits. The static context view is bounded separately from archived history. `DEVFLOW_CONTEXT_COMPRESSION_ENABLED` enables bounded optional summaries with source citations and static fallback. Credentials, permission state and revision authority are never delegated to summaries.
+
+New tasks default to a 25-minute total workflow limit. Explicit task limits take precedence; changing configuration or resuming a task does not extend its saved absolute deadline. Review request deadlines and conservative time reserves are configured separately:
+
+```dotenv
+DEVFLOW_TIMEOUT_MS=1500000
+DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS=240000
+DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS=210000
+DEVFLOW_FINALIZE_TIMEOUT_MS=30000
+```
+
+Normal Review reserves its request, one still-available recovery and candidate finalization (480 seconds by default). Once both workflow recovery credits are consumed, it reserves 270 seconds. Execute/Repair close exploration before consuming this downstream reserve. Source supplements have a 120-second host deadline; probe operations reserve their actual deadline plus the subsequent judgment. These are deadlines, not guarantees of model completion. Insufficient time prevents dispatch and records the shortfall; a request timeout leaves Review incomplete. A separate bounded finalization signal saves the candidate and pending findings after cancellation. Unconfirmed request costs remain reserved at their upper bound.

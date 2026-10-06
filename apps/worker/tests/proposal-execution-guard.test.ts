@@ -162,7 +162,7 @@ async function phase(
       hardLimit: 5,
       onLimitReached: () => ({ action: "STOP", reason: "NO_PROGRESS" }),
     },
-    timeoutMs: 5000,
+    timeoutMs: 900_000,
     executionBudget: {
       stage: purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR",
       maxModelCalls: 5,
@@ -193,7 +193,8 @@ describe("proposal writes keep host guards through implementation and repair", (
     });
     expect(current.write).not.toHaveBeenCalled();
     const unobserved = await phase("REVIEW_REPAIR", [response]);
-    expect(unobserved.result.phaseCompletion?.evidenceStatus).toBe("UNVERIFIED");
+    expect(unobserved.result.phaseCompletion?.evidenceStatus).toBe("CURRENT_SOURCE_LINKED");
+    expect(unobserved.write).not.toHaveBeenCalled();
   });
   it("stops no-op repair loops with convergence disabled", async () => {
     const same = call("writeFile", { path: "src/a.ts", content: original });
@@ -373,7 +374,7 @@ describe("proposal writes keep host guards through implementation and repair", (
     const current = await phase(
       "IMPLEMENTATION",
       [
-        call("queryRelations", { paths: ["src/a.ts"] }),
+        call("queryRelations", { paths: ["src/a.ts"], symbols: ["value"] }),
         call("readFile", { path: "src/a.ts" }),
         call("replaceText", {
           path: "src/a.ts",
@@ -388,6 +389,7 @@ describe("proposal writes keep host guards through implementation and repair", (
     );
     expect(current.result.status).toBe("SUCCEEDED");
     expect(current.write).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(current.model.requests)).toContain("implementationEvidence");
     const overlay = JSON.parse(
       current.artifacts.find((a) => a.name.startsWith("repository-relations-overlay-"))!.content,
     );

@@ -1,4 +1,4 @@
-import { isTestFile } from "./contracts.js";
+import { extractIssueSignals, sourcePathPriority, sourceRole } from "./contracts.js";
 
 const common = new Set([
   "z",
@@ -102,18 +102,20 @@ export function rankIssueCandidates<
     explanation?: string;
   },
 >(candidates: readonly T[], issue: string): T[] {
-  const versions = [...issue.matchAll(/\bv\d+\b/giu)].map((m) => m[0].toLowerCase());
+  const signals = extractIssueSignals(issue);
+  const rolePriority = (path: string) =>
+    ({ IMPLEMENTATION: 4, ENTRY: 2, TEST: 1, BENCHMARK: 0, METADATA: 0 })[sourceRole(path)];
   const score = (c: T) =>
-    (isTestFile(c.path) ? -50 : 30) +
-    (/(?:^|\/)index\.[cm]?[jt]sx?$/iu.test(c.path) ? -40 : 0) +
+    sourcePathPriority(c.path, signals) +
     (/\b(?:core|shared|internal|runtime)\b/iu.test(c.reason ?? c.explanation ?? "") ? 10 : 0) +
-    (versions.some((v) => c.path.toLowerCase().split("/").includes(v)) ? 25 : 0) +
     (implementationAnchors(
       c.snippet ?? "",
       `${issue} ${c.reason ?? c.explanation ?? ""}`,
       c.symbol,
     )[0]?.score ?? 0);
-  const sorted = [...candidates].sort((a, b) => score(b) - score(a));
+  const sorted = [...candidates].sort(
+    (a, b) => rolePriority(b.path) - rolePriority(a.path) || score(b) - score(a),
+  );
   return sorted.filter(
     (c, index) => !sorted.slice(0, index).some((p) => p.path === c.path && p.symbol === c.symbol),
   );

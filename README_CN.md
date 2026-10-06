@@ -12,8 +12,9 @@ API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略
 - Localization、Planner、Execute、Repair、Review 分别配置模型，示例默认使用百炼。
 - 版本化 TS/JS 文件依赖与导出关系，Execute / Repair 可按需调用有界 `queryRelations`。
 - 修改前核对完整文件 SHA，支持精确文本替换和保护文件策略。
-- Review 获得当前源码及未修改分支；Repair 可用源码证据回应错误意见，再经过测试和独立 Review。
-- 统一请求、恢复和最终输出预算；重复读取、失败调用和无效写入接受进展检测。
+- Review 保持无工具，可请求宿主进行两轮有界补证和隔离的公开复现；Repair 保留诊断任务、逐项 finding 答复和经过校验的引用，交给独立 Review 再判定。
+- Execute 为编辑纠正与收尾预留预算；重复源码或图查询不算新进展，畸形编辑可获得一次有界纠正机会。
+- 统一请求、恢复和最终输出预算，并在整个流程中保持受保护的写入范围。
 
 最终九题单批严格通过 5/9；其中一题因费用阈值中断，单独续测后通过，九题覆盖中共有 6 题获得严格端到端成功证据。该小型数据集证明限定仓库中的实际修复能力，仍不足以代表任意仓库的成功率，见[验证结果与限制](docs/validation-v2.md)。
 
@@ -41,7 +42,7 @@ Web：http://localhost:3000；API：http://localhost:3001/api/v1；Worker 就绪
 
 ## 分阶段模型
 
-[.env.example](.env.example) 默认使用百炼兼容接口。Planner 使用 `deepseek-v4-pro-0813`；Execute / Repair 使用 `glm-5.3`；Localization / Review 继承 `LLM_MODEL`。每阶段支持独立 `LLM_<STAGE>_*` 配置，具体模型由用户根据平台和任务选择。见[配置优先级、能力建议及预算](docs/stage-models.md)，修改后重启 Worker。
+[.env.example](.env.example) 默认使用百炼兼容接口。Planner / Review 使用 `deepseek-v4-pro-0813`；Execute / Repair 使用 `glm-5.3`；Localization 继承 `LLM_MODEL`。Review 使用 high 推理强度，Review / Repair 配置 16,384 输出 token 和 64,000 上下文 token。每阶段支持独立 `LLM_<STAGE>_*` 配置，具体模型由用户根据平台和任务选择。见[配置优先级、能力建议及预算](docs/stage-models.md)，修改后重启 Worker。
 
 ## 工作流与边界
 

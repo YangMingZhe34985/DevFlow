@@ -8,6 +8,8 @@ import {
 import { deduplicateContext, invalidateHistoricalReads, type WorkingSet } from "./working-set.js";
 import { CANDIDATE_SUMMARY, type PostPatchController } from "./post-patch.js";
 import type { PrePatchController } from "./pre-patch.js";
+import { EvidenceProgress } from "./evidence-progress.js";
+import { estimateModelInput } from "./model-budget.js";
 
 import {
   DevflowError,
@@ -47,6 +49,8 @@ import {
 export type { AgentPhase, AgentState } from "./state.js";
 
 export interface AgentProgressSnapshot {
+  handoffPending?: boolean;
+  editCorrectionPending?: boolean;
   patchReady?: boolean;
   stepCount: number;
   currentLimit: number;
@@ -96,6 +100,11 @@ export interface AgentRunRequest {
   contextCompressionState?: ContextCompressionState;
   contextStage?: ContextStage;
   contextMaxBytes?: number;
+  /** Host reserve for mandatory downstream work. Editing correction and handoff are reserved locally. */
+  convergenceReserve?: { downstreamSteps: number; downstreamTokens: number };
+  /** Absolute stage time is supplied by the host; applies to every execution path. */
+  /** requestMs is an admission estimate, not a new per-request model timeout. */
+  timeReserve?: { downstreamMs: number; requestMs: number };
   prePatch?: PrePatchController;
   postPatch?: PostPatchController;
   traceEfficiency?: boolean;
@@ -104,6 +113,14 @@ export interface AgentRunRequest {
   approvedPlan?: AgentPlan;
   systemPrompt?: string;
   additionalContext?: string;
+  /** Stable Repair requirements/diagnostics are retained independently of source versions. */
+  stableTaskContext?: string;
+  repairMode?: boolean;
+  executionRecovery?: AgentState["executionRecovery"];
+  repairRecoveryContext?: {
+    maxToolExecutions: number;
+    collect: () => Promise<{ text: string; toolExecutions: number; toolLatencyMs: number }>;
+  };
   /** Versioned localization evidence is valid only before the first workspace mutation. */
   invalidateAdditionalContextOnMutation?: boolean;
   emitRunLifecycle?: boolean;
@@ -148,7 +165,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
     validateRunRequest(request);
     const postPatch = request.postPatch;
     if (postPatch) context = { ...context, postPatch };
-    const deadlineSignal = AbortSignal.timeout(request.timeoutMs);
+    const phaseDeadlineAt =
+      Date.now() + request.timeoutMs - (request.timeReserve?.downstreamMs ?? 0);
+    const deadlineSignal = AbortSignal.timeout(Math.max(1, phaseDeadlineAt - Date.now()));
     const signal = AbortSignal.any([context.signal, deadlineSignal]);
     const initialMessages: ModelMessage[] = [
       {
@@ -170,8 +189,35 @@ export class DefaultAgentRuntime implements AgentRuntime {
     }
     if (restoredState === undefined && request.contextCompressionState)
       state = { ...state, contextCompression: structuredClone(request.contextCompressionState) };
+    if (restoredState === undefined && request.executionRecovery)
+      state = { ...state, executionRecovery: structuredClone(request.executionRecovery) };
     const messages: ModelMessage[] = [...state.messages];
     const execution = createExecutionState(context.tools);
+    execution.editCorrectionPending = state.executionRecovery?.pending ?? false;
+    execution.editCorrectionUsed = state.executionRecovery?.used ?? false;
+    if (state.executionRecovery?.correctionReason)
+      execution.correctionReason = state.executionRecovery.correctionReason;
+    const sourceProgress = new EvidenceProgress();
+    const compatibilityObservations = new Set<string>();
+    for (const source of request.workingSet?.relevantCode ?? [])
+      sourceProgress.observe(source, source.workspaceRevision);
+    const originalAuthorize = context.authorizeTool;
+    let correctingEdit = false;
+    let explorationClosed = state.executionRecovery?.explorationClosed ?? false;
+    let closingDecisionPending = state.executionRecovery?.handoffPending ?? false;
+    context = {
+      ...context,
+      authorizeTool: (call) =>
+        (correctingEdit || explorationClosed) &&
+        postPatch?.active !== true &&
+        !(
+          correctingEdit && execution.correctionReason === "OUTPUT_LENGTH"
+            ? ["replaceText"]
+            : ["replaceText", "applyPatch", "writeFile"]
+        ).includes(call.name)
+          ? "EDIT_CORRECTION_REQUIRED: correct the failed edit or finish; source is unchanged."
+          : originalAuthorize?.(call),
+    };
     const initialRevision = request.workingSet?.workspaceRevision ?? 0;
     execution.workspaceRevision = initialRevision;
     let adaptiveStepBudget = initializeAdaptiveStepBudget(request, state);
@@ -211,6 +257,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
           if (state.stepCount >= adaptiveStepBudget.hardLimit) break;
           const snapshot = {
             ...agentProgressSnapshot(state, execution, adaptiveStepBudget),
+            handoffPending: closingDecisionPending,
+            ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(postPatch ? { patchReady: postPatch.ready } : {}),
           };
           const decision = await awaitWithSignal(
@@ -246,9 +294,21 @@ export class DefaultAgentRuntime implements AgentRuntime {
           continue;
         }
         const stepId = randomUUID();
+        closingDecisionPending = false;
+        correctingEdit = execution.editCorrectionPending;
+        if (correctingEdit) {
+          execution.editCorrectionPending = false;
+          execution.editCorrectionUsed = true;
+        }
         state = await checkpoint(context, {
           ...state,
           phase: "THINKING",
+          executionRecovery: {
+            pending: execution.editCorrectionPending,
+            used: execution.editCorrectionUsed,
+            explorationClosed,
+            handoffPending: closingDecisionPending,
+          },
           stepCount: state.stepCount + 1,
           messages,
         });
@@ -262,6 +322,26 @@ export class DefaultAgentRuntime implements AgentRuntime {
         });
 
         let response: ModelResponse | undefined;
+        let recoverySource: string | undefined;
+        if (
+          correctingEdit &&
+          execution.correctionReason === "OUTPUT_LENGTH" &&
+          request.repairRecoveryContext
+        ) {
+          const reserve = request.repairRecoveryContext.maxToolExecutions;
+          assertExecutionBudget(request, "toolCalls", state.metrics.toolCalls + reserve);
+          const recovery = await request.repairRecoveryContext.collect();
+          recoverySource = recovery.text;
+          state = await checkpoint(context, {
+            ...state,
+            metrics: {
+              ...state.metrics,
+              toolCalls: state.metrics.toolCalls + recovery.toolExecutions,
+              toolExecutions: state.metrics.toolExecutions + recovery.toolExecutions,
+              toolLatencyMs: state.metrics.toolLatencyMs + recovery.toolLatencyMs,
+            },
+          });
+        }
         for (let attempt = 0; attempt <= request.maxRetries; attempt += 1) {
           throwIfAborted(signal, context.signal, deadlineSignal);
           assertExecutionBudget(request, "modelCalls", state.metrics.modelCalls + 1);
@@ -280,7 +360,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           const validMessages = request.deduplicateContext
             ? invalidateHistoricalReads(messages)
             : messages;
-          const currentMessages =
+          let currentMessages =
             request.invalidateAdditionalContextOnMutation === true &&
             execution.workspaceRevision !== initialRevision
               ? validMessages.filter(
@@ -292,6 +372,24 @@ export class DefaultAgentRuntime implements AgentRuntime {
                     ),
                 )
               : validMessages;
+          if (correctingEdit && execution.correctionReason === "OUTPUT_LENGTH") {
+            const stableRequest = { ...request };
+            delete stableRequest.additionalContext;
+            currentMessages = [
+              {
+                role: "SYSTEM",
+                content: request.systemPrompt ?? (initialMessages[0]!.content as string),
+              },
+              ...buildUserMessages(stableRequest, context.task.title, context.task.description),
+              {
+                role: "USER",
+                content:
+                  "HOST_REPAIR_LENGTH_RECOVERY: previous partial output/actions were discarded. One correction credit only; use replaceText with current SHA or finishPhase. No exploration or continuation.\n" +
+                  (recoverySource ??
+                    "Current source is unavailable; provide an explicit evidence gap instead of guessing an edit."),
+              },
+            ];
+          }
           const priorCompressionReserve = state.contextCompression?.pendingTokenReserve ?? 0;
           const compressionStepId = randomUUID();
           let projectedMessages = request.contextStage
@@ -493,9 +591,110 @@ export class DefaultAgentRuntime implements AgentRuntime {
             );
           if (postPatch?.active)
             projectedMessages = projectModelMessages(postPatch.messages(request.approvedPlan));
-          const availableTools = (context.availableTools?.() ?? context.tools).filter(
-            (t) => postPatch?.allowed(t.name) !== false && (prePatch?.available(t) ?? true),
+          let availableTools = (context.availableTools?.() ?? context.tools).filter(
+            (t) =>
+              postPatch?.allowed(t.name) !== false &&
+              (prePatch?.available(t) ?? true) &&
+              (!correctingEdit ||
+                (execution.correctionReason === "OUTPUT_LENGTH"
+                  ? ["replaceText", "finishPhase"]
+                  : ["replaceText", "applyPatch", "writeFile", "finishPhase"]
+                ).includes(t.name)),
           );
+          if (request.timeReserve) {
+            const remainingTimeMs = phaseDeadlineAt - Date.now();
+            explorationClosed ||= remainingTimeMs < 3 * request.timeReserve.requestMs;
+            if (explorationClosed) {
+              availableTools = availableTools.filter((t) =>
+                ["replaceText", "applyPatch", "writeFile", "finishPhase"].includes(t.name),
+              );
+              projectedMessages = [
+                ...projectedMessages,
+                {
+                  role: "USER",
+                  content:
+                    "HOST_TIME_RESERVE: exploration is closed to preserve correction, completion and independent Review. Use current evidence to edit and finish, or report INSUFFICIENT_EVIDENCE/SCOPE_CONFLICT.",
+                },
+              ];
+            }
+            const observation = {
+              requestIssued: false,
+              explorationClosed,
+              remainingTimeMs,
+              requestTimeMs: request.timeReserve.requestMs,
+              downstreamTimeMs: request.timeReserve.downstreamMs,
+            };
+            await context.emit({
+              runId: context.runId,
+              stepId,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: { timePreflight: jsonValue(observation) },
+            });
+            if (remainingTimeMs < request.timeReserve.requestMs)
+              throw new DevflowError({
+                code: "EXECUTION_BUDGET_EXCEEDED",
+                message: "Cannot send stage request without consuming downstream time.",
+                details: {
+                  ...observation,
+                  missingTimeMs: request.timeReserve.requestMs - remainingTimeMs,
+                },
+              });
+          }
+          if (request.convergenceReserve && !postPatch?.active && !prePatch) {
+            const inputTokens = estimateModelInput(projectedMessages, availableTools);
+            const outputTokens = request.modelSettings?.maxOutputTokens ?? 8192;
+            const nextTokens = inputTokens + outputTokens;
+            const remainingTokens =
+              (request.executionBudget?.maxTotalTokens ?? Number.MAX_SAFE_INTEGER) -
+              state.metrics.tokenUsage.totalTokens -
+              (state.contextCompression?.pendingTokenReserve ?? 0);
+            const remainingSteps =
+              (adaptiveStepBudget?.currentLimit ?? request.maxSteps) - state.stepCount + 1;
+            const reserveTokens = 2 * nextTokens + request.convergenceReserve.downstreamTokens;
+            explorationClosed ||=
+              remainingTokens < nextTokens + reserveTokens || remainingSteps <= 2;
+            if (explorationClosed) {
+              availableTools = availableTools.filter((t) =>
+                ["replaceText", "applyPatch", "writeFile", "finishPhase"].includes(t.name),
+              );
+              projectedMessages = [
+                ...projectedMessages,
+                {
+                  role: "USER",
+                  content:
+                    "HOST_CONVERGENCE: exploration is closed to preserve edit correction, completion and external Review. Use current evidence for a minimal approved edit and finishPhase, or explicitly report INSUFFICIENT_EVIDENCE/SCOPE_CONFLICT. Do not invent missing implementation.",
+                },
+              ];
+            }
+            const required =
+              estimateModelInput(projectedMessages, availableTools) +
+              outputTokens +
+              request.convergenceReserve.downstreamTokens;
+            const observation = {
+              requestIssued: false,
+              explorationClosed,
+              estimatedInputTokens: inputTokens,
+              configuredOutputTokens: outputTokens,
+              reserveTokens,
+              requiredTokens: required,
+              remainingTokens,
+              remainingSteps,
+            };
+            await context.emit({
+              runId: context.runId,
+              stepId,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: { convergencePreflight: jsonValue(observation) },
+            });
+            if (required > remainingTokens)
+              throw new DevflowError({
+                code: "EXECUTION_BUDGET_EXCEEDED",
+                message: "Cannot send stage request without consuming the downstream reserve.",
+                details: { ...observation, missingTokens: required - remainingTokens },
+              });
+          }
           if (prePatch) {
             const preflight = prePatch.preflight(
               request.systemPrompt ?? (initialMessages[0]!.content as string),
@@ -519,6 +718,27 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 modelCalls: state.metrics.modelCalls + 1,
               },
             });
+          }
+          if (correctingEdit && request.executionBudget) {
+            const estimated =
+              estimateModelInput(projectedMessages, availableTools) +
+              (request.modelSettings?.maxOutputTokens ?? 8192);
+            const remaining =
+              request.executionBudget.maxTotalTokens -
+              state.metrics.tokenUsage.totalTokens -
+              (state.contextCompression?.pendingTokenReserve ?? 0);
+            if (estimated > remaining)
+              throw new DevflowError({
+                code: "EXECUTION_BUDGET_EXCEEDED",
+                message:
+                  "EDIT_CORRECTION: insufficient tokens for input and configured output; request was not sent.",
+                details: {
+                  requestIssued: false,
+                  requiredTokens: estimated,
+                  remainingTokens: remaining,
+                  missingTokens: estimated - remaining,
+                },
+              });
           }
           await context.emit({
             runId: context.runId,
@@ -627,6 +847,39 @@ export class DefaultAgentRuntime implements AgentRuntime {
             message: "Model did not produce a response.",
           });
         }
+        if (response.finishReason === "LENGTH" && request.repairMode) {
+          if (execution.editCorrectionUsed || correctingEdit)
+            throw new DevflowError({
+              code: "LLM_FAILED",
+              message:
+                "Repair output was truncated again; shared correction credit is exhausted. Candidate and unfinished findings are retained.",
+            });
+          execution.editCorrectionPending = true;
+          execution.correctionReason = "OUTPUT_LENGTH";
+          explorationClosed = true;
+          state = await checkpoint(context, {
+            ...state,
+            executionRecovery: {
+              pending: true,
+              used: false,
+              explorationClosed: true,
+              correctionReason: "OUTPUT_LENGTH",
+            },
+            messages,
+          });
+          await context.emit({
+            runId: context.runId,
+            stepId,
+            type: "STEP_COMPLETED",
+            occurredAt: new Date().toISOString(),
+            payload: {
+              recovery: "REPAIR_OUTPUT_LENGTH",
+              partialActionsDiscarded: response.toolCalls.length,
+              requestIssued: false,
+            },
+          });
+          continue;
+        }
         if (response.finishReason === "LENGTH" && request.prePatch?.active) {
           const recovered = request.prePatch.recoverLength(response.toolCalls.length);
           await context.emit({
@@ -659,6 +912,12 @@ export class DefaultAgentRuntime implements AgentRuntime {
         }
 
         if (response.toolCalls.length === 0) {
+          if (request.repairMode)
+            throw new DevflowError({
+              code: "AGENT_STALLED",
+              message:
+                "Repair did not submit finishPhase or an actionable tool decision; unfinished diagnostics/findings remain.",
+            });
           if (request.prePatch?.active)
             throw request.prePatch.failure(
               "PRE_PATCH_EXPLORATION_STALLED",
@@ -743,6 +1002,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
         state = await checkpoint(context, {
           ...state,
           phase: "CALLING_TOOL",
+          executionRecovery: {
+            pending: execution.editCorrectionPending,
+            used: execution.editCorrectionUsed,
+            explorationClosed,
+            handoffPending: closingDecisionPending,
+            ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
+          },
           messages,
         });
 
@@ -871,12 +1137,42 @@ export class DefaultAgentRuntime implements AgentRuntime {
           0,
         );
         const normalCalls = executedCalls.filter(({ control }) => !control);
+        if (
+          !execution.editCorrectionUsed &&
+          normalCalls.some(({ call, result }) => {
+            if (call.name !== "applyPatch") return false;
+            const failure = objectValue(
+              result.ok
+                ? objectValue(result.output)?.patchFailure
+                : objectValue(result.error.details)?.patchFailure,
+            );
+            return failure?.kind === "FORMAT_INVALID" && failure.needsRead === false;
+          })
+        ) {
+          execution.editCorrectionPending = true;
+          execution.correctionReason = "FORMAT_INVALID";
+          messages.push({
+            role: "USER",
+            content:
+              "One bounded edit correction is available. The patch format was invalid and source is unchanged. Use the exact current evidence to correct the edit, preferably replaceText, then finishPhase. Do not reread or search. Hard budgets still apply.",
+          });
+        }
         let newEvidence = false;
         for (const { call, result, metadata } of normalCalls) {
           if (metadata.mutatesWorkspace) continue;
           const identity = `${execution.workspaceRevision}:${call.name}:${stableStringify(result.ok ? result.output : { input: call.input, error: result.error })}`;
-          if (!execution.evidenceSeen.has(identity)) {
-            execution.evidenceSeen.add(identity);
+          const observed = request.convergenceReserve
+            ? result.ok &&
+              sourceProgress.observe(
+                result.output,
+                execution.workspaceRevision,
+                typeof objectValue(call.input)?.path === "string"
+                  ? (objectValue(call.input)!.path as string)
+                  : undefined,
+              )
+            : !compatibilityObservations.has(identity);
+          compatibilityObservations.add(identity);
+          if (observed) {
             if (result.ok) execution.evidenceDiscoveries++;
             newEvidence = true;
           }
@@ -925,7 +1221,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           },
         });
 
-        if (madeWorkspaceProgress || !repeatedWithoutProgress) {
+        if (madeWorkspaceProgress || !repeatedWithoutProgress || execution.editCorrectionPending) {
           execution.noProgressStreak = 0;
         } else {
           execution.noProgressStreak += 1;
@@ -934,6 +1230,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
               role: "USER",
               content:
                 "Convergence warning: the previous calls produced no new evidence or workspace change. Do not repeat unchanged reads, failed calls or no-op edits; change strategy or finish with the unresolved gap.",
+            });
+          } else if (request.convergenceReserve && !explorationClosed) {
+            explorationClosed = true;
+            closingDecisionPending = true;
+            execution.noProgressStreak = 0;
+            messages.push({
+              role: "USER",
+              content:
+                "HOST_CONVERGENCE: repeated observations added no relevant evidence. Exploration is closed; the next bounded decision must edit using current source or finishPhase with the unresolved gap.",
             });
           } else {
             throw new DevflowError({
@@ -949,6 +1254,16 @@ export class DefaultAgentRuntime implements AgentRuntime {
           }
         }
 
+        state = await checkpoint(context, {
+          ...state,
+          executionRecovery: {
+            pending: execution.editCorrectionPending,
+            used: execution.editCorrectionUsed,
+            explorationClosed,
+            handoffPending: closingDecisionPending,
+            ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
+          },
+        });
         await context.emit({
           runId: context.runId,
           stepId,
@@ -1010,6 +1325,12 @@ export class DefaultAgentRuntime implements AgentRuntime {
       throw new DevflowError({
         code: "MAX_STEPS_EXCEEDED",
         message: `Agent exceeded the maximum of ${exhaustedLimit} model steps.`,
+        details: {
+          requestIssued: false,
+          remainingSteps: 0,
+          missingSteps: execution.editCorrectionPending ? 1 : 0,
+          correctionPending: execution.editCorrectionPending,
+        },
       });
     } catch (error) {
       const normalized = normalizeRunError(error, context.signal, deadlineSignal);
@@ -1076,7 +1397,9 @@ interface ToolExecutionMetadata {
 }
 
 interface RuntimeExecutionState {
-  evidenceSeen: Set<string>;
+  correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH";
+  editCorrectionPending: boolean;
+  editCorrectionUsed: boolean;
   evidenceDiscoveries: number;
   readonly tools: ReadonlyMap<string, ModelToolDescriptor>;
   readonly cache: Map<string, ToolExecutionResult>;
@@ -1102,8 +1425,9 @@ interface ExecutedToolCall {
 
 function createExecutionState(tools: readonly ModelToolDescriptor[]): RuntimeExecutionState {
   return {
+    editCorrectionPending: false,
+    editCorrectionUsed: false,
     tools: new Map(tools.map((tool) => [tool.name, tool])),
-    evidenceSeen: new Set(),
     evidenceDiscoveries: 0,
     cache: new Map(),
     inFlight: new Map(),
@@ -1135,6 +1459,7 @@ function agentProgressSnapshot(
   budget: AdaptiveStepBudgetState,
 ): AgentProgressSnapshot {
   return {
+    editCorrectionPending: execution.editCorrectionPending,
     stepCount: state.stepCount,
     currentLimit: budget.currentLimit,
     hardLimit: budget.hardLimit,
@@ -1879,6 +2204,11 @@ function buildUserMessages(
       content: `Repository/stage evidence:\n${request.additionalContext}`,
     });
   }
+  if (request.stableTaskContext !== undefined)
+    messages.push({
+      role: "USER",
+      content: `Stable Repair task state (requirements persist; source citations must be refreshed):\n${request.stableTaskContext}`,
+    });
   return messages;
 }
 

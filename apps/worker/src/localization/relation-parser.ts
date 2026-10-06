@@ -4,7 +4,7 @@ import { z } from "zod";
 import { acquireParser } from "./parser.js";
 import { workspacePackages } from "./workspace-packages.js";
 
-export const RELATION_PARSER_VERSION = "typescript-5.9.3-relations-v1";
+export const RELATION_PARSER_VERSION = "typescript-5.9.3-relations-v2";
 export const RelationParseSchema = z.object({
   status: z.enum(["PARSED", "PARSE_ERROR"]),
   symbols: z.array(
@@ -14,6 +14,8 @@ export const RelationParseSchema = z.object({
       endLine: z.number(),
       offset: z.number(),
       exported: z.boolean(),
+      kind: z.enum(["FUNCTION", "CLASS", "VARIABLE", "METHOD", "TYPE"]).optional(),
+      implementation: z.boolean().optional(),
     }),
   ),
   exports: z.array(
@@ -32,6 +34,7 @@ export const RelationParseSchema = z.object({
       resolvedPath: z.string().nullable(),
       resolution: z.enum(["RESOLVED", "EXTERNAL", "UNRESOLVED", "DYNAMIC"]),
       reason: z.string(),
+      bindings: z.array(z.object({ local: z.string(), imported: z.string() })).default([]),
     }),
   ),
   configurationErrors: z.array(z.string()),
@@ -87,7 +90,16 @@ findShadow(source);
 const line=n=>source.getLineAndCharacterOfPosition(n.getStart(source)).line+1;
 function dependency(node,specifier,kind) {
   if(imports.length>=500) { truncated=true; return; }
-  const row={specifier,kind,line:line(node),resolvedPath:null,resolution:'DYNAMIC',reason:'Nonliteral runtime expression; no static target'};
+  const bindings=[];
+  if(ts.isImportDeclaration(node)&&node.importClause) {
+    const clause=node.importClause;
+    if(clause.name)bindings.push({local:clause.name.text,imported:'default'});
+    if(clause.namedBindings) {
+      if(ts.isNamespaceImport(clause.namedBindings))bindings.push({local:clause.namedBindings.name.text,imported:'*'});
+      else for(const el of clause.namedBindings.elements)bindings.push({local:el.name.text,imported:(el.propertyName||el.name).text});
+    }
+  }
+  const row={specifier,kind,line:line(node),resolvedPath:null,resolution:'DYNAMIC',reason:'Nonliteral runtime expression; no static target',bindings};
   if(specifier!==null) {
     if(kind==='REQUIRE'&&shadowedRequire) { row.resolution='DYNAMIC'; row.reason='A repository declaration shadows require; syntax is not a verified module dependency'; imports.push(row); return; }
     const resolved=ts.resolveModuleName(specifier,file,options,host,undefined,undefined,kind==='REQUIRE'?ts.ModuleKind.CommonJS:ts.ModuleKind.ESNext).resolvedModule;
@@ -104,12 +116,17 @@ function visit(node) {
       const mods=ts.canHaveModifiers(decl)?ts.getModifiers(decl)||[]:[];
       const exported=mods.some(m=>m.kind===ts.SyntaxKind.ExportKeyword);
       const name=node.name.getText(source).slice(0,256);
-      symbols.push({name,startLine:line(node),endLine:source.getLineAndCharacterOfPosition(node.getEnd()).line+1,offset:node.getStart(source),exported});
+      const kind=ts.isFunctionDeclaration(node)?'FUNCTION':ts.isClassDeclaration(node)?'CLASS':ts.isMethodDeclaration(node)?'METHOD':ts.isVariableDeclaration(node)?'VARIABLE':'TYPE';
+      const implementation=kind==='CLASS'||kind==='VARIABLE'&&!!node.initializer||(kind==='FUNCTION'||kind==='METHOD')&&!!node.body;
+      symbols.push({name,startLine:line(node),endLine:source.getLineAndCharacterOfPosition(node.getEnd()).line+1,offset:node.getStart(source),exported,kind,implementation});
       if(exported&&ts.isIdentifier(node.name)) exports.push({name:mods.some(m=>m.kind===ts.SyntaxKind.DefaultKeyword)?'default':name,local:name,line:line(node),specifier:null});
       if(exported&&(ts.isObjectBindingPattern(node.name)||ts.isArrayBindingPattern(node.name))) {
         const binding=b=>{if(ts.isIdentifier(b))exports.push({name:b.text,local:b.text,line:line(b),specifier:null});else for(const el of b.elements||[])if(ts.isBindingElement(el))binding(el.name);};binding(node.name);
       }
     } else truncated=true;
+  }
+  if(ts.isBinaryExpression(node)&&node.operatorToken.kind===ts.SyntaxKind.EqualsToken&&ts.isPropertyAccessExpression(node.left)&&(ts.isArrowFunction(node.right)||ts.isFunctionExpression(node.right))) {
+    if(symbols.length<1000)symbols.push({name:node.left.name.text,startLine:line(node),endLine:source.getLineAndCharacterOfPosition(node.getEnd()).line+1,offset:node.getStart(source),exported:false,kind:'METHOD',implementation:true});else truncated=true;
   }
   if((ts.isFunctionDeclaration(node)||ts.isClassDeclaration(node))&&!node.name&&(ts.getModifiers(node)||[]).some(m=>m.kind===ts.SyntaxKind.DefaultKeyword))exports.push({name:'default',local:null,line:line(node),specifier:null});
   if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) dependency(node,node.moduleSpecifier.text,ts.isImportDeclaration(node)?'IMPORT':'REEXPORT');
@@ -154,6 +171,7 @@ async function parseRelationsInWorker(
     throw new Error("Relation parser input exceeds 512 KiB");
   const worker = new Worker(script, {
     eval: true,
+    execArgv: [],
     env: {},
     workerData: {
       ...input,

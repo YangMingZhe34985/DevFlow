@@ -1,5 +1,22 @@
 import { fileURLToPath } from "node:url";
 import { checkRepairResponse } from "./repair-response.js";
+import {
+  collectReviewProbes,
+  emptyReviewProbeState,
+  preparePublicProbe,
+  projectReviewProbes,
+  ReviewProbeStateSchema,
+} from "./review-probes.js";
+import { capturePublicProbeSource } from "./review-probe-source.js";
+import {
+  collectReviewSupplement,
+  reviewSupplementRequests,
+  newReviewCorrections,
+  remainingReviewSupplement,
+  ReviewSupplementUsageSchema,
+  type ReviewSupplementUsage,
+  type ReviewSourceCache,
+} from "./review-supplement.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { EfficiencyTrace } from "./efficiency-trace.js";
@@ -17,6 +34,7 @@ import {
   ContextCompressionStateSchema,
   type ContextCompressionState,
   DefaultAgentRuntime,
+  AgentStateSchema,
   PostPatchController,
   PrePatchController,
   PREPATCH_DEFAULTS,
@@ -24,15 +42,25 @@ import {
   type AgentProgressSnapshot,
   type LanguageModelPort,
   type ModelGenerationSettings,
+  type ModelMessage,
   type ModelResponse,
   type ModelToolDescriptor,
   type WorkingSet,
   type WorkingCode,
+  type AgentState,
   contentHash,
+  estimateModelInput,
   type VercelAiModelParameters,
 } from "@devflow/agent";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import { SandboxGitService } from "@devflow/git";
+import { reviewTimeReserve, restoredWorkflowTiming } from "./review-time-budget.js";
+import { preserveInterruptedWorkflow } from "./workflow-interruption.js";
+import {
+  retainReviewEvidence,
+  RetainedReviewEvidenceSchema,
+  type RetainedReviewEvidence,
+} from "./review-evidence-retention.js";
 import {
   EnvironmentGitHubCredentialSource,
   GitHubBranchSchema,
@@ -51,6 +79,7 @@ import {
 import {
   DockerSandboxManager,
   NodeDockerCommandRunner,
+  ReadonlyProbeRunner,
   resolveLocalFilesystemPath,
   type CommandResult,
   type SandboxSession,
@@ -83,6 +112,7 @@ import {
 
 import type { WorkerEnvironment } from "../config/env.js";
 import { IssueLocalizer } from "../localization/retrieval.js";
+import { navigateImplementation } from "../localization/implementation-navigation.js";
 import {
   RepositoryRelationGraph,
   RelationGraphSchema,
@@ -94,6 +124,7 @@ import {
 } from "../localization/issue-localization-agent.js";
 import {
   planningSnapshotSource,
+  snapshotSource,
   sandboxSource,
   overlaySource,
   revisionedSandbox,
@@ -270,11 +301,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     run: RunExecutionRecord,
     signal: AbortSignal,
   ): Promise<RunExecutionOutcome> {
-    const previousElapsedMs = await initialWorkflowElapsedMs(this.database, run.id);
-    const planStartedAt = Date.now() - previousElapsedMs;
-    const planDeadlineSignal = AbortSignal.timeout(
-      Math.max(1, this.environment.DEVFLOW_TIMEOUT_MS - previousElapsedMs),
+    const planLimits = await benchmarkSandboxLimits(this.database, run.id);
+    const planTiming = await initialWorkflowTiming(
+      this.database,
+      run.id,
+      this.environment.DEVFLOW_TIMEOUT_MS,
+      planLimits?.timeoutMs,
     );
+    const planStartedAt = planTiming.startedAt;
+    const planDeadlineSignal = AbortSignal.timeout(Math.max(1, planTiming.deadlineAt - Date.now()));
     const planSignal = AbortSignal.any([signal, planDeadlineSignal]);
     const metrics = await initialWorkflowMetrics(this.database, run);
     metrics.retries = run.retryCount;
@@ -344,7 +379,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         {
           maxSteps: run.maxSteps,
           maxReviewRetries: run.maxReviewRetries,
-          timeoutMs: this.environment.DEVFLOW_TIMEOUT_MS,
+          timeoutMs: planTiming.timeoutMs,
+          deadlineAt: planTiming.deadlineAt,
           ...(this.environment.DEVFLOW_MAX_MODEL_CALLS === undefined
             ? {}
             : { maxModelCalls: this.environment.DEVFLOW_MAX_MODEL_CALLS }),
@@ -757,14 +793,21 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     }
     let plan: AgentPlan = persistedPlan;
 
-    const previousElapsedMs = await initialWorkflowElapsedMs(this.database, run.id);
-    const startedAt = Date.now() - previousElapsedMs;
+    const benchmarkLimits = await benchmarkSandboxLimits(this.database, run.id);
+    const timing = await initialWorkflowTiming(
+      this.database,
+      run.id,
+      this.environment.DEVFLOW_TIMEOUT_MS,
+      benchmarkLimits?.timeoutMs,
+    );
+    const startedAt = timing.startedAt;
     const metrics = await initialWorkflowMetrics(this.database, run);
     const budget = WorkflowBudgetLedger.fromMetrics(
       {
         maxSteps: run.maxSteps,
         maxReviewRetries: run.maxReviewRetries,
-        timeoutMs: this.environment.DEVFLOW_TIMEOUT_MS,
+        timeoutMs: timing.timeoutMs,
+        deadlineAt: timing.deadlineAt,
         ...(this.environment.DEVFLOW_MAX_MODEL_CALLS === undefined
           ? {}
           : { maxModelCalls: this.environment.DEVFLOW_MAX_MODEL_CALLS }),
@@ -796,9 +839,13 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       syncBudgetStageSteps(metrics);
     };
     refreshAdaptiveMetrics();
-    const deadlineSignal = AbortSignal.timeout(
-      Math.max(1, this.environment.DEVFLOW_TIMEOUT_MS - previousElapsedMs),
-    );
+    await this.database.events.append({
+      runId: run.id,
+      type: "WORKFLOW_CHECKPOINT",
+      occurredAt: new Date().toISOString(),
+      payload: asJson({ stage: "EXECUTE", budget: budget.snapshot(metrics) }),
+    });
+    const deadlineSignal = AbortSignal.timeout(Math.max(1, budget.remainingTimeMs));
     const executionSignal = AbortSignal.any([signal, deadlineSignal]);
     let sandbox: SandboxSession | undefined;
     let benchmark: PreparedBenchmarkEvaluation | undefined;
@@ -809,7 +856,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     try {
       budget.assertWithinLimits("PLAN", metrics);
       const localSnapshot = await requireLocalRunSnapshot(this.database, run);
-      const benchmarkLimits = await benchmarkSandboxLimits(this.database, run.id);
       let preparingSandbox = true;
       const dockerRunner = new NodeDockerCommandRunner();
       const manager = new DockerSandboxManager({
@@ -895,6 +941,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       await this.observeSpan(run.id, "checkout_and_sandbox_prepare", prepareStarted);
       const efficiencyTrace = this.traces.getStore();
       if (efficiencyTrace) sandbox = efficiencyTrace.sandbox(sandbox);
+      // Only the fixed host source-capture script may use this read-only path.
+      // Generic Agent exec still invalidates revisions because it can write files.
+      const probeCaptureSandbox = sandbox;
       const localizationView = revisionedSandbox(sandbox);
       sandbox = localizationView.sandbox;
       const activeSandbox = sandbox;
@@ -1121,6 +1170,27 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           // denial instead of misreporting a stage lease as the global maximum.
           hardLimit: adaptiveBudget.hardLimit - baseConsumedSteps,
           onLimitReached: async (snapshot: Readonly<AgentProgressSnapshot>) => {
+            if (snapshot.editCorrectionPending || snapshot.handoffPending) {
+              const required =
+                baseConsumedSteps + snapshot.stepCount + 1 + lease.mandatoryDownstreamSteps;
+              if (required > adaptiveBudget.hardLimit)
+                return {
+                  action: "STOP" as const,
+                  reason: "ESTIMATED_BUDGET_EXCEEDED" as const,
+                  message:
+                    "EDIT_CORRECTION budget unavailable after reserving downstream Review; no correction request was sent.",
+                };
+              if (required > adaptiveBudget.activeLimit) {
+                adaptiveBudget = { ...adaptiveBudget, activeLimit: required };
+                budgetExtensions++;
+                refreshAdaptiveMetrics();
+              }
+              return {
+                action: "EXTEND" as const,
+                additionalSteps: 1,
+                reason: "EDIT_CORRECTION: one syntax correction within hard budget",
+              };
+            }
             if (
               snapshot.patchReady &&
               baseConsumedSteps + snapshot.stepCount + 1 + lease.mandatoryDownstreamSteps <=
@@ -1363,6 +1433,20 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         tools,
         model: implementationModel,
         purpose: "IMPLEMENTATION",
+        ...(plan.proposalVersion
+          ? {
+              convergenceReserve: {
+                downstreamSteps: implementationLease.mandatoryDownstreamSteps,
+                downstreamTokens:
+                  2 *
+                  (Math.min(
+                    this.environment.stageModels?.REVIEW?.contextTokens ?? 32000,
+                    Math.ceil((64 * 1024) / 3),
+                  ) +
+                    (this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048)),
+              },
+            }
+          : {}),
         maxSteps: adaptiveBudget.hardLimit - implementationBaseSteps,
         adaptiveStepBudget: adaptiveControllerFor(
           "EXECUTE",
@@ -1481,6 +1565,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         additionalContext: string,
         entryProgress: "DIFF_PROGRESS" | "DISCOVERY_PROGRESS" | "NO_PROGRESS",
         currentSources: WorkingCode[],
+        reviewFindingIds?: readonly string[],
+        stableTaskContext?: string,
       ): Promise<RunResult> => {
         budget.requireAgentSteps("REPAIR");
         recordStageAttempt(metrics, "REPAIR");
@@ -1537,6 +1623,20 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ? implementationModel
             : this.createModel(run, benchmark?.configuration.modelParameters, "REPAIR"),
           purpose,
+          ...(plan.proposalVersion
+            ? {
+                convergenceReserve: {
+                  downstreamSteps: repairLease.mandatoryDownstreamSteps,
+                  downstreamTokens:
+                    2 *
+                    (Math.min(
+                      this.environment.stageModels?.REVIEW?.contextTokens ?? 32000,
+                      Math.ceil((64 * 1024) / 3),
+                    ) +
+                      (this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048)),
+                },
+              }
+            : {}),
           maxSteps: adaptiveBudget.hardLimit - repairBaseSteps,
           adaptiveStepBudget: adaptiveControllerFor("REPAIR", repairLease, repairBaseSteps),
           timeoutMs: budget.remainingTimeoutMs("REPAIR"),
@@ -1547,7 +1647,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             maxTotalTokens: budget.remainingTotalTokens(metrics),
           },
           additionalContext,
+          ...(stableTaskContext ? { stableTaskContext } : {}),
           currentSources,
+          ...(reviewFindingIds ? { reviewFindingIds } : {}),
           workspaceRevision: localizationView.revision(),
         });
         mergeAgentPhaseMetrics(metrics, result.metrics, "REPAIR", Date.now() - repairStartedAt);
@@ -1677,6 +1779,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           [repairContext.text, convergenceWarning].filter(Boolean).join("\n\n"),
           convergenceWarning.length === 0 ? "DIFF_PROGRESS" : "NO_PROGRESS",
           repairContext.currentSources,
+          undefined,
+          repairContext.stableTaskContext,
         );
         if (repair.status !== "SUCCEEDED") {
           return await this.finalizeBenchmark(
@@ -1718,6 +1822,95 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
 
       let review: ReviewResult;
       let repairResponse: RunResult["phaseCompletion"];
+      const supplementMarker = "review-evidence-supplement-v1.json";
+      const reviewArtifacts = await this.database.artifacts.list(run.id);
+      let supplementUsage: ReviewSupplementUsage = {
+        rounds: 0,
+        reads: 0,
+        sourceBytes: 0,
+        snippetBytes: 0,
+      };
+      let supplementCache: ReviewSourceCache[] = [];
+      const savedSupplement = reviewArtifacts.findLast(
+        (a) => a.name === "review-evidence-supplement-v2.json",
+      );
+      if (savedSupplement?.content) {
+        const saved = JSON.parse(savedSupplement.content);
+        supplementUsage = ReviewSupplementUsageSchema.parse(saved.usage);
+        supplementCache = saved.cacheEntries ?? [];
+      } else if (reviewArtifacts.some((a) => a.name === supplementMarker)) {
+        supplementUsage = { rounds: 1, reads: 4, sourceBytes: 512 * 1024, snippetBytes: 16 * 1024 };
+      }
+      const feedbackKeys = new Set<string>(
+        savedSupplement?.content ? (JSON.parse(savedSupplement.content).feedbackKeys ?? []) : [],
+      );
+      const saveSupplement = async () => {
+        await this.database.artifacts.create({
+          runId: run.id,
+          kind: "OTHER",
+          name: "review-evidence-supplement-v2.json",
+          mimeType: "application/json",
+          content: JSON.stringify({
+            version: 2,
+            usage: supplementUsage,
+            cacheEntries: supplementCache,
+            feedbackKeys: [...feedbackKeys],
+          }),
+          metadata: { visibility: "HOST_ONLY" },
+        });
+      };
+      const findingHistory = new Map<string, ReviewResult["findings"][number]>();
+      const savedProbes = reviewArtifacts.findLast((a) => a.name === "review-probes-v1.json");
+      const probeState = savedProbes?.content
+        ? ReviewProbeStateSchema.parse(JSON.parse(savedProbes.content))
+        : emptyReviewProbeState();
+      const saveProbes = async () => {
+        await this.database.artifacts.create({
+          runId: run.id,
+          kind: "OTHER",
+          name: "review-probes-v1.json",
+          mimeType: "application/json",
+          content: JSON.stringify(probeState),
+          metadata: { visibility: "HOST_ONLY" },
+        });
+      };
+      for (const artifact of reviewArtifacts.filter((a) => a.kind === "REVIEW_REPORT")) {
+        try {
+          for (const finding of JSON.parse(artifact.content ?? "{}").findings ?? [])
+            if (finding.findingId) findingHistory.set(finding.findingId, finding);
+        } catch {
+          /* A damaged report cannot grant permission or close a finding. */
+        }
+      }
+      const savedEvidence = reviewArtifacts.findLast(
+        (a) => a.name === "review-retained-evidence-v1.json",
+      );
+      let retainedEvidence: RetainedReviewEvidence | undefined;
+      try {
+        retainedEvidence = savedEvidence?.content
+          ? RetainedReviewEvidenceSchema.parse(JSON.parse(savedEvidence.content))
+          : undefined;
+      } catch {
+        /* Invalid host evidence must be recollected. */
+      }
+      if (retainedEvidence?.repairResponse) repairResponse = retainedEvidence.repairResponse;
+      const saveEvidence = async (evidence: ReviewEvidence) => {
+        retainedEvidence = RetainedReviewEvidenceSchema.parse({
+          version: 1,
+          workspaceRevision: evidence.workspaceRevision,
+          baselineRevision: run.task.baseCommitSha ?? "unknown",
+          sources: evidence.sources,
+          ...(repairResponse ? { repairResponse } : {}),
+        });
+        await this.database.artifacts.create({
+          runId: run.id,
+          kind: "OTHER",
+          name: "review-retained-evidence-v1.json",
+          mimeType: "application/json",
+          content: JSON.stringify(retainedEvidence),
+          metadata: { visibility: "HOST_ONLY" },
+        });
+      };
       let diffStartedAt = Date.now();
       let diff = await git.diff(sandbox, { maxBytes: 300_000 }, executionSignal);
       this.traces.getStore()?.span("DIFF_GENERATION", diffStartedAt);
@@ -1757,8 +1950,76 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             protectedPaths: benchmark?.configuration.protectedPaths ?? [],
           },
           signal: executionSignal,
+          navigation: {
+            source: sandboxSource(activeSandbox, { maxFileBytes: 48 * 1024 }),
+            repositoryId: run.repository.id,
+            baseCommitSha: run.task.baseCommitSha ?? "unknown",
+            description: run.task.title + "\n" + run.task.description,
+          },
         });
         recordDeterministicTools(metrics, "REVIEW", sourceEvidence);
+        sourceEvidence.findingHistory = [...findingHistory.values()];
+        const reviewRecoveryState = (await this.database.artifacts.list(run.id)).findLast(
+          (a) => a.name === "review-output-recovery-v1.json",
+        );
+        sourceEvidence.outputRecoveriesUsed = reviewRecoveryState?.content
+          ? z
+              .object({ used: z.number().int().min(0).max(2) })
+              .parse(JSON.parse(reviewRecoveryState.content)).used
+          : 0;
+        await retainReviewEvidence({
+          previous: retainedEvidence,
+          current: sourceEvidence,
+          findings: sourceEvidence.findingHistory,
+          baselineRevision: run.task.baseCommitSha ?? "unknown",
+          cache: supplementCache,
+          signal: executionSignal,
+          cacheVerified: (entry) => {
+            if (!supplementCache.some((c) => c.key === entry.key && c.sha256 === entry.sha256))
+              supplementCache.push(entry);
+          },
+          verifyCurrent: async (path) => {
+            const remaining = remainingReviewSupplement(supplementUsage);
+            if (
+              remaining.reads < 1 ||
+              budget.remainingTimeMs <
+                120_000 +
+                  reviewTimeReserve(this.environment, sourceEvidence.outputRecoveriesUsed ?? 0)
+            )
+              throw Error("RETAINED_EVIDENCE_BUDGET_INSUFFICIENT");
+            const verifySignal = AbortSignal.any([executionSignal, AbortSignal.timeout(120_000)]);
+            planSourcePath(path);
+            budget.requireToolCalls("REVIEW", metrics, 2);
+            const listed = await activeSandbox.listFiles(
+              { path, recursive: false, maxEntries: 1 },
+              verifySignal,
+            );
+            const entry = listed.entries.find((e) => e.path === path && e.kind === "FILE");
+            if (!entry || entry.sizeBytes === undefined || entry.sizeBytes > remaining.bytes)
+              throw Error("RETAINED_EVIDENCE_SOURCE_BUDGET_OR_FILE_MISSING");
+            supplementUsage.reads++;
+            supplementUsage.sourceBytes += entry.sizeBytes;
+            await saveSupplement();
+            const started = Date.now();
+            const read = await activeSandbox.readFile({ path, maxBytes: 1 }, verifySignal);
+            recordToolWork(metrics, "REVIEW", {
+              calls: 2,
+              executions: 2,
+              latencyMs: Date.now() - started,
+            });
+            return read.fileSha256;
+          },
+        });
+        await saveSupplement();
+        sourceEvidence.probes = projectReviewProbes(
+          probeState.observations.filter((o) =>
+            o.view === "BASELINE"
+              ? o.revision === (run.task.baseCommitSha ?? "unknown")
+              : o.revision === String(sourceEvidence.workspaceRevision),
+          ),
+          sourceEvidence.sources.map((s) => s.path),
+        );
+        await saveEvidence(sourceEvidence);
         if (repairResponse) sourceEvidence.repairResponse = repairResponse;
         review = await this.review(
           run,
@@ -1772,10 +2033,441 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           benchmark?.configuration.modelParameters,
           sourceEvidence,
         );
+        await saveEvidence(sourceEvidence);
+        let supplementRequests = reviewSupplementRequests(review);
+        let supplementStopReason =
+          supplementUsage.rounds >= 2
+            ? "SUPPLEMENT_ALREADY_CONSUMED"
+            : "NO_USABLE_EVIDENCE_REQUEST";
+        for (const finding of review.findings)
+          if (finding.findingId) findingHistory.set(finding.findingId, finding);
+        sourceEvidence.findingHistory = [...findingHistory.values()];
+        const feedbackReserveTokens = () =>
+          (sourceEvidence.outputRecoveriesUsed !== undefined &&
+          sourceEvidence.outputRecoveriesUsed >= 2
+            ? 1
+            : 2) *
+          (estimateModelInput(
+            [
+              { role: "SYSTEM", content: REVIEW_PROMPT },
+              {
+                role: "USER",
+                content: buildReviewContext({
+                  title: run.task.title,
+                  description: run.task.description,
+                  plan,
+                  test,
+                  diff: diff.patch,
+                  sourceEvidence,
+                }),
+              },
+            ],
+            [],
+          ) +
+            Math.ceil(
+              Buffer.byteLength(JSON.stringify(z.toJSONSchema(ReviewTransportSchema))) / 3,
+            ) +
+            (this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048) +
+            Math.ceil((32 * 1024) / 3));
+        const feedbackDecisionSlots = () =>
+          (sourceEvidence.outputRecoveriesUsed ?? 0) < 2 ? 2 : 1;
+        let feedbackProgress: boolean;
+        do {
+          feedbackProgress = false;
+          const beforeFeedbackRound = supplementUsage.rounds;
+          const corrections = newReviewCorrections(review, feedbackKeys);
+          const correctingHostFeedback =
+            review.decision === "NEEDS_EVIDENCE" &&
+            (review.hostFeedback?.some((f) => f.category !== "SOURCE") ?? false);
+          if (
+            correctingHostFeedback &&
+            supplementUsage.rounds < 2 &&
+            corrections.length &&
+            budget.remainingTimeMs >=
+              reviewTimeReserve(this.environment, sourceEvidence.outputRecoveriesUsed ?? 0) &&
+            budget.remainingAgentSteps >= feedbackDecisionSlots() &&
+            budget.remainingModelCalls(metrics) >= feedbackDecisionSlots() &&
+            budget.remainingTotalTokens(metrics) >= feedbackReserveTokens()
+          ) {
+            supplementUsage.rounds++;
+            for (const row of corrections) feedbackKeys.add(row.key);
+            await saveSupplement();
+            sourceEvidence.hostFeedback = corrections.map((r) => r.feedback);
+            feedbackProgress = true;
+            supplementStopReason = "HOST_REFERENCE_CORRECTION_PENDING";
+            await this.database.artifacts.create({
+              runId: run.id,
+              kind: "OTHER",
+              name: "review-host-feedback-v1.json",
+              mimeType: "application/json",
+              content: JSON.stringify({
+                version: 1,
+                usage: supplementUsage,
+                feedback: sourceEvidence.hostFeedback,
+              }),
+              metadata: { visibility: "HOST_ONLY" },
+            });
+          } else if (correctingHostFeedback) {
+            sourceEvidence.hostFeedback = review.hostFeedback;
+            supplementStopReason =
+              (supplementUsage.rounds >= 2
+                ? "HOST_FEEDBACK_EXHAUSTED"
+                : corrections.length
+                  ? "INSUFFICIENT_RE_REVIEW_RESERVE"
+                  : "REPEATED_HOST_FEEDBACK") +
+              ":" +
+              (review.hostFeedback ?? []).map((f) => f.code).join(",");
+          }
+          if (
+            !correctingHostFeedback &&
+            review.decision === "NEEDS_EVIDENCE" &&
+            supplementUsage.rounds < 2 &&
+            supplementRequests.length
+          ) {
+            // Persist consumption before any source work; recovery cannot reset it.
+            budget.assertWithinLimits("REVIEW", metrics);
+            budget.requireAgentSteps("REVIEW");
+            budget.requireModelCall("REVIEW", metrics);
+            if (
+              budget.remainingAgentSteps >= feedbackDecisionSlots() &&
+              budget.remainingModelCalls(metrics) >= feedbackDecisionSlots() &&
+              budget.remainingTimeMs >=
+                120_000 +
+                  reviewTimeReserve(this.environment, sourceEvidence.outputRecoveriesUsed ?? 0) &&
+              budget.remainingTotalTokens(metrics) >= feedbackReserveTokens()
+            ) {
+              const beforeSupplement = { ...supplementUsage };
+              const remaining = remainingReviewSupplement(supplementUsage);
+              const supplementLimits = {
+                reads: Math.min(4, remaining.reads),
+                bytes: Math.min(512 * 1024, remaining.bytes),
+                snippets: Math.min(16 * 1024, remaining.snippets),
+              };
+              supplementUsage = {
+                rounds: supplementUsage.rounds + 1,
+                reads: supplementUsage.reads + supplementLimits.reads,
+                sourceBytes: supplementUsage.sourceBytes + supplementLimits.bytes,
+                snippetBytes: supplementUsage.snippetBytes + supplementLimits.snippets,
+              };
+              await saveSupplement();
+              await this.database.artifacts.create({
+                runId: run.id,
+                kind: "OTHER",
+                name: supplementMarker,
+                mimeType: "application/json",
+                content: JSON.stringify({
+                  used: true,
+                  workspaceRevision: localizationView.revision(),
+                }),
+                metadata: { visibility: "HOST_ONLY" },
+              });
+              const artifacts = await this.database.artifacts.list(run.id);
+              const saved = artifacts.findLast(
+                (a) => a.name === "repository-relations-plan-v1.json",
+              );
+              let baseline;
+              try {
+                baseline = saved?.content
+                  ? RelationGraphSchema.parse(JSON.parse(saved.content))
+                  : undefined;
+              } catch {
+                /* Invalid graph is not authoritative. */
+              }
+              if (
+                baseline &&
+                (baseline.repositoryId !== run.repository.id ||
+                  baseline.baseCommitSha !== run.task.baseCommitSha)
+              )
+                baseline = undefined;
+              const supplementSignal = AbortSignal.any([
+                executionSignal,
+                AbortSignal.timeout(120_000),
+              ]);
+              const supplement = await collectReviewSupplement({
+                source: sandboxSource(activeSandbox, { maxFileBytes: 512 * 1024 }),
+                repositoryId: run.repository.id,
+                baseCommitSha: run.task.baseCommitSha ?? "unknown",
+                workspaceRevision: localizationView.revision(),
+                plan,
+                requests: supplementRequests,
+                signal: supplementSignal,
+                limits: supplementLimits,
+                cacheEntries: supplementCache,
+                baselineSource: localSnapshot
+                  ? snapshotSource(localSnapshot, { maxFileBytes: 1024 * 1024 })
+                  : gitWorkspaceSource(run.task.baseCommitSha!, activeSandbox).base,
+                ...(baseline ? { baseline } : {}),
+                readCurrent: async (path, maxBytes, signal) => {
+                  const metadata = await activeSandbox.listFiles(
+                    { path, recursive: false, maxEntries: 1 },
+                    signal,
+                  );
+                  if (metadata.entries.find((e) => e.path === path)?.kind !== "FILE")
+                    throw Error("Review source is not a regular public file");
+                  return activeSandbox.readFile({ path, maxBytes }, signal);
+                },
+              }).catch((error): Awaited<ReturnType<typeof collectReviewSupplement>> => {
+                if (executionSignal.aborted || !supplementSignal.aborted) throw error;
+                const unresolved = [
+                  "SOURCE_REQUEST_TIMEOUT: host source collection exceeded its 120 second deadline; no behavior verdict established",
+                ];
+                return {
+                  cacheEntries: supplementCache,
+                  sources: [],
+                  unavailable: unresolved,
+                  supplement: {
+                    used: true,
+                    requests: supplementRequests.length,
+                    reads: supplementLimits.reads,
+                    sourceBytes: supplementLimits.bytes,
+                    snippetBytes: supplementLimits.snippets,
+                    unresolved,
+                  },
+                  toolExecutions: supplementLimits.reads + 1,
+                  toolLatencyMs: 120_000,
+                };
+              });
+              recordDeterministicTools(metrics, "REVIEW", supplement);
+              supplementUsage = {
+                rounds: supplementUsage.rounds,
+                reads:
+                  beforeSupplement.reads + (supplement.supplement?.reads ?? supplementLimits.reads),
+                sourceBytes:
+                  beforeSupplement.sourceBytes +
+                  (supplement.supplement?.sourceBytes ?? supplementLimits.bytes),
+                snippetBytes:
+                  beforeSupplement.snippetBytes +
+                  (supplement.supplement?.snippetBytes ?? supplementLimits.snippets),
+              };
+              supplementCache = supplement.cacheEntries;
+              await saveSupplement();
+              for (const row of supplement.sources) {
+                if (
+                  !sourceEvidence.sources.some(
+                    (s) =>
+                      s.path === row.path &&
+                      (s.view ?? "CURRENT") === (row.view ?? "CURRENT") &&
+                      s.fileSha256 === row.fileSha256 &&
+                      s.startLine === row.startLine &&
+                      s.endLine === row.endLine,
+                  )
+                ) {
+                  sourceEvidence.sources.push(row);
+                  feedbackProgress = true;
+                }
+              }
+              sourceEvidence.sourceFeedback = {
+                requests: supplementRequests,
+                errors: supplement.unavailable.length
+                  ? supplement.unavailable
+                  : feedbackProgress
+                    ? []
+                    : [
+                        "ALREADY_SUPPLIED: Requested ranges are already in the current evidence. Cite them or identify genuinely missing evidence.",
+                      ],
+              };
+              const failureKey = JSON.stringify([
+                supplementRequests.map((r) => [r.path, r.symbol, r.view ?? "CURRENT"]),
+                sourceEvidence.sourceFeedback.errors,
+              ]);
+              if (sourceEvidence.sourceFeedback.errors.length && !feedbackKeys.has(failureKey)) {
+                feedbackKeys.add(failureKey);
+                feedbackProgress = true;
+                await saveSupplement();
+              }
+              sourceEvidence.unavailable.push(...supplement.unavailable);
+              if (supplement.supplement) sourceEvidence.supplement = supplement.supplement;
+              await this.database.artifacts.create({
+                runId: run.id,
+                kind: "OTHER",
+                name: "review-evidence-supplement-result-v1.json",
+                mimeType: "application/json",
+                content: JSON.stringify(supplement),
+                metadata: { visibility: "HOST_ONLY" },
+              });
+              await this.database.events.append({
+                runId: run.id,
+                type: "WORKFLOW_CHECKPOINT",
+                occurredAt: new Date().toISOString(),
+                payload: asJson({
+                  stage: "REVIEW",
+                  supplement: supplement.supplement,
+                  requestIssued: false,
+                  budget: budget.snapshot(metrics, metrics.budget),
+                }),
+              });
+              supplementStopReason = supplement.sources.length
+                ? "RE_REVIEW_STILL_NEEDS_EVIDENCE"
+                : "SOURCE_UNAVAILABLE";
+              for (const finding of review.findings)
+                if (finding.findingId) findingHistory.set(finding.findingId, finding);
+              sourceEvidence.findingHistory = [...findingHistory.values()];
+            } else {
+              supplementStopReason = "INSUFFICIENT_RE_REVIEW_RESERVE";
+            }
+            supplementRequests = reviewSupplementRequests(review);
+          }
+          for (const finding of review.findings)
+            if (finding.findingId) findingHistory.set(finding.findingId, finding);
+          sourceEvidence.findingHistory = [...findingHistory.values()];
+          if (
+            !correctingHostFeedback &&
+            (supplementUsage.rounds < 2 || supplementUsage.rounds > beforeFeedbackRound) &&
+            (review.probeRequests?.length ||
+              probeState.requests.some((r) =>
+                review.findings.some(
+                  (f) =>
+                    f.findingId === r.findingId &&
+                    f.disposition !== "RESOLVED" &&
+                    f.disposition !== "CONTRADICTED" &&
+                    f.disposition !== "DEFERRED",
+                ),
+              ))
+          ) {
+            if (supplementUsage.rounds === beforeFeedbackRound) {
+              supplementUsage.rounds++;
+              await saveSupplement();
+            }
+            const probeStarted = Date.now();
+            const currentProbeSandbox = probeCaptureSandbox;
+            const probeResult = await collectReviewProbes({
+              requests: review.probeRequests ?? [],
+              findings: review.findings,
+              state: probeState,
+              baseline: localSnapshot
+                ? snapshotSource(localSnapshot, { maxFileBytes: 512 * 1024 })
+                : gitWorkspaceSource(run.task.baseCommitSha!, activeSandbox).base!,
+              current: sandboxSource(activeSandbox, { maxFileBytes: 512 * 1024 }),
+              baseRevision: run.task.baseCommitSha ?? "unknown",
+              currentRevision: String(localizationView.revision()),
+              runner: new ReadonlyProbeRunner(new NodeDockerCommandRunner()),
+              image: this.environment.DEVFLOW_SANDBOX_IMAGE,
+              signal: executionSignal,
+              save: saveProbes,
+              prepare: async (view, request) => {
+                let source: IndexSource;
+                if (view === "BASELINE" && localSnapshot)
+                  source = snapshotSource(localSnapshot, { maxFileBytes: 512 * 1024 });
+                else {
+                  budget.assertWithinLimits("REVIEW", metrics);
+                  if (
+                    budget.remainingToolCalls(metrics) < 2 ||
+                    budget.remainingTimeoutMs("REVIEW") < 31_000
+                  )
+                    throw new Error("PROBE_SOURCE_BUDGET_INSUFFICIENT: request not issued");
+                  recordToolWork(metrics, "REVIEW", { calls: 1, executions: 1, latencyMs: 0 });
+                  source = await capturePublicProbeSource(
+                    currentProbeSandbox,
+                    request.publicEntrypoint,
+                    request.code,
+                    executionSignal,
+                    view === "BASELINE" ? run.task.baseCommitSha : undefined,
+                  );
+                }
+                return preparePublicProbe(source, request, executionSignal);
+              },
+              beforeWork: (kind, reserveTimeMs) => {
+                budget.assertWithinLimits("REVIEW", metrics);
+                if (
+                  budget.remainingToolCalls(metrics) < (kind === "EXECUTE" ? 3 : 2) ||
+                  budget.remainingTimeMs <
+                    reserveTimeMs +
+                      reviewTimeReserve(this.environment, sourceEvidence.outputRecoveriesUsed ?? 0)
+                )
+                  throw new Error(
+                    "PROBE_BUDGET_INSUFFICIENT: tool/time reserve; request not issued",
+                  );
+                // Preserve an independent Review decision; no probe can bypass it.
+                budget.requireAgentSteps("REVIEW");
+                budget.requireModelCall("REVIEW", metrics);
+                if (
+                  budget.remainingAgentSteps < 2 ||
+                  budget.remainingModelCalls(metrics) < 2 ||
+                  budget.remainingTotalTokens(metrics) < feedbackReserveTokens()
+                )
+                  throw new Error(
+                    "PROBE_BUDGET_INSUFFICIENT: independent re-review input/output reserve; request not issued",
+                  );
+                recordToolWork(metrics, "REVIEW", {
+                  calls: kind === "EXECUTE" ? 3 : kind === "READ" ? 2 : 1,
+                  executions: kind === "EXECUTE" ? 3 : kind === "READ" ? 2 : 1,
+                  latencyMs: 0,
+                });
+              },
+            });
+            recordToolWork(metrics, "REVIEW", {
+              executions: 0,
+              latencyMs: Date.now() - probeStarted,
+            });
+            // Keep whole provenance records; raw observations stay in the private artifact.
+            sourceEvidence.probes = projectReviewProbes(
+              probeResult.observations,
+              sourceEvidence.sources.map((s) => s.path),
+            );
+            sourceEvidence.probeFeedback = probeResult.feedback;
+            feedbackProgress ||= probeResult.progress;
+            if (probeResult.unresolved.length)
+              supplementStopReason = probeResult.unresolved.join("; ");
+            for (const finding of review.findings)
+              if (finding.findingId) findingHistory.set(finding.findingId, finding);
+          }
+          if (feedbackProgress) {
+            await saveEvidence(sourceEvidence);
+            review = await this.review(
+              run,
+              plan,
+              diff.patch,
+              test,
+              executionSignal,
+              reviewAttempt,
+              metrics,
+              budget,
+              benchmark?.configuration.modelParameters,
+              sourceEvidence,
+              true,
+            );
+            sourceEvidence.hostFeedback = review.hostFeedback;
+            for (const finding of review.findings)
+              if (finding.findingId) findingHistory.set(finding.findingId, finding);
+            sourceEvidence.findingHistory = [...findingHistory.values()];
+          }
+          supplementRequests = reviewSupplementRequests(review);
+        } while (
+          feedbackProgress &&
+          review.decision === "NEEDS_EVIDENCE" &&
+          supplementUsage.rounds < 2 &&
+          (supplementRequests.length > 0 ||
+            Boolean(review.probeRequests?.length) ||
+            newReviewCorrections(review, feedbackKeys).length > 0)
+        );
+        await saveEvidence(sourceEvidence);
+        if (
+          review.decision === "NEEDS_EVIDENCE" &&
+          review.hostFeedback?.some((f) => f.category !== "SOURCE")
+        )
+          supplementStopReason = `${supplementUsage.rounds >= 2 ? "HOST_FEEDBACK_EXHAUSTED" : !newReviewCorrections(review, feedbackKeys).length ? "REPEATED_HOST_FEEDBACK" : supplementStopReason}:${review.hostFeedback.map((f) => f.code).join(",")}`;
         verification.review = review.approved ? "REVIEW_PASSED" : "FAILED";
         budget.assertWithinLimits("REVIEW", metrics);
         reviewAttempt += 1;
         if (review.approved) break;
+        if (review.decision === "NEEDS_EVIDENCE") {
+          const failed = await this.failedResult(
+            run,
+            metrics,
+            startedAt,
+            "REVIEW_EVIDENCE_UNRESOLVED",
+            `Independent Review lacks required evidence: ${review.summary}. ${supplementStopReason}; ${sourceEvidence.supplement?.unresolved.join("; ") || "no resolved evidence gap"}.`,
+          );
+          return await this.finalizeBenchmark(
+            benchmark,
+            sandbox,
+            failed,
+            true,
+            repairAttempt,
+            Math.max(0, reviewAttempt - 1),
+            executionSignal,
+          );
+        }
         if (reviewAttempt > run.maxReviewRetries) {
           const failed = await this.failedResult(
             run,
@@ -1808,12 +2500,25 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             payload: { attempt: reviewAttempt, reason: "REVIEW_REJECTED" },
           },
         });
+        const confirmedFindings = review.findings.filter(
+          (f) =>
+            f.kind === "DEFECT" &&
+            f.severity !== "INFO" &&
+            f.disposition === "CONFIRMED" &&
+            f.blocking !== false,
+        );
+        if (!confirmedFindings.length)
+          throw new DevflowError({
+            code: "INSUFFICIENT_EVIDENCE",
+            message: "Review did not confirm an actionable defect; Repair was not issued.",
+            details: { stopReason: "REVIEW_EVIDENCE_UNRESOLVED" },
+          });
         const reviewRepairContext = await buildRepairContext(
           git,
           sandbox,
           test,
           executionSignal,
-          `Address only these independent review findings:\n${JSON.stringify(review.findings, null, 2)}`,
+          `Address only these confirmed independent review findings:\n${JSON.stringify(confirmedFindings, null, 2)}`,
           {
             evidenceRecoveryAvailable: tools.some((tool) => tool.name === "readEvidenceArtifact"),
             workspaceRevision: localizationView.revision(),
@@ -1832,8 +2537,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           [reviewRepairContext.text, reviewRepairWarning].filter(Boolean).join("\n\n"),
           "DISCOVERY_PROGRESS",
           reviewRepairContext.currentSources,
+          confirmedFindings.flatMap((f) => (f.findingId ? [f.findingId] : [])),
+          reviewRepairContext.stableTaskContext,
         );
         repairResponse = repair.phaseCompletion;
+        await saveEvidence(sourceEvidence);
         if (repair.status !== "SUCCEEDED") {
           return await this.finalizeBenchmark(
             benchmark,
@@ -1892,6 +2600,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             [reviewTriggeredTestContext.text, testRepairWarning].filter(Boolean).join("\n\n"),
             testRepairWarning.length === 0 ? "DIFF_PROGRESS" : "NO_PROGRESS",
             reviewTriggeredTestContext.currentSources,
+            undefined,
+            reviewTriggeredTestContext.stableTaskContext,
           );
           if (testRepair.status !== "SUCCEEDED") {
             return await this.finalizeBenchmark(
@@ -2016,21 +2726,33 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       });
       const failed: RunResult = {
         runId: run.id,
-        status: cancelled ? "CANCELLED" : timedOut ? "TIMED_OUT" : "FAILED",
+        status: cancelled
+          ? "CANCELLED"
+          : timedOut || normalized.code === "TIMEOUT"
+            ? "TIMED_OUT"
+            : "FAILED",
         metrics,
         error: normalized.toJSON(),
       };
-      if (sandbox !== undefined && !cancelled && !timedOut) {
+      if (sandbox !== undefined) {
         try {
-          return await this.finalizeBenchmark(
-            benchmark,
-            sandbox,
+          const finalSandbox = sandbox;
+          return await preserveInterruptedWorkflow({
+            database: this.database,
+            sandbox: finalSandbox,
             failed,
-            false,
-            repairAttempt,
-            Math.max(0, reviewAttempt - 1),
-            signal,
-          );
+            timeoutMs: this.environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
+            finalize: (finalizeSignal) =>
+              this.finalizeBenchmark(
+                benchmark,
+                finalSandbox,
+                failed,
+                false,
+                repairAttempt,
+                Math.max(0, reviewAttempt - 1),
+                finalizeSignal,
+              ),
+          });
         } catch {
           const trace = this.traces.getStore();
           if (trace) {
@@ -2355,11 +3077,19 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       maxTotalTokens: number;
     };
     additionalContext: string;
+    stableTaskContext?: string;
     workingSet?: WorkingSet;
     currentSources?: WorkingCode[];
     workspaceRevision?: number;
     executionPacket?: ExecutionPacket;
     packetSourceBytes?: number;
+    convergenceReserve?: {
+      downstreamSteps: number;
+      downstreamTokens: number;
+      downstreamTimeMs?: number;
+      requestTimeMs?: number;
+    };
+    reviewFindingIds?: readonly string[];
   }): Promise<RunResult> {
     const trace = this.traces.getStore();
     if (trace) {
@@ -2374,6 +3104,42 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     }
     const runtime = new DefaultAgentRuntime(input.model);
     const phaseArtifacts = await this.database.artifacts.list(input.run.id);
+    const reviewRecoveryArtifact = phaseArtifacts.findLast(
+      (a) => a.name === "review-output-recovery-v1.json",
+    );
+    const reviewRecoveryUsed = reviewRecoveryArtifact?.content
+      ? z
+          .object({ used: z.number().int().min(0).max(2) })
+          .parse(JSON.parse(reviewRecoveryArtifact.content)).used
+      : 0;
+    const recoveryArtifact =
+      input.purpose === "IMPLEMENTATION"
+        ? undefined
+        : phaseArtifacts.findLast((a) => a.name === "repair-execution-recovery-v1.json");
+    const savedRecovery = recoveryArtifact?.content
+      ? JSON.parse(recoveryArtifact.content)
+      : undefined;
+    const parsedRecovery = savedRecovery
+      ? AgentStateSchema.shape.executionRecovery.safeParse(savedRecovery)
+      : undefined;
+    const recoveryData = parsedRecovery?.success ? parsedRecovery.data : undefined;
+    const repairRecovery = recoveryData
+      ? {
+          pending: savedRecovery?.completed === true ? false : recoveryData.pending,
+          used: recoveryData.used,
+          explorationClosed:
+            savedRecovery?.completed === true ? false : recoveryData.explorationClosed,
+          ...(typeof recoveryData.handoffPending === "boolean"
+            ? { handoffPending: recoveryData.handoffPending }
+            : {}),
+          ...(recoveryData.correctionReason
+            ? { correctionReason: recoveryData.correctionReason }
+            : {}),
+        }
+      : parsedRecovery
+        ? { pending: false, used: true, explorationClosed: true }
+        : undefined;
+    let savedRecoveryKey = savedRecovery ? JSON.stringify(savedRecovery) : "";
     const baselineArtifact =
       (this.environment.DEVFLOW_RELATION_GRAPH_ENABLED ?? true)
         ? phaseArtifacts.findLast((a) => a.name === "repository-relations-plan-v1.json")
@@ -2467,7 +3233,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     const relationTool: ModelToolDescriptor = {
       name: "queryRelations",
       description:
-        "Read a bounded current static dependency/export graph around repository paths. Incomplete graphs permit ordinary code reads; this tool never grants write scope.",
+        "When implementation evidence is missing, query current dependency/export relations using the relevant paths and API symbols. With symbols, returns bounded SHA-linked implementation windows from the shared navigator. Follow with readFile for required code before editing. Incomplete graphs permit ordinary code reads; this tool never grants write scope.",
       inputSchema: z.object({
         paths: z.array(z.string().min(1).max(1024)).min(1).max(4),
         symbols: z.array(z.string().min(1).max(256)).max(6).optional(),
@@ -2606,8 +3372,13 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         maxSteps: input.maxSteps,
         adaptiveStepBudget: input.adaptiveStepBudget,
         timeoutMs: input.timeoutMs,
+        timeReserve: {
+          downstreamMs: reviewTimeReserve(this.environment, reviewRecoveryUsed),
+          requestMs: 60_000,
+        },
         maxRetries: this.environment.DEVFLOW_MAX_RETRIES,
         executionBudget: input.executionBudget,
+        ...(input.convergenceReserve ? { convergenceReserve: input.convergenceReserve } : {}),
         emitRunLifecycle: false,
         traceEfficiency: trace !== undefined,
         deduplicateContext: actionEnabled,
@@ -2620,6 +3391,58 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           ...this.modelBindings.get(input.model)?.settings,
         },
         additionalContext: input.additionalContext,
+        ...(input.purpose === "IMPLEMENTATION"
+          ? {}
+          : {
+              repairMode: true,
+              ...(repairRecovery ? { executionRecovery: repairRecovery } : {}),
+              stableTaskContext:
+                input.stableTaskContext ??
+                `Host finding IDs: ${JSON.stringify(input.reviewFindingIds ?? [])}. Preserve requirements and resolve diagnostics before finishing.`,
+              repairRecoveryContext: {
+                maxToolExecutions: 2,
+                collect: async () => {
+                  const started = Date.now(),
+                    rows: WorkingCode[] = [];
+                  const paths = [
+                    ...new Set([
+                      ...(input.currentSources ?? []).map((s) => s.path),
+                      ...(input.plan.approvalScope?.files ?? []).map((f) => f.path),
+                    ]),
+                  ].slice(0, 2);
+                  let reads = 0;
+                  for (const path of paths) {
+                    const prior = input.currentSources?.find((s) => s.path === path);
+                    const startLine = prior?.startLine ?? 1;
+                    reads++;
+                    const current = await input.sandbox.readFile(
+                      { path, startLine, endLine: startLine + 159, maxBytes: 16 * 1024 },
+                      input.signal,
+                    );
+                    if (!current.fileSha256) continue;
+                    versions.set(path, current.fileSha256);
+                    stalePaths.delete(path);
+                    const observed: WorkingCode = {
+                      path,
+                      startLine: current.startLine ?? startLine,
+                      endLine: current.endLine ?? startLine,
+                      code: current.content,
+                      contentHash: current.fileSha256,
+                      workspaceRevision: current.workspaceRevision ?? input.workspaceRevision ?? 0,
+                      role: "TARGET",
+                      complete: false,
+                    };
+                    observedSources.push(observed);
+                    rows.push(observed);
+                  }
+                  return {
+                    text: JSON.stringify({ currentSources: rows, unavailable: rows.length === 0 }),
+                    toolExecutions: reads,
+                    toolLatencyMs: Date.now() - started,
+                  };
+                },
+              },
+            }),
         invalidateAdditionalContextOnMutation: true,
       },
       {
@@ -2635,6 +3458,30 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
         signal: input.signal,
         tools: phaseTools,
+        ...(input.purpose === "IMPLEMENTATION"
+          ? {}
+          : {
+              stateStore: {
+                load: async () => undefined,
+                save: async (state: AgentState) => {
+                  if (!state.executionRecovery) return;
+                  const key = JSON.stringify({
+                    ...state.executionRecovery,
+                    completed: state.phase === "COMPLETED",
+                  });
+                  if (key === savedRecoveryKey) return;
+                  await this.database.artifacts.create({
+                    runId: input.run.id,
+                    kind: "OTHER",
+                    name: "repair-execution-recovery-v1.json",
+                    mimeType: "application/json",
+                    content: key,
+                    metadata: { visibility: "HOST_ONLY" },
+                  });
+                  savedRecoveryKey = key;
+                },
+              },
+            }),
         ...(exploration
           ? {
               availableTools: () => phaseTools.filter((t) => exploration.available(t.name)),
@@ -2696,11 +3543,47 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               };
             const started = Date.now(),
               { paths, symbols } = parsed.data as { paths: string[]; symbols?: string[] };
-            await relationGraph.inspect(paths, toolSignal);
+            await relationGraph.inspect(paths, toolSignal, false);
+            const navigation = symbols?.length
+              ? await navigateImplementation({
+                  repositoryId: input.run.repository.id,
+                  baseCommitSha: relationGraph.snapshot().baseCommitSha,
+                  source: sandboxSource(input.sandbox, { maxFileBytes: 512 * 1024 }),
+                  graph: relationGraph,
+                  description: `${symbols.map((s) => `${s}()`).join(" ")}\n${input.run.task.title}\n${input.run.task.description}`,
+                  candidates: paths.map((path) => ({ path, symbol: symbols[0] })),
+                  signal: toolSignal,
+                  maxReads: 4,
+                  maxSourceBytes: 512 * 1024,
+                  maxSnippetBytes: 4096,
+                  maxWindows: 3,
+                })
+              : undefined;
+            for (const window of navigation?.windows ?? []) {
+              observedSources.push({
+                path: window.path,
+                code: window.snippet,
+                contentHash: window.contentHash,
+                startLine: window.startLine,
+                endLine: window.endLine,
+                complete: false,
+                workspaceRevision: relationGraph.snapshot().workspaceRevision,
+                role: "INTERFACE",
+              });
+            }
             return {
               ok: true,
               durationMs: Date.now() - started,
-              output: asJson(relationGraph.issueView(paths, [], 8192, symbols)),
+              output: asJson({
+                ...relationGraph.issueView(paths, [], navigation ? 4096 : 8192, symbols),
+                ...(navigation
+                  ? {
+                      implementationEvidence: navigation.windows,
+                      missingInformation: navigation.missing,
+                      navigationMetrics: navigation.metrics,
+                    }
+                  : {}),
+              }),
             };
           }
           const savedVersions = new Map(versions);
@@ -3076,10 +3959,17 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       observedSources,
       input.sandbox,
       input.signal,
-      () => checks++,
+      () => {
+        if (phaseResult.metrics.toolCalls + checks + 1 > input.executionBudget.maxToolCalls)
+          throw new Error("REPAIR_EVIDENCE_BUDGET_INSUFFICIENT: current citation read not issued");
+        checks++;
+      },
+      input.reviewFindingIds,
+      input.plan.approvalScope?.files.map((f) => f.path),
     );
     phaseResult.metrics.toolExecutions =
       (phaseResult.metrics.toolExecutions ?? phaseResult.metrics.toolCalls) + checks;
+    phaseResult.metrics.toolCalls += checks;
     phaseResult.metrics.toolLatencyMs += Date.now() - checkedAt;
     if (response)
       await this.database.events.append({
@@ -3319,23 +4209,79 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     budget: WorkflowBudgetLedger,
     modelParameters?: VercelAiModelParameters,
     sourceEvidence?: ReviewEvidence,
+    supplemental = false,
   ): Promise<ReviewResult> {
+    if (sourceEvidence) {
+      sourceEvidence.task = { title: run.task.title, description: run.task.description };
+      sourceEvidence.planInterpretation = { summary: plan.summary };
+      sourceEvidence.baselineRevision = run.task.baseCommitSha ?? "unknown";
+    }
     recordStageAttempt(metrics, "REVIEW");
     const reviewStartedAt = Date.now();
-    await this.database.runs.transition({
-      runId: run.id,
-      expectedStatus: "RUNNING",
-      expectedStage: "TEST",
-      status: "RUNNING",
-      currentStage: "REVIEW",
-      event: {
+    if (!supplemental)
+      await this.database.runs.transition({
         runId: run.id,
-        type: "REVIEW_STARTED",
-        occurredAt: new Date().toISOString(),
-        payload: { attempt: attempt + 1, independent: true },
-      },
-    });
+        expectedStatus: "RUNNING",
+        expectedStage: "TEST",
+        status: "RUNNING",
+        currentStage: "REVIEW",
+        event: {
+          runId: run.id,
+          type: "REVIEW_STARTED",
+          occurredAt: new Date().toISOString(),
+          payload: { attempt: attempt + 1, independent: true },
+        },
+      });
     const reviewer = this.createReviewer(run, modelParameters);
+    const artifacts = (await this.database.artifacts?.list?.(run.id)) ?? [];
+    const savedRecovery = artifacts.findLast((a) => a.name === "review-output-recovery-v1.json");
+    let recoveryUsed = savedRecovery?.content
+      ? z
+          .object({ version: z.literal(1), used: z.number().int().min(0).max(2) })
+          .parse(JSON.parse(savedRecovery.content)).used
+      : Math.min(
+          2,
+          artifacts
+            .filter((a) => a.kind === "REVIEW_REPORT")
+            .reduce(
+              (n, a) =>
+                n +
+                Number(
+                  (a.metadata as { formatRepairAttempts?: number })?.formatRepairAttempts ?? 0,
+                ) +
+                Number(
+                  (a.metadata as { lengthRegenerationAttempts?: number })
+                    ?.lengthRegenerationAttempts ?? 0,
+                ),
+              0,
+            ),
+        );
+    const outputCap = this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048;
+    if (sourceEvidence) sourceEvidence.outputRecoveriesUsed = recoveryUsed;
+    const compactMessages: ModelMessage[] = [
+      {
+        role: "SYSTEM",
+        content:
+          REVIEW_PROMPT +
+          " This is a fresh, bounded recovery decision. Preserve current evidence and unfinished findings, state only decisive behavior and task scope, and return concise JSON. Do not continue the truncated answer.",
+      },
+      {
+        role: "USER",
+        content: buildReviewContext({
+          title: run.task.title,
+          description: run.task.description,
+          plan,
+          test,
+          diff,
+          sourceEvidence,
+          compact: true,
+        }),
+      },
+    ];
+    const recoveryTokens =
+      estimateModelInput(compactMessages, []) +
+      Math.ceil(Buffer.byteLength(JSON.stringify(z.toJSONSchema(ReviewTransportSchema))) / 3) +
+      outputCap;
     try {
       const generated = await generateStructuredOutput({
         model: reviewer,
@@ -3344,6 +4290,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         description: "Independent code review verdict and actionable issues.",
         purpose: "REVIEW",
         lengthRegeneration: true,
+        rejectLength: true,
+        requestTimeoutMs: {
+          normal: this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS,
+          recovery: this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS,
+        },
+        lengthRecovery: {
+          messages: compactMessages,
+          settings: { reasoningEffort: "low", maxOutputTokens: outputCap },
+        },
         messages: [
           {
             role: "SYSTEM",
@@ -3362,11 +4317,91 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           },
         ],
         signal,
-        onRequest: async ({ purpose, formatRepair }) => {
+        onRequest: async ({ purpose, formatRepair, request }) => {
           budget.assertWithinLimits("REVIEW", metrics);
+          const recovery = formatRepair || purpose.endsWith("_LENGTH_REGENERATION");
+          const outputTokens = request.settings?.maxOutputTokens ?? outputCap;
+          const requiredTokens =
+            estimateModelInput(request.messages, request.tools) +
+            Math.ceil(
+              Buffer.byteLength(JSON.stringify(z.toJSONSchema(ReviewTransportSchema))) / 3,
+            ) +
+            outputTokens;
+          const remainingTokens = budget.remainingTotalTokens(metrics);
+          const reservedTokens = !recovery && recoveryUsed < 2 ? recoveryTokens : 0;
+          const requiredSteps = reservedTokens > 0 ? 2 : 1;
+          const requestTimeoutMs = recovery
+            ? this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS
+            : this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS;
+          const reservedTimeMs =
+            this.environment.DEVFLOW_FINALIZE_TIMEOUT_MS +
+            (!recovery && recoveryUsed < 2
+              ? this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS
+              : 0);
+          const requiredTimeMs = requestTimeoutMs + reservedTimeMs;
+          const remainingTimeMs = budget.remainingTimeMs;
+          const contextTokens = this.environment.stageModels?.REVIEW?.contextTokens ?? 32000;
+          if (
+            (recovery && recoveryUsed >= 2) ||
+            requiredTokens + reservedTokens > remainingTokens ||
+            requiredTokens > contextTokens ||
+            (reservedTokens > 0 && recoveryTokens > contextTokens) ||
+            budget.remainingAgentSteps < requiredSteps ||
+            budget.remainingModelCalls(metrics) < requiredSteps ||
+            remainingTimeMs < requiredTimeMs
+          ) {
+            const details = {
+              stage: "REVIEW",
+              requestIssued: false,
+              remainingTokens,
+              requiredTokens,
+              reservedTokens,
+              requiredSteps,
+              remainingSteps: budget.remainingAgentSteps,
+              remainingModelCalls: budget.remainingModelCalls(metrics),
+              remainingTimeMs,
+              requestTimeoutMs,
+              reservedTimeMs,
+              requiredTimeMs,
+              missingTimeMs: Math.max(0, requiredTimeMs - remainingTimeMs),
+              recoveryUsed,
+              outputTokens,
+              contextTokens,
+              missingTokens: Math.max(
+                0,
+                requiredTokens + reservedTokens - remainingTokens,
+                requiredTokens - contextTokens,
+              ),
+              missingSteps: Math.max(0, requiredSteps - budget.remainingAgentSteps),
+            };
+            await this.database.events.append({
+              runId: run.id,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: asJson(details),
+            });
+            throw new DevflowError({
+              code: "EXECUTION_BUDGET_EXCEEDED",
+              message:
+                "Review decision/recovery cannot fit the remaining step, token, time or recovery budget.",
+              details,
+            });
+          }
           ensureStructuredStepCapacity(metrics, "REVIEW");
           budget.requireAgentSteps("REVIEW");
           budget.requireModelCall("REVIEW", metrics);
+          if (recovery) {
+            recoveryUsed++;
+            if (sourceEvidence) sourceEvidence.outputRecoveriesUsed = recoveryUsed;
+            await this.database.artifacts.create({
+              runId: run.id,
+              kind: "OTHER",
+              name: "review-output-recovery-v1.json",
+              mimeType: "application/json",
+              content: JSON.stringify({ version: 1, used: recoveryUsed }),
+              metadata: { visibility: "HOST_ONLY" },
+            });
+          }
           budget.consumeStructuredStep("REVIEW");
           recordStageStep(metrics, "REVIEW");
           if (formatRepair) recordFormatRepair(metrics, "REVIEW");
@@ -3374,7 +4409,25 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             runId: run.id,
             type: "LLM_REQUEST",
             occurredAt: new Date().toISOString(),
-            payload: { purpose, attempt: attempt + 1, formatRepair },
+            payload: {
+              purpose,
+              attempt: attempt + 1,
+              formatRepair,
+              supplemental,
+              requestIssued: true,
+              requiredTokens,
+              remainingTokens,
+              outputTokens,
+              reservedTokens,
+              recoveryUsed,
+              reasoningEffort:
+                request.settings?.reasoningEffort ??
+                this.environment.stageModels?.REVIEW?.reasoningEffort ??
+                null,
+              remainingTimeMs,
+              requestTimeoutMs,
+              reservedTimeMs,
+            },
           });
         },
         onResponse: async ({ purpose, formatRepair, regeneration, response, failure }) => {
@@ -3440,7 +4493,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       await this.database.artifacts.create({
         runId: run.id,
         kind: "REVIEW_REPORT",
-        name: `review-attempt-${String(attempt + 1)}.json`,
+        name: `review-attempt-${String(attempt + 1)}${supplemental ? "-supplement" : ""}.json`,
         mimeType: "application/json",
         content: JSON.stringify(review, null, 2),
         metadata: asJson({
@@ -4036,8 +5089,14 @@ export async function initialWorkflowMetrics(
   return metrics;
 }
 
-async function initialWorkflowElapsedMs(database: DatabaseAdapter, runId: string): Promise<number> {
+async function initialWorkflowTiming(
+  database: DatabaseAdapter,
+  runId: string,
+  timeoutMs: number,
+  explicitTimeoutMs?: number,
+): Promise<ReturnType<typeof restoredWorkflowTiming>> {
   let elapsedMs = 0;
+  const checkpoints: Parameters<typeof restoredWorkflowTiming>[0][number][] = [];
   let afterSequence = 0;
   while (true) {
     const events = await database.events.list(runId, {
@@ -4047,6 +5106,7 @@ async function initialWorkflowElapsedMs(database: DatabaseAdapter, runId: string
     for (const event of events) {
       if (event.type !== "WORKFLOW_CHECKPOINT") continue;
       const checkpoint = recordValue(event.payload);
+      checkpoints.push(recordValue(checkpoint.budget));
       const observed = recordValue(recordValue(checkpoint.budget).observed);
       elapsedMs = Math.max(
         elapsedMs,
@@ -4057,7 +5117,7 @@ async function initialWorkflowElapsedMs(database: DatabaseAdapter, runId: string
     if (events.length < 1_000) break;
     afterSequence = events[events.length - 1]!.sequence;
   }
-  return elapsedMs;
+  return restoredWorkflowTiming(checkpoints, Date.now(), elapsedMs, timeoutMs, explicitTimeoutMs);
 }
 
 /** @deprecated Kept for benchmark-test compatibility; new code records a named stage. */

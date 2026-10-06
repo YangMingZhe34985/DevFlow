@@ -12,8 +12,9 @@ The API persists intent and queues work. The Worker owns execution; agents acces
 - Separate model bindings for Localization, Planner, Execute, Repair and Review. The example configuration uses Bailian.
 - Versioned TS/JS dependency/export evidence, available to Execute and Repair through bounded `queryRelations` calls.
 - Full-file SHA checks, precise text replacement and protected-file policies before code writes.
-- Current source and unchanged branches in Review; Repair can return source-backed disagreement, followed by fresh testing and independent review.
-- Shared request/recovery budgets, complete-output checks and progress detection for repeated reads, failed calls and no-op writes.
+- Tool-free Review with two bounded host evidence rounds and isolated public reproductions; Repair retains diagnostic tasks and checked per-finding answers for independent re-review.
+- Execute reserves editing correction and completion budgets; repeated source/graph queries cannot earn new progress, while malformed edits receive one bounded correction.
+- Shared request/recovery budgets, complete-output checks and protected write scope throughout the workflow.
 
 The final nine-case cohort passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing validated nine-case coverage to six strict successes. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).
 
@@ -41,7 +42,7 @@ Web: http://localhost:3000; API: http://localhost:3001/api/v1; Worker readiness:
 
 ## Model configuration
 
-[.env.example](.env.example) defaults to Bailian's compatible endpoint. Planner uses `deepseek-v4-pro-0813`, Execute/Repair use `glm-5.3`, and Localization/Review inherit `LLM_MODEL`. Each stage has its own `LLM_<STAGE>_*` settings. Users choose models suited to their provider and workload. Read [stage bindings, inheritance and budgets](docs/stage-models.md), then restart the Worker after changes.
+[.env.example](.env.example) defaults to Bailian's compatible endpoint. Planner/Review use `deepseek-v4-pro-0813`, Execute/Repair use `glm-5.3`, and Localization inherits `LLM_MODEL`. Review uses high reasoning effort; Review/Repair allow 16,384 output tokens and 64,000 context tokens. Each stage has its own `LLM_<STAGE>_*` settings. Users choose models suited to their provider and workload. Read [stage bindings, inheritance and budgets](docs/stage-models.md), then restart the Worker after changes.
 
 ## Workflow
 

@@ -99,6 +99,7 @@ async function parseInWorker(
   if (Buffer.byteLength(content) > 512 * 1024) throw new Error("Parser input exceeds 512 KiB");
   const worker = new Worker(script, {
     eval: true,
+    execArgv: [],
     env: {},
     workerData: {
       content,

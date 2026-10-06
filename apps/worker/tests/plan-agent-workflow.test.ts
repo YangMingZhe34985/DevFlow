@@ -157,6 +157,7 @@ describe("PlanAgent production PLAN integration", () => {
       "plan_proposal",
     ]);
     const attempt = JSON.parse(attemptArtifact(current.artifacts).content!) as PlanAttempt;
+    expect(attempt.metrics.modelCalls).toBe(1);
     expect(attempt.metrics.reads).toBe(0);
     expect(attempt.contractCorrection).toBeUndefined();
     const metrics = checkpointMetrics(current.events);
@@ -236,11 +237,11 @@ describe("PlanAgent production PLAN integration", () => {
     expect(metrics.toolCalls).toBe(1 + attempt.metrics.reads);
     expect(metrics.toolExecutions).toBe(
       evidence.metrics.toolExecutions +
-        1 +
         attempt.metrics.reads +
         JSON.parse(
-          current.artifacts.find((a) => a.name === "repository-relations-plan-v1.json")!.content!,
-        ).metrics.reads,
+          current.artifacts.find((a) => a.name === "issue-localization-agent-plan-v1.json")!
+            .content!,
+        ).metrics.sourceReads,
     );
     expect(metrics.stages?.PLAN).toMatchObject({
       modelCalls: metrics.modelCalls,

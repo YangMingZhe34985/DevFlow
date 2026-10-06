@@ -5,6 +5,7 @@ import {
   fakeModelResponse,
   PostPatchController,
   contentHash,
+  type ModelRequest,
 } from "@devflow/agent";
 import { DockerSandboxManager, type SandboxSession } from "@devflow/sandbox";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
@@ -18,8 +19,60 @@ import {
 } from "../src/runs/post-patch.js";
 import { ApprovalWorkflowRunExecutor } from "../src/runs/approval-workflow-run-executor.js";
 import { loadWorkerEnvironment } from "../src/config/env.js";
+import { WorkflowBudgetLedger } from "../src/runs/workflow-budget.js";
+import { createWorkflowMetrics } from "../src/runs/workflow-metrics.js";
 
 afterEach(() => vi.restoreAllMocks());
+it("does not issue Review when input plus configured output exceeds the remaining budget", async () => {
+  const events: NewAgentEvent[] = [];
+  const db = {
+    runs: { transition: async () => ({}) },
+    events: {
+      append: async (e: NewAgentEvent) => {
+        events.push(e);
+      },
+    },
+  } as unknown as DatabaseAdapter;
+  const reviewer = new FakeLanguageModel([]);
+  const workflow = new ApprovalWorkflowRunExecutor(
+    db,
+    loadWorkerEnvironment({ DATABASE_URL: "unused" }),
+    undefined,
+    () => reviewer,
+  );
+  const run = {
+    id: "review-budget",
+    task: { title: "Fix", description: "Fix supported behavior" },
+  } as RunExecutionRecord;
+  await expect(
+    workflow["review"](
+      run,
+      { summary: "Fix", steps: [] },
+      "diff",
+      {
+        exitCode: 0,
+        stdout: "pass",
+        stderr: "",
+        timedOut: false,
+        durationMs: 1,
+        outputTruncated: false,
+      },
+      new AbortController().signal,
+      0,
+      createWorkflowMetrics(),
+      new WorkflowBudgetLedger({
+        maxSteps: 10,
+        maxReviewRetries: 1,
+        maxTotalTokens: 5,
+        timeoutMs: 10000,
+      }),
+    ),
+  ).rejects.toMatchObject({
+    code: "EXECUTION_BUDGET_EXCEEDED",
+    details: { stage: "REVIEW", requestIssued: false, remainingTokens: 5 },
+  });
+  expect(events.some((e) => e.type === "LLM_REQUEST")).toBe(false);
+});
 const ok = { ok: true as const, output: {}, durationMs: 1 };
 it("normalizes execution success separately from APPLIED, NO_OP, rejected, malformed and unobserved mutations", () => {
   expect(normalizeMutation(ok, { a: "old" }, { a: "new" }, ["a"], 5)).toMatchObject({
@@ -256,7 +309,8 @@ function fixture(skipTests = false) {
       truncated: false,
     }),
     readFile: async ({ path }: { path: string }) => {
-      if (path === "a.ts") return { path, content, truncated: false };
+      if (path === "a.ts")
+        return { path, content, truncated: false, fileSha256: contentHash(content) };
       if (path === "package.json" && !skipTests)
         return { path, content: '{"scripts":{"test":"node --test"}}', truncated: false };
       throw new DevflowError({ code: "NOT_FOUND", message: "missing" });
@@ -277,7 +331,7 @@ function fixture(skipTests = false) {
               ? ""
               : args.includes("--numstat")
                 ? "1\t1\ta.ts\n"
-                : `--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-${original.trim()}\n+${content.trim()}\n`;
+                : `diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-${original.trim()}\n+${content.trim()}\n`;
         else if (args[0] === "status")
           stdout = "## main\0" + (content === original ? "" : " M a.ts\0");
         else if (args[0] === "rev-parse") stdout = "a".repeat(40);
@@ -299,6 +353,193 @@ function fixture(skipTests = false) {
   } as unknown as SandboxSession;
   return { sandbox, order, tests: () => testCalls };
 }
+
+function reviewedFindings(request: ModelRequest) {
+  const message = request.messages.find(
+    (m) =>
+      m.role === "USER" &&
+      typeof m.content === "string" &&
+      m.content.includes("Current source and host protection policy:\n"),
+  );
+  const text = typeof message?.content === "string" ? message.content : "";
+  return (
+    JSON.parse(
+      text
+        .split("Current source and host protection policy:\n")[1]
+        ?.split("\n\nTest evidence")[0] ?? "{}",
+    ).findingHistory ?? []
+  );
+}
+it.each([
+  ["PASS", false],
+  ["NEEDS_EVIDENCE", false],
+  ["PASS", true],
+] as const)(
+  "host supplements Review within shared rounds, then independently returns %s without artificial Repair",
+  async (finalVerdict, omitRequests) => {
+    const f = fixture();
+    vi.spyOn(DockerSandboxManager.prototype, "create").mockResolvedValue(f.sandbox);
+    const artifacts: { name: string; content?: string }[] = [],
+      events: NewAgentEvent[] = [];
+    const plan = {
+      summary: "Fix value",
+      complexity: "COMPLEX",
+      estimatedSteps: 20,
+      confidence: 0.8,
+      steps: [{ id: "edit", title: "Edit", description: "Fix a.ts" }],
+    };
+    const db = {
+      approvals: { list: async () => [{ kind: "PLAN", status: "APPROVED", request: { plan } }] },
+      events: {
+        list: async () => [],
+        append: async (e: NewAgentEvent) => {
+          events.push(e);
+        },
+      },
+      artifacts: {
+        list: async () => artifacts,
+        create: async (a: { name: string; content?: string }) => {
+          artifacts.push(a);
+          return { ...a, id: randomUUID() };
+        },
+      },
+      runs: { transition: async () => ({}) },
+    } as unknown as DatabaseAdapter;
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [
+          {
+            id: "edit",
+            name: "writeFile",
+            input: { path: "a.ts", content: "export const value = 2;\n" },
+          },
+        ],
+      }),
+    ]);
+    const reviewer = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [],
+        text: JSON.stringify({
+          verdict: "NEEDS_EVIDENCE",
+          summary: "Need current value",
+          issues: omitRequests
+            ? [
+                {
+                  kind: "EVIDENCE_GAP",
+                  severity: "medium",
+                  message: "Need current value",
+                  evidence: { path: "a.ts", quote: "value = 2" },
+                },
+              ]
+            : [],
+          ...(omitRequests
+            ? {}
+            : {
+                evidenceRequests: [
+                  { path: "a.ts", symbol: "value", question: "Read current implementation" },
+                ],
+              }),
+        }),
+      }),
+      async (request) => {
+        expect(request.tools).toEqual([]);
+        expect(JSON.stringify(request.messages)).toContain(
+          omitRequests ? "BEHAVIOR_BASIS_MISSING" : '\\"used\\":true',
+        );
+        expect(JSON.stringify(request.messages)).toContain(
+          contentHash("export const value = 2;\n"),
+        );
+        return fakeModelResponse({
+          toolCalls: [],
+          text: JSON.stringify({
+            verdict: finalVerdict,
+            summary:
+              finalVerdict === "PASS"
+                ? "Current code satisfies the issue"
+                : "Still missing API contract",
+            issues:
+              omitRequests && finalVerdict === "PASS"
+                ? reviewedFindings(request).map((f: { findingId: string }) => ({
+                    findingId: f.findingId,
+                    kind: "EVIDENCE_GAP",
+                    severity: "medium",
+                    disposition: "RESOLVED",
+                    message: "Current value observed",
+                    evidence: { path: "a.ts", quote: "value = 2" },
+                    behavior: {
+                      scenario: "Read value",
+                      expected: "2",
+                      actual: "2",
+                      requirementBasis: "ISSUE",
+                      requirement: "Update a.ts",
+                    },
+                  }))
+                : [],
+            ...(finalVerdict === "PASS"
+              ? {}
+              : { evidenceRequests: [{ path: "a.ts", question: "Read again" }] }),
+          }),
+        });
+      },
+      ...(finalVerdict === "NEEDS_EVIDENCE"
+        ? [
+            fakeModelResponse({
+              toolCalls: [],
+              text: JSON.stringify({
+                verdict: "NEEDS_EVIDENCE",
+                summary: "API contract is still unavailable after two rounds",
+                issues: [],
+                evidenceRequests: [{ path: "a.ts", question: "Still missing contract" }],
+              }),
+            }),
+          ]
+        : []),
+    ]);
+    const workflow = new ApprovalWorkflowRunExecutor(
+      db,
+      loadWorkerEnvironment({
+        DATABASE_URL: "unused",
+        DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED: "true",
+        DEVFLOW_POST_PATCH_AUTOFINISH_ENABLED: "true",
+      }),
+      () => model,
+      () => reviewer,
+    );
+    const run = {
+      id: randomUUID(),
+      currentStage: "EXECUTE",
+      status: "RUNNING",
+      retryCount: 0,
+      maxSteps: 30,
+      maxTestRetries: 1,
+      maxReviewRetries: 1,
+      repository: {
+        id: randomUUID(),
+        sourceKind: "GIT",
+        sourceUri: "https://example.invalid/repo.git",
+      },
+      task: {
+        id: randomUUID(),
+        title: "Change value",
+        description: "Update a.ts",
+        baseCommitSha: "a".repeat(40),
+      },
+    } as RunExecutionRecord;
+    const result = await workflow["executeApprovedPlan"](run, new AbortController().signal);
+    expect(result.status, JSON.stringify(result)).toBe(
+      finalVerdict === "PASS" ? "SUCCEEDED" : "FAILED",
+    );
+    if (finalVerdict !== "PASS")
+      expect(result.error?.details).toMatchObject({ workflowCode: "REVIEW_EVIDENCE_UNRESOLVED" });
+    expect(artifacts.filter((a) => a.name === "review-evidence-supplement-v1.json")).toHaveLength(
+      omitRequests ? 0 : finalVerdict === "NEEDS_EVIDENCE" ? 2 : 1,
+    );
+    if (omitRequests)
+      expect(artifacts.filter((a) => a.name === "review-host-feedback-v1.json")).toHaveLength(1);
+    expect(events.filter((e) => e.type === "REPAIR_STARTED")).toHaveLength(0);
+    expect(f.order.filter((e) => e === "WRITE")).toHaveLength(1);
+  },
+);
 
 it.each([false, true])(
   "Gate A: actual auto-finish workflow retains TEST/REPAIR/REVIEW boundary (skip=%s)",
@@ -347,9 +588,25 @@ it.each([false, true])(
         : [
             write(1),
             write(2),
-            fakeModelResponse({ toolCalls: [], text: "Repair done" }),
+            fakeModelResponse({
+              toolCalls: [
+                {
+                  id: randomUUID(),
+                  name: "finishPhase",
+                  input: { summary: "Repair done", outcome: "CHANGED" },
+                },
+              ],
+            }),
             write(3),
-            fakeModelResponse({ toolCalls: [], text: "Review repair done" }),
+            fakeModelResponse({
+              toolCalls: [
+                {
+                  id: randomUUID(),
+                  name: "finishPhase",
+                  input: { summary: "Review repair done", outcome: "CHANGED" },
+                },
+              ],
+            }),
           ],
     );
     let reviews = 0;
@@ -366,11 +623,34 @@ it.each([false, true])(
             summary: skip ? "The issue is fixed; all tests passed." : "Check value contract",
             issues:
               skip || reviews > 1
-                ? []
+                ? reviewedFindings(request).map((f: { findingId: string }) => ({
+                    findingId: f.findingId,
+                    kind: "DEFECT",
+                    severity: "high",
+                    disposition: "RESOLVED",
+                    message: "Current implementation satisfies value contract",
+                    evidence: { path: "a.ts", quote: "value = 3" },
+                    behavior: {
+                      scenario: "Read exported value",
+                      expected: "3",
+                      actual: "3",
+                      requirementBasis: "ISSUE",
+                      requirement: "Return value 3",
+                    },
+                  }))
                 : [
                     {
                       severity: "high",
                       message: "a.ts value contract needs correction; use value 3",
+                      kind: "DEFECT",
+                      evidence: { path: "a.ts", quote: "value = 2" },
+                      behavior: {
+                        scenario: "Read exported value",
+                        expected: "3",
+                        actual: "2",
+                        requirementBasis: "ISSUE",
+                        requirement: "Return value 3",
+                      },
                     },
                   ],
           }),

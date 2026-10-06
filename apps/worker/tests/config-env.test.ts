@@ -12,6 +12,10 @@ describe("Worker runtime budget configuration", () => {
       LLM_STRUCTURED_OUTPUT_MODE: "auto",
       LLM_REASONING_PROFILE: "efficient",
       DEVFLOW_MAX_TOTAL_TOKENS: 250_000,
+      DEVFLOW_TIMEOUT_MS: 1_500_000,
+      DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS: 240_000,
+      DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS: 210_000,
+      DEVFLOW_FINALIZE_TIMEOUT_MS: 30_000,
     });
     expect(environment.DEVFLOW_MAX_MODEL_CALLS).toBeUndefined();
     expect(environment.DEVFLOW_MAX_TOOL_CALLS).toBeUndefined();

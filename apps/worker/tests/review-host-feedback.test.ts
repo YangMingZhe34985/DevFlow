@@ -1,0 +1,158 @@
+import { expect, it } from "vitest";
+import { ReviewResultSchema } from "@devflow/shared";
+import { assessReview, REVIEW_PROMPT, type ReviewEvidence } from "../src/runs/review-evidence.js";
+import { newReviewCorrections, reviewSupplementRequests } from "../src/runs/review-supplement.js";
+const evidence: ReviewEvidence = {
+  task: {
+    title: "Shared default",
+    description: "Using a Map default must not leak mutations into later parses.",
+  },
+  planInterpretation: { summary: "Deep-copy every mutable default including nested arrays" },
+  workspaceRevision: 2,
+  policy: {},
+  unavailable: [],
+  toolExecutions: 0,
+  toolLatencyMs: 0,
+  sources: [
+    {
+      path: "a.ts",
+      content: "return [...value];",
+      fileSha256: "a".repeat(64),
+      startLine: 1,
+      partial: false,
+    },
+    {
+      path: "a.ts",
+      content: "return value;",
+      fileSha256: "b".repeat(64),
+      startLine: 1,
+      partial: false,
+      view: "BASELINE",
+    },
+  ],
+};
+const issue = {
+  severity: "high" as const,
+  kind: "DEFECT" as const,
+  message: "Nested defaults leak",
+  evidence: { path: "a.ts", quote: "return [...value];" },
+  behavior: {
+    scenario: "default([[]]); mutate first[0]",
+    expected: "Second parse unchanged",
+    actual: "Both share the nested array",
+    requirementBasis: "ISSUE" as const,
+    requirement: "Independent nested default",
+  },
+  scopeAssessment: {
+    category: "ISSUE_UNRESOLVED" as const,
+    explanation: "Nested defaults must be independent",
+    taskQuote: evidence.planInterpretation!.summary,
+  },
+};
+it("returns exact Plan/Issue source feedback without reading code or approving the candidate", () => {
+  const r = assessReview({ verdict: "FAIL", summary: "Review", issues: [issue] }, evidence);
+  expect(r).toMatchObject({
+    approved: false,
+    decision: "NEEDS_EVIDENCE",
+    hostFeedback: [
+      {
+        category: "TASK_SCOPE",
+        code: "TASK_QUOTE_FROM_PLAN",
+        field: "scopeAssessment.taskQuote",
+        value: issue.scopeAssessment.taskQuote,
+      },
+    ],
+  });
+  expect(
+    reviewSupplementRequests({
+      ...r,
+      evidenceRequests: [{ path: "a.ts", question: "Read again" }],
+    }),
+  ).toEqual([]);
+  const rows = newReviewCorrections(r, new Set());
+  expect(rows).toHaveLength(1);
+  expect(newReviewCorrections(r, new Set(rows.map((row) => row.key)))).toHaveLength(0);
+  expect(REVIEW_PROMPT).toContain("not permission to add acceptance requirements");
+  expect(ReviewResultSchema.parse(r).hostFeedback).toEqual(r.hostFeedback);
+});
+it("accepts a corrected task-related static defect without waiving Repair or the old finding", () => {
+  const old = assessReview({ verdict: "FAIL", summary: "Review", issues: [issue] }, evidence);
+  const current = {
+    ...issue,
+    findingId: old.findings[0]!.findingId,
+    scopeAssessment: {
+      ...issue.scopeAssessment,
+      taskQuote: evidence.task!.description,
+      explanation:
+        "The mutation independence promise is the original task; the nested case also violates it",
+    },
+  };
+  expect(
+    assessReview(
+      { verdict: "FAIL", summary: "Confirmed", issues: [current] },
+      { ...evidence, findingHistory: old.findings },
+    ),
+  ).toMatchObject({
+    approved: false,
+    decision: "FAIL",
+    findings: [{ disposition: "CONFIRMED", blocking: true }],
+  });
+  expect(
+    assessReview(
+      { verdict: "PASS", summary: "Omitted", issues: [] },
+      { ...evidence, findingHistory: old.findings },
+    ).approved,
+  ).toBe(false);
+});
+it("allows an evidenced alternative scope decision but never silently defers an unmatched quote", () => {
+  const current = {
+    ...issue,
+    scopeAssessment: {
+      category: "PREEXISTING_UNRELATED" as const,
+      explanation:
+        "This additional nested-array behavior existed before the Map fix and is not part of the reported Map task",
+      baselineEvidence: { path: "a.ts", quote: "return value;" },
+    },
+  };
+  expect(
+    assessReview({ verdict: "FAIL", summary: "Extra behavior", issues: [current] }, evidence),
+  ).toMatchObject({ approved: true, findings: [{ disposition: "DEFERRED", blocking: false }] });
+  const invalid = {
+    ...current,
+    scopeAssessment: { ...current.scopeAssessment, taskQuote: "Invented user requirement" },
+  };
+  expect(
+    assessReview({ verdict: "FAIL", summary: "Extra behavior", issues: [invalid] }, evidence),
+  ).toMatchObject({ approved: false, hostFeedback: [{ code: "TASK_QUOTE_MISMATCH" }] });
+});
+it("distinguishes missing source from missing behavior and remains compatible with old reports", () => {
+  expect(
+    assessReview(
+      {
+        verdict: "FAIL",
+        summary: "Source",
+        issues: [
+          {
+            ...issue,
+            evidence: { path: "absent.ts", quote: "absent" },
+            scopeAssessment: undefined,
+          },
+        ],
+      },
+      evidence,
+    ).hostFeedback?.[0]?.category,
+  ).toBe("SOURCE");
+  expect(
+    assessReview(
+      {
+        verdict: "FAIL",
+        summary: "Behavior",
+        issues: [{ ...issue, behavior: undefined, scopeAssessment: undefined }],
+      },
+      evidence,
+    ).hostFeedback?.[0]?.category,
+  ).toBe("BEHAVIOR");
+  expect(
+    ReviewResultSchema.parse({ approved: false, summary: "Historical", findings: [] }).hostFeedback,
+  ).toBeUndefined();
+});

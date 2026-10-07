@@ -43,3 +43,7 @@ A wholly repeated request stops immediately. Two rounds without new source evide
 Free acceptance includes input above 8,000 tokens followed by a read and another decision, unchanged output on the HTTP wire, context/budget rejection without dispatch, duplicate and no-progress stop, and interrupted Worker resume. Frozen real validation remains a separate gate.
 
 Final free checks for the replacement migration: lint, typecheck and 784 tests passed (29 skipped); formatting and public-file scan passed; Docker 8/8 passed. Both actual Worker public-material replays passed. Package version remains 2.2.0. Frozen paid E07/E10 results will be recorded separately, with all failures retained.
+
+## Frozen real validation result
+
+The `1e206aa` migration was tested once each on E07 and E10. Both failed in Localization output validation before Planner: a 548-character hypothesis exceeded 500 and a 1,018-character summary exceeded 1,000. Lossless format conversion repeated the same invalid content. Initial evidence visibility improved, but E10 later projections still omitted producer evidence; complete localization and repair success are unproven. These real failures supersede any interpretation of free replay as model capability evidence. See [the frozen validation report](v22-selective-migration-validation-20261008.md). New conservative fees were CNY 0.109858; cumulative occupancy is CNY 123.614310 / 150. No extra retry or production change was made during the frozen batch.

@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { sha256 } from "@devflow/eval";
 import type { SandboxSession } from "@devflow/sandbox";
 import { resolveRepairDiagnostics } from "../src/runs/repair-diagnostics.js";
-import { ReplanEvidenceReader, verifyReplanEvidence } from "../src/runs/replan-evidence.js";
+import {
+  ReplanEvidenceReader,
+  verifyReplanEvidence,
+  replanEvidencePlan,
+} from "../src/runs/replan-evidence.js";
 function fixture() {
   const sources = {
     "tests/test.cpp": "test() {\n search();\n assert(result);\n}\n",
@@ -51,6 +55,37 @@ function fixture() {
   };
 }
 describe("read-only scope candidate qualification", () => {
+  it("bounds many failing tests with one auditable operation list, preserving candidate and Planner reads", async () => {
+    const f = fixture();
+    const sources: Record<string, string> = f.sources;
+    for (let i = 0; i < 12; i++) sources[`tests/failure${i}.cpp`] = sources["tests/test.cpp"]!;
+    f.input.failure.stdout = Object.keys(sources)
+      .filter((p) => p.startsWith("tests/"))
+      .map((p) => `${p}:3: Failure`)
+      .join("\n");
+    f.input.resolution = resolveRepairDiagnostics(f.input.failure.stdout, Object.keys(sources));
+    const preparationPlan = replanEvidencePlan(f.input);
+    expect(preparationPlan.testLocations).toHaveLength(2);
+    expect(preparationPlan.omittedTestPaths).toHaveLength(6); // Resolver itself retains at most eight files.
+    const result = await verifyReplanEvidence({ ...f.input, preparationPlan });
+    expect(result.records).toHaveLength(1);
+    expect(f.reader.state.reads).toBe(3);
+    expect(f.readFile.mock.calls.map(([x]) => x.path).sort()).toEqual(
+      [...preparationPlan.readPaths].sort(),
+    );
+    await f.reader.read("src/search.cpp");
+    expect(f.reader.state.reads).toBe(3);
+  });
+  it("persists a smaller planned physical allowance and rejects extra IO without resetting the shared limit", async () => {
+    const f = fixture();
+    f.reader.state.readLimit = 1;
+    await f.reader.read("src/search.cpp");
+    await f.reader.read("src/search.cpp");
+    await expect(f.reader.read("tests/test.cpp")).rejects.toThrow(
+      "REPLAN_SOURCE_READ_RESERVE_EXHAUSTED",
+    );
+    expect(f.readFile).toHaveBeenCalledTimes(1);
+  });
   it("admits implementation evidence linked to the failing test without claiming root-cause proof", async () => {
     const f = fixture(),
       r = await verifyReplanEvidence(f.input);
@@ -88,6 +123,14 @@ describe("read-only scope candidate qualification", () => {
     f.input.completion.evidence[0]!.quote = "test() {";
     expect((await verifyReplanEvidence(f.input)).records).toEqual([]);
   });
+  it("retains a valid citation to any failed location in a selected test file", async () => {
+    const f = fixture();
+    f.input.completion.evidence[0]!.quote = " search();";
+    f.input.resolution.resolved.push({ ...f.input.resolution.resolved[0]!, line: 2 });
+    f.input.resolution.resolved.push({ ...f.input.resolution.resolved[0]!, line: 4 });
+    expect((await verifyReplanEvidence(f.input)).records).toHaveLength(1);
+    expect(f.reader.state.reads).toBe(2);
+  });
   it("assembles a missing implementation quote from current public-test symbol evidence", async () => {
     const f = fixture();
     f.sources["src/search.cpp"] =
@@ -111,6 +154,40 @@ describe("read-only scope candidate qualification", () => {
       fileSha256: sha256(f.sources["src/search.cpp"]),
     });
     expect((await verifyReplanEvidence(f.input)).rejected[0]?.reason).toBe("EVIDENCE_INVALID");
+  });
+  it("uses a claimed symbol only to select a real current declaration for independent planning", async () => {
+    const f = fixture();
+    f.sources["src/search.cpp"] = "export function decodeState(value) {\n return value.status;\n}";
+    f.input.completion.evidence = [];
+    const result = await verifyReplanEvidence({
+      ...f.input,
+      completion: {
+        ...f.input.completion,
+        summary: "Investigate decodeState; failure may arise during restoration",
+      },
+    });
+    expect(result.records[0]).toMatchObject({
+      relationship: "HYPOTHESIS_FOR_PLANNER",
+      hostRegion: { selection: "MODEL_SYMBOL_HINT" },
+    });
+    expect(result.records[0]?.testEvidence?.[0]?.source).toBe("HOST_DIAGNOSTIC_READ");
+    expect(
+      (
+        await verifyReplanEvidence({
+          ...f.input,
+          completion: { ...f.input.completion, summary: "Investigate inventedFunction" },
+        })
+      ).records,
+    ).toEqual([]);
+    f.input.failure.exitCode = 0;
+    expect(
+      (
+        await verifyReplanEvidence({
+          ...f.input,
+          completion: { ...f.input.completion, summary: "decodeState" },
+        })
+      ).records,
+    ).toEqual([]);
   });
   it("restored read consumption cannot renew the eight-read allowance", async () => {
     const f = fixture();

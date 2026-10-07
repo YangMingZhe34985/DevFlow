@@ -1,3 +1,4 @@
+import { ReplanSourceAllowanceExhausted } from "./replan-evidence.js";
 import { createHash } from "node:crypto";
 import type { LanguageModelPort, ModelRequest, ModelResponse } from "@devflow/agent";
 import { readFileContent } from "@devflow/sandbox";
@@ -419,7 +420,28 @@ class PlanSession {
         this.readFeedback(error, request.path);
       }
     }
-    await this.discoverCandidates();
+    try {
+      await this.discoverCandidates();
+    } catch (error) {
+      this.check();
+      const verifiedCandidate = this.rows.some(
+        (row) =>
+          row.sourceVerified &&
+          this.verifiedFiles.get(row.path)?.contentHash === row.contentHash &&
+          this.input.discoveryCandidates?.some((candidate) => candidate.path === row.path),
+      );
+      // Only optional navigation may stop on its local allowance. Mandatory reads,
+      // source identity, cancellation and global budget failures still block.
+      if (!(error instanceof ReplanSourceAllowanceExhausted) || !verifiedCandidate) throw error;
+      this.diagnostic(
+        "PLAN_OPTIONAL_NAVIGATION_EXHAUSTED",
+        "Optional navigation exhausted its shared source allowance; finalize from verified candidate evidence. Unobserved relationships remain unknown.",
+        { ...error.allowance, requestIssued: false },
+      );
+      this.observations.push(
+        "Optional navigation stopped at the shared source allowance. Only supplied current SHA-verified source was observed; missing relationships are unknown, not absent. No additional read allowance or write authority is granted.",
+      );
+    }
     this.buildFinal();
   }
   private readFeedback(error: unknown, path: string): void {
@@ -1152,6 +1174,7 @@ function structuredFailure(
   };
 }
 async function withSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) void operation.catch(() => {});
   signal.throwIfAborted();
   let abort: (() => void) | undefined;
   const cancelled = new Promise<never>((_resolve, reject) => {

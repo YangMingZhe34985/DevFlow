@@ -102,6 +102,8 @@ export interface AgentRunRequest {
   contextMaxBytes?: number;
   /** Host reserve for mandatory downstream work. Editing correction and handoff are reserved locally. */
   convergenceReserve?: { downstreamSteps: number; downstreamTokens: number };
+  continuationTools?: () => number;
+  continuationReserve?: () => { tokens: number; steps: number; timeMs: number };
   /** Absolute stage time is supplied by the host; applies to every execution path. */
   /** requestMs is an admission estimate, not a new per-request model timeout. */
   timeReserve?: { downstreamMs: number; requestMs: number };
@@ -219,6 +221,12 @@ export class DefaultAgentRuntime implements AgentRuntime {
     context = {
       ...context,
       authorizeTool: (call) => {
+        const required = request.continuationTools?.() ?? 0;
+        const remaining =
+          (request.executionBudget?.maxToolCalls ?? Number.MAX_SAFE_INTEGER) -
+          state.metrics.toolCalls;
+        if (required > 0 && remaining <= required && call.name !== "finishPhase")
+          return "CONTINUATION_TOOL_RESERVE: finishPhase with current evidence and remaining gaps; preserve downstream operations.";
         if (authorizationHandoffUsed && call.name !== "finishPhase")
           return "HOST_AUTHORIZATION_HANDOFF: only finishPhase with the remaining gap or scope conflict is available.";
         if (
@@ -686,7 +694,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
               explorationClosed,
               remainingTimeMs,
               requestTimeMs: request.timeReserve.requestMs,
-              downstreamTimeMs: request.timeReserve.downstreamMs,
+              downstreamTimeMs: Math.max(
+                request.timeReserve.downstreamMs,
+                request.continuationReserve?.().timeMs ?? 0,
+              ),
             };
             await context.emit({
               runId: context.runId,
@@ -708,6 +719,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
           if (authorizationHandoffUsed)
             availableTools = availableTools.filter((t) => t.name === "finishPhase");
           if (request.convergenceReserve && !postPatch?.active && !prePatch) {
+            const continuation = request.continuationReserve?.();
+            const downstreamTokens = Math.max(
+              request.convergenceReserve.downstreamTokens,
+              continuation?.tokens ?? 0,
+            );
+            const remainingTools =
+              (request.executionBudget?.maxToolCalls ?? Number.MAX_SAFE_INTEGER) -
+              state.metrics.toolCalls;
+            const downstreamTools = request.continuationTools?.() ?? 0;
             const inputTokens = estimateModelInput(projectedMessages, availableTools);
             const outputTokens = request.modelSettings?.maxOutputTokens ?? 8192;
             const nextTokens = inputTokens + outputTokens;
@@ -728,9 +748,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
             const reserveTokens =
               (execution.editCorrectionUsed || correctingEdit ? 0 : correctionTokens) +
               completionTokens +
-              request.convergenceReserve.downstreamTokens;
+              downstreamTokens;
             explorationClosed ||=
-              remainingTokens < nextTokens + reserveTokens || remainingSteps <= 2;
+              remainingTokens < nextTokens + reserveTokens ||
+              remainingSteps <= Math.max(2, (continuation?.steps ?? 0) + 2) ||
+              remainingTools <= downstreamTools + 3;
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
                 [
@@ -756,7 +778,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             const required =
               estimateModelInput(projectedMessages, availableTools) +
               outputTokens +
-              request.convergenceReserve.downstreamTokens +
+              downstreamTokens +
               (explorationClosed && closingReadAllowed()
                 ? completionTokens + Math.ceil(16384 / 3)
                 : 0);
@@ -772,6 +794,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
               requiredTokens: required,
               remainingTokens,
               remainingSteps,
+              remainingTools,
+              downstreamTools,
             };
             await context.emit({
               runId: context.runId,

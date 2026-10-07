@@ -9,12 +9,33 @@ export interface ReplanReadState {
   reads: number;
   sourceBytes: number;
   cacheHits: number;
+  readLimit?: number | undefined;
 }
 export interface ReplanFile {
   path: string;
   content: string;
   contentHash: string;
   sizeBytes: number;
+}
+/** Local source allowance, distinct from workflow cancellation or downstream reserves. */
+export class ReplanSourceAllowanceExhausted extends DevflowError {
+  readonly allowance: { reads: number; readLimit: number; sourceBytes: number };
+  constructor(state: Readonly<ReplanReadState>) {
+    const allowance = {
+      reads: state.reads,
+      readLimit: Math.min(8, state.readLimit ?? 8),
+      sourceBytes: state.sourceBytes,
+    };
+    super({
+      code: "EXECUTION_BUDGET_EXCEEDED",
+      message: "REPLAN_SOURCE_READ_RESERVE_EXHAUSTED",
+      details: {
+        requestIssued: false,
+        ...allowance,
+      },
+    });
+    this.allowance = allowance;
+  }
 }
 /** A single physical-read allowance shared by admission and Plan preparation. */
 export class ReplanEvidenceReader {
@@ -40,12 +61,11 @@ export class ReplanEvidenceReader {
       this.state.cacheHits++;
       return cached;
     }
-    if (this.state.reads >= 8 || this.state.sourceBytes >= 1024 * 1024)
-      throw new DevflowError({
-        code: "EXECUTION_BUDGET_EXCEEDED",
-        message: "REPLAN_SOURCE_READ_RESERVE_EXHAUSTED",
-        details: { requestIssued: false },
-      });
+    if (
+      this.state.reads >= Math.min(8, this.state.readLimit ?? 8) ||
+      this.state.sourceBytes >= 1024 * 1024
+    )
+      throw new ReplanSourceAllowanceExhausted(this.state);
     this.state.reads++;
     try {
       await this.beforeRead(); // Reserve and persist before issuing IO.
@@ -61,7 +81,11 @@ export class ReplanEvidenceReader {
     this.state.sourceBytes += Buffer.byteLength(file.content);
     await this.afterRead?.(this.state);
     if (file.truncated || !file.fileSha256 || sha256(file.content) !== file.fileSha256)
-      throw new Error("REPLAN_SOURCE_IDENTITY_UNVERIFIED");
+      throw new DevflowError({
+        code: "VALIDATION_ERROR",
+        message: "REPLAN_SOURCE_IDENTITY_UNVERIFIED",
+        details: { path },
+      });
     const observed = {
       path,
       content: file.content,
@@ -80,7 +104,7 @@ export interface ReplanEvidenceRecord {
     startLine: number;
     endLine: number;
     quote: string;
-    selection: "PUBLIC_SYMBOL_OVERLAP";
+    selection: "PUBLIC_SYMBOL_OVERLAP" | "MODEL_SYMBOL_HINT";
   };
   testEvidence?: {
     path: string;
@@ -95,6 +119,38 @@ export interface ReplanEvidenceRecord {
   relationship: "HYPOTHESIS_FOR_PLANNER";
 }
 const isTest = (path: string) => /(?:^|\/)(?:tests?|__tests__)(?:\/|$)|Test\.java$/u.test(path);
+
+/** Select investigation evidence, not a proof of causality. The same list drives preflight and IO. */
+export function replanEvidencePlan(input: {
+  requested: readonly string[];
+  oldPaths: readonly string[];
+  resolution: DiagnosticResolution;
+  completion: NonNullable<RunResult["phaseCompletion"]>;
+}) {
+  const candidates = [...new Set(input.requested)]
+    .filter((p) => !input.oldPaths.includes(p))
+    .slice(0, 8);
+  const cited = new Set(
+    [
+      ...(input.completion.evidence ?? []),
+      ...(input.completion.findingResponses?.flatMap((r) => r.evidence ?? []) ?? []),
+    ].map((e) => e.path),
+  );
+  const tests = input.resolution.resolved.filter((d) => isTest(d.path));
+  const needsTests = candidates.some((p) => !input.resolution.resolved.some((d) => d.path === p));
+  const byPath = [...new Map(tests.map((d) => [d.path, d])).values()];
+  const testLocations = needsTests
+    ? byPath.sort((a, b) => Number(cited.has(b.path)) - Number(cited.has(a.path))).slice(0, 2)
+    : [];
+  return {
+    candidates,
+    testLocations,
+    readPaths: [...new Set([...candidates, ...testLocations.map((d) => d.path)])],
+    omittedTestPaths: byPath
+      .filter((d) => !testLocations.some((s) => s.path === d.path))
+      .map((d) => d.path),
+  };
+}
 export async function verifyReplanEvidence(input: {
   requested: readonly string[];
   oldPaths: readonly string[];
@@ -103,6 +159,7 @@ export async function verifyReplanEvidence(input: {
   completion: NonNullable<RunResult["phaseCompletion"]>;
   reader: ReplanEvidenceReader;
   allowed: (path: string) => boolean;
+  preparationPlan?: ReturnType<typeof replanEvidencePlan>;
 }) {
   const records: ReplanEvidenceRecord[] = [],
     rejected: { path: string; reason: string }[] = [];
@@ -128,6 +185,7 @@ export async function verifyReplanEvidence(input: {
   };
   const retainedTests = new Set<string>();
   let retainedTestBytes = 0;
+  const preparation = input.preparationPlan ?? replanEvidencePlan(input);
   for (const path of [...new Set(input.requested)].slice(0, 8)) {
     if (!graphPathAllowed(path) || !input.allowed(path) || isTest(path)) {
       rejected.push({ path, reason: "PROTECTED_OR_FORBIDDEN_PATH" });
@@ -154,11 +212,15 @@ export async function verifyReplanEvidence(input: {
       const testEvidence: NonNullable<ReplanEvidenceRecord["testEvidence"]> = [];
       let hostRegion: ReturnType<typeof candidateRegion>;
       if (!direct.length) {
-        for (const diagnostic of input.resolution.resolved.filter((d) => isTest(d.path))) {
+        for (const diagnostic of preparation.testLocations) {
           const supplied = citations.filter((c) => c.path === diagnostic.path);
           for (const citation of supplied) {
             const range = await validate(citation);
-            if (diagnostic.line >= range.start && diagnostic.line <= range.end) {
+            if (
+              input.resolution.resolved.some(
+                (d) => d.path === diagnostic.path && d.line >= range.start && d.line <= range.end,
+              )
+            ) {
               testLinks.push(diagnostic.path);
               testEvidence.push({
                 ...citation,
@@ -193,7 +255,13 @@ export async function verifyReplanEvidence(input: {
         if (!sourceQuotes.length) {
           // Current source is already SHA-verified by the shared bounded reader.
           // A public-test symbol selects a region, not a causal verdict or write permission.
-          hostRegion = candidateRegion(file.content, testEvidence.map((c) => c.quote).join("\n"));
+          hostRegion = candidateRegion(
+            file.content,
+            testEvidence.map((c) => c.quote).join("\n"),
+            [input.completion.summary, input.completion.replanRequest?.reason]
+              .filter(Boolean)
+              .join("\n"),
+          );
           if (!hostRegion)
             throw new Error(
               "IMPLEMENTATION_REGION_MISSING: cite a current relevant definition or explain its public-test relationship in a bounded Repair correction",

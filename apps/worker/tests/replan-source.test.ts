@@ -87,7 +87,7 @@ describe("versioned bounded replanning preparation", () => {
   it("reserves one shared read allowance and leaves capacity checks uncharged", () => {
     const reserve = replanOperationReserve(1, 4, true);
     expect(reserve.operations.sourceReads).toBe(8);
-    expect(reserve.downstream).toBe(22);
-    expect(reserve.total).toBe(37);
+    expect(reserve.downstream).toBe(26);
+    expect(reserve.total).toBe(39);
   });
 });

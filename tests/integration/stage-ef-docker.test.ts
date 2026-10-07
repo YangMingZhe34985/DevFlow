@@ -171,9 +171,9 @@ integration("E/F real Docker and database integration", () => {
           newText: '// Candidate wrapper retained\nexport { subtract } from "./calculator.js";',
           expectedSha256: sha('export { subtract } from "./calculator.js";\n'),
         }),
-        call("readFile", { path: "src/calculator.js" }),
+        ...(mode === "BUDGET_STOP" ? [] : [call("readFile", { path: "src/calculator.js" })]),
         ...(mode === "TEST_ONLY" ? [call("readFile", { path: "test/calculator.test.js" })] : []),
-        call("replaceText", change), // Must be rejected under the original wrapper-only approval.
+        ...(mode === "BUDGET_STOP" ? [] : [call("replaceText", change)]), // Original approval still rejects this edit.
         {
           ...call("finishPhase", {
             summary: "The public diagnostic identifies the implementation outside approval",
@@ -274,7 +274,7 @@ integration("E/F real Docker and database integration", () => {
         expect(paused.status, JSON.stringify(paused)).toBe("FAILED");
         if (paused.status !== "FAILED") throw new Error("Expected preflight stop");
         expect(paused.error.message).toContain("REPLAN_DOWNSTREAM_RESERVE_INSUFFICIENT");
-        expect(model.requests).toHaveLength(4);
+        expect(model.requests).toHaveLength(2); // Closed exploration responds directly with a scope conflict.
         expect(JSON.stringify(await database.events.list(created.id, { limit: 1000 }))).toContain(
           '"requestIssued":false',
         );

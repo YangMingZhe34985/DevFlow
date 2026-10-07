@@ -1,3 +1,4 @@
+import { ContinuationTools } from "./continuation-tools.js";
 import { repairContinuationReserve } from "./repair-reserve.js";
 import { repairDiagnosticTasks } from "./repair-tasks.js";
 import {
@@ -23,8 +24,12 @@ import {
 } from "./repair-response.js";
 import { repairModeInstructions } from "./repair-diagnostics.js";
 import { resolveRepairDiagnostics } from "./repair-diagnostics.js";
-import { ReplanEvidenceReader, verifyReplanEvidence } from "./replan-evidence.js";
-import { replanSource, replanOperationReserve } from "./replan-source.js";
+import {
+  ReplanEvidenceReader,
+  verifyReplanEvidence,
+  replanEvidencePlan,
+} from "./replan-evidence.js";
+import { replanSource } from "./replan-source.js";
 import {
   collectReviewProbes,
   emptyReviewProbeState,
@@ -983,7 +988,60 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         protectInfrastructure: benchmark !== undefined,
         protectedPaths: benchmark?.configuration.protectedPaths ?? [],
       });
+      const testCommandCache: TestCommandCache = {
+        detected: false,
+        command: undefined,
+        profile:
+          benchmark?.configuration.runtime.publicVerificationProfile ??
+          this.verificationProfileFactory?.(run),
+      };
+      const continuation = new ContinuationTools(
+        plan.approvalScope?.files.map((f) => f.path) ?? [],
+      );
       let scopeReplan: ScopeReplanState | undefined;
+      let continuationRecoveryAvailable = true;
+      const continuationReserve = () => {
+        if (scopeReplan) return { tokens: 0, steps: 0, timeMs: 0 };
+        const source = JSON.stringify(
+          [...continuation.current.values()].map((f) => ({
+            path: f.path,
+            sha256: f.contentHash,
+            content: f.content.slice(0, 3000),
+          })),
+        ).slice(0, 16000);
+        const repair = repairContinuationReserve({
+          title: run.task.title,
+          description: run.task.description,
+          plan: plan.proposal ?? plan,
+          diagnostics: [],
+          source,
+          repairOutput: this.environment.stageModels?.REPAIR?.maxOutputTokens ?? 8192,
+          reviewOutput: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048,
+          includeRepair: true,
+          reviewRecoveryAvailable: continuationRecoveryAvailable,
+        });
+        const plannerInput =
+          estimateModelInput(
+            [
+              {
+                role: "USER",
+                content: JSON.stringify({
+                  issue: run.task.description,
+                  plan: plan.proposal ?? plan,
+                  source,
+                }),
+              },
+            ],
+            [],
+          ) + 3072;
+        const plannerOutput = this.environment.stageModels?.PLANNER?.maxOutputTokens ?? 4096;
+        return {
+          tokens: repair.total + 2 * (plannerInput + plannerOutput),
+          steps: 5,
+          timeMs:
+            reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2) + 180000,
+        };
+      };
       const replanArtifact = (await this.database.artifacts.list(run.id)).findLast(
         (a) => a.name === "scope-replan-v1.json",
       );
@@ -1081,6 +1139,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         );
       };
 
+      continuationRecoveryAvailable = await remainingReviewRecovery();
       const repairEvidence = new Map<
         string,
         { version: "repair-evidence-v1"; sections: Record<string, string> }
@@ -1567,6 +1626,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           purpose: "IMPLEMENTATION",
           ...(plan.proposalVersion
             ? {
+                continuationTools: () =>
+                  scopeReplan
+                    ? 0
+                    : continuation.reserve(
+                        testCommandCache.profile?.checks.length ?? 1,
+                        !!localSnapshot,
+                      ).total,
+                continuationReserve,
+                onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: implementationLease.mandatoryDownstreamSteps,
                   downstreamTokens:
@@ -1642,13 +1710,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           );
         }
       }
-      const testCommandCache: TestCommandCache = {
-        detected: false,
-        command: undefined,
-        profile:
-          benchmark?.configuration.runtime.publicVerificationProfile ??
-          this.verificationProfileFactory?.(run),
-      };
+
       if (resumeReplan && scopeReplan?.profileSha256) {
         if (!testCommandCache.profile) {
           const discovery = await discoverPublicVerification(
@@ -1672,6 +1734,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         recordStageAttempt(metrics, "TEST");
         const testStartedAt = Date.now();
         budget.requireToolCalls("TEST", metrics);
+        continuation.current.clear(); // Public commands can invalidate prior source observations.
         const result = await this.runTests(
           run,
           activeSandbox,
@@ -1777,6 +1840,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         stableTaskContext?: string,
       ): Promise<RunResult> => {
         budget.requireAgentSteps("REPAIR");
+        continuationRecoveryAvailable = await remainingReviewRecovery();
         if (scopeReplan?.status === "RESUMED") {
           scopeReplan.repairAttempts = repairAttempt;
           scopeReplan.reviewAttempts = reviewAttempt;
@@ -1840,6 +1904,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           purpose,
           ...(plan.proposalVersion
             ? {
+                continuationTools: () =>
+                  scopeReplan
+                    ? 0
+                    : continuation.reserve(
+                        testCommandCache.profile?.checks.length ?? 1,
+                        !!localSnapshot,
+                      ).total,
+                continuationReserve,
+                onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: repairLease.mandatoryDownstreamSteps,
                   downstreamTokens: repairContinuationReserve({
@@ -1964,12 +2037,46 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             : {}),
         };
         await saveScopeReplan();
-        const toolReserve = replanOperationReserve(
-          oldPaths.length,
-          testCommandCache.profile?.checks.length ?? 1,
+        const resolution = resolveRepairDiagnostics(
+          diagnostic,
+          replanRepositoryPaths,
           !!localSnapshot,
         );
+        const preparationPlan = replanEvidencePlan({
+          requested: requestedPaths,
+          oldPaths,
+          resolution,
+          completion,
+        });
+        const preparationPaths = preparationPlan.readPaths;
+        const requiredReads = preparationPaths.filter((p) => !continuation.current.has(p)).length;
+        if (requiredReads > 8)
+          throw new DevflowError({
+            code: "EXECUTION_BUDGET_EXCEEDED",
+            message: "REPLAN_REQUIRED_READS_EXCEED_SHARED_ALLOWANCE",
+            details: { requestIssued: false, requiredReads, availableReads: 8 },
+          });
+        const toolReserve = continuation.reserve(
+          testCommandCache.profile?.checks.length ?? 1,
+          !!localSnapshot,
+          preparationPaths,
+        );
+
         const remainingTools = budget.remainingToolCalls(metrics);
+        const navigationReads = Math.min(
+          2,
+          8 - requiredReads,
+          Math.max(0, remainingTools - toolReserve.total),
+        );
+        toolReserve.operations.sourceReads += navigationReads;
+        toolReserve.total += navigationReads;
+        Object.assign(scopeReplan.preparation!, {
+          readLimit: requiredReads + navigationReads,
+          plannedReadPaths: preparationPaths,
+          omittedTestPaths: preparationPlan.omittedTestPaths,
+          navigationReadAllowance: navigationReads,
+        });
+        await saveScopeReplan();
         await this.database.events.append({
           runId: run.id,
           type: "WORKFLOW_CHECKPOINT",
@@ -1981,6 +2088,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               remainingToolCalls: remainingTools,
               requiredToolCalls: toolReserve.total,
               operations: toolReserve.operations,
+              preparationPaths,
+              omittedTestPaths: preparationPlan.omittedTestPaths,
+              navigationReads,
               missing: Math.max(0, toolReserve.total - remainingTools),
             },
           }),
@@ -2071,11 +2181,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             await saveScopeReplan();
           },
         );
-        const resolution = resolveRepairDiagnostics(
-          diagnostic,
-          replanRepositoryPaths,
-          localSnapshot !== undefined,
-        );
+        for (const [path, file] of continuation.current) evidenceReader.files.set(path, file);
         const verifyAdmission = () =>
           verifyReplanEvidence({
             requested:
@@ -2085,6 +2191,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             oldPaths,
             failure,
             resolution,
+            preparationPlan,
             completion,
             reader: evidenceReader,
             allowed: (path) =>
@@ -2126,9 +2233,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               content,
               metadata: { visibility: "HOST_ONLY" },
             });
-            for (const diagnostic of resolution.resolved.slice(0, 8)) {
-              if (!evidenceReader.files.has(diagnostic.path))
-                await evidenceReader.read(diagnostic.path);
+            for (const path of preparationPaths) {
+              if (!evidenceReader.files.has(path)) await evidenceReader.read(path);
             }
             let sourceBytes = 0;
             const sources: WorkingCode[] = [];
@@ -4007,6 +4113,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     workspaceRevision?: number;
     executionPacket?: ExecutionPacket;
     packetSourceBytes?: number;
+    continuationTools?: () => number;
+    continuationReserve?: () => { tokens: number; steps: number; timeMs: number };
+    onToolObservation?: (name: string, result: ToolExecutionResult) => void;
     convergenceReserve?: {
       downstreamSteps: number;
       downstreamTokens: number;
@@ -4315,6 +4424,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         maxRetries: this.environment.DEVFLOW_MAX_RETRIES,
         executionBudget: input.executionBudget,
         ...(input.convergenceReserve ? { convergenceReserve: input.convergenceReserve } : {}),
+        ...(input.continuationTools ? { continuationTools: input.continuationTools } : {}),
+        ...(input.continuationReserve ? { continuationReserve: input.continuationReserve } : {}),
         emitRunLifecycle: false,
         traceEfficiency: trace !== undefined,
         deduplicateContext: actionEnabled,
@@ -4840,6 +4951,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 execute,
               })
             : await execute();
+          input.onToolObservation?.(request.name, result);
           const isMutation = ["writeFile", "replaceText", "applyPatch", "runCommand"].includes(
             request.name,
           );

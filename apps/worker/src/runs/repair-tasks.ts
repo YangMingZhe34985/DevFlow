@@ -75,7 +75,7 @@ export function sourceEvidenceRecord(source: WorkingCode, artifactSha256?: strin
 }
 
 /** Select a bounded observed implementation region; lexical overlap is a hypothesis, never causal proof. */
-export function candidateRegion(content: string, publicEvidence: string) {
+export function candidateRegion(content: string, publicEvidence: string, hypothesis?: string) {
   const ignored = new Set([
     "if",
     "for",
@@ -97,13 +97,27 @@ export function candidateRegion(content: string, publicEvidence: string) {
     ),
   ];
   const lines = content.split("\n");
-  const index = lines.findIndex((line) =>
+  let selection: "PUBLIC_SYMBOL_OVERLAP" | "MODEL_SYMBOL_HINT" = "PUBLIC_SYMBOL_OVERLAP";
+  let index = lines.findIndex((line) =>
     names.some((name) => new RegExp(`\\b${name}\\s*\\(`, "u").test(line)),
   );
+  if (index < 0 && hypothesis) {
+    // A model-mentioned name may select a real declaration for read-only planning.
+    // It is not a supplied quote, a confirmed call edge, or authority to edit.
+    index = lines.findIndex((line) => {
+      const name = /\b(?:function|def)\s+([A-Za-z_]\w*)\s*\(/u.exec(line)?.[1];
+      return (
+        name !== undefined &&
+        !ignored.has(name) &&
+        new RegExp(`\\b${name}\\b`, "u").test(hypothesis)
+      );
+    });
+    selection = "MODEL_SYMBOL_HINT";
+  }
   if (index < 0) return undefined;
   const startLine = Math.max(1, index - 8 + 1),
     endLine = Math.min(lines.length, index + 72);
   const quote = lines.slice(startLine - 1, endLine).join("\n");
   if (Buffer.byteLength(quote) > 8192) return undefined;
-  return { startLine, endLine, quote, selection: "PUBLIC_SYMBOL_OVERLAP" as const };
+  return { startLine, endLine, quote, selection };
 }

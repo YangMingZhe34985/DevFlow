@@ -16,6 +16,10 @@ export const ScopeReplanStateSchema = z.object({
       reads: z.number().int().nonnegative(),
       sourceBytes: z.number().int().nonnegative(),
       cacheHits: z.number().int().nonnegative(),
+      readLimit: z.number().int().min(0).max(8).optional(),
+      plannedReadPaths: z.array(z.string()).optional(),
+      omittedTestPaths: z.array(z.string()).optional(),
+      navigationReadAllowance: z.number().int().min(0).max(2).optional(),
       metadataOperations: z.number().int().nonnegative().optional(),
       metadataCacheHits: z.number().int().nonnegative().optional(),
       downstreamToolReserve: z.number().int().nonnegative().optional(),
@@ -32,7 +36,7 @@ export const ScopeReplanStateSchema = z.object({
             startLine: z.number().int().positive(),
             endLine: z.number().int().positive(),
             quote: z.string(),
-            selection: z.literal("PUBLIC_SYMBOL_OVERLAP"),
+            selection: z.enum(["PUBLIC_SYMBOL_OVERLAP", "MODEL_SYMBOL_HINT"]),
           })
           .optional(),
         testEvidence: z
@@ -138,18 +142,21 @@ export async function captureReplanCandidate(input: {
   if (status.exitCode !== 0 || status.timedOut || status.outputTruncated)
     throw new Error("REPLAN_STATUS_INCOMPLETE");
   const records = status.stdout.split("\0").filter(Boolean);
+  const changedPaths = new Set<string>();
   // Every current untracked path is expanded; a directory prefix cannot conceal extra writes.
   for (let i = 0; i < records.length; i++) {
     const record = records[i]!;
     if (record.startsWith("## ")) continue;
     const paths = [record.slice(3)];
     if (/^[RC]|^.[RC]/u.test(record) && records[i + 1]) paths.push(records[++i]!);
-    for (const path of paths)
+    for (const path of paths) {
       if (!input.paths.includes(path)) throw new Error(`REPLAN_UNAPPROVED_CANDIDATE:${path}`);
+      changedPaths.add(path);
+    }
   }
   const files: ScopeReplanState["files"] = [];
   let bytes = 0;
-  for (const path of [...new Set(input.paths)]) {
+  for (const path of changedPaths) {
     if (!graphPathAllowed(path)) throw new Error("REPLAN_INVALID_CANDIDATE_PATH");
     input.beforeRead();
     const baseline = await input.sandbox.exec(
@@ -205,6 +212,18 @@ export async function restoreReplanCandidate(input: {
   input.beforeRead();
   if ((await git.head(sandbox, signal)) !== state.baseCommitSha)
     throw new Error("REPLAN_RESTORE_BASE_MISMATCH");
+  input.beforeRead();
+  const clean = await sandbox.exec(
+    {
+      program: "git",
+      args: ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      timeoutMs: 20000,
+      maxOutputBytes: 500000,
+    },
+    signal,
+  );
+  if (clean.exitCode !== 0 || clean.timedOut || clean.outputTruncated || clean.stdout.trim())
+    throw new Error("REPLAN_RESTORE_WORKSPACE_NOT_CLEAN");
   if (
     state.patchSha256 !==
     sha256(canonicalJson(state.files.map((f) => [f.path, f.baselineSha256, f.currentSha256])))

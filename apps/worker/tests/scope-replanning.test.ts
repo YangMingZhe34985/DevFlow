@@ -27,7 +27,11 @@ function fixture(current: Record<string, string>, baseline: Record<string, strin
     let stdout = "a".repeat(40),
       stderr = "",
       exitCode = 0;
-    if (input.args[0] === "status") stdout = "## main\0";
+    if (input.args[0] === "status")
+      stdout = [...new Set([...Object.keys(current), ...Object.keys(baseline)])]
+        .filter((p) => current[p] !== baseline[p])
+        .map((p) => `${p in current ? (p in baseline ? " M" : "??") : " D"} ${p}\0`)
+        .join("");
     if (input.args[0] === "show") {
       const path = input.args[1].slice(41);
       if (path in baseline) stdout = baseline[path]!;

@@ -89,16 +89,23 @@ export function replanOperationReserve(
   oldPaths: number,
   publicChecks: number,
   knownManifest: boolean,
+  actual?: {
+    changedPaths: number;
+    sourceReads: number;
+    candidatePaths: number;
+    cachedReads?: number;
+  },
 ) {
+  const changed = actual?.changedPaths ?? oldPaths;
   const operations = {
-    sourceReads: 8,
-    metadata: knownManifest ? 2 : 8,
-    checkpoint: 3 + 2 * oldPaths,
-    checkpointRestore: 2 + 2 * oldPaths,
-    repairContext: 2 + Math.min(8, oldPaths + 2),
+    sourceReads: Math.min(8, Math.max(0, (actual?.sourceReads ?? 8) - (actual?.cachedReads ?? 0))),
+    metadata: knownManifest ? 0 : Math.min(8, actual?.candidatePaths ?? 8),
+    checkpoint: 3 + 2 * changed,
+    checkpointRestore: 2 + 3 * changed,
+    repairContext: 2 + Math.min(8, actual?.candidatePaths ?? oldPaths + 2),
     editCorrectionFinish: 3,
-    publicChecks: Math.max(1, publicChecks),
-    reviewReads: 6,
+    publicChecks: 1 + Math.max(1, publicChecks),
+    reviewReads: 8, // diff, bounded six source reads, final candidate capture
   };
   const downstream =
     operations.checkpointRestore +

@@ -25,6 +25,34 @@ function source(files: Record<string, string>): IndexSource {
 const graph = (s: IndexSource) =>
   new RepositoryRelationGraph({ repositoryId: "repo", baseCommitSha: "a".repeat(40), source: s });
 describe("versioned repository relations", () => {
+  it("resolves captured solution-reference aliases and rejects conflicting referenced targets", async () => {
+    const files = {
+      "tsconfig.json": JSON.stringify({
+        files: [],
+        references: [{ path: "./tsconfig.app.json" }, { path: "./tsconfig.test.json" }],
+      }),
+      "tsconfig.app.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["./src/*"] } } }),
+      "tsconfig.test.json": JSON.stringify({ compilerOptions: { paths: { "@/*": ["./src/*"] } } }),
+      "tests/check.test.ts": "import { value } from '@/value'; expect(value).toBe(1);",
+      "src/value.ts": "export const value = 0;",
+      "other/value.ts": "export const value = 2;",
+    };
+    const g = graph(source(files));
+    await g.inspect(["tests/check.test.ts"], signal, false);
+    expect(g.snapshot().edges).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ to: "src/value.ts", resolution: "RESOLVED" }),
+      ]),
+    );
+    files["tsconfig.test.json"] = JSON.stringify({
+      compilerOptions: { paths: { "@/*": ["./other/*"] } },
+    });
+    const conflict = graph(source(files));
+    await conflict.inspect(["tests/check.test.ts"], signal, false);
+    expect(conflict.snapshot().edges).toEqual(
+      expect.arrayContaining([expect.objectContaining({ to: null, resolution: "UNRESOLVED" })]),
+    );
+  });
   it("reports AST and partial lexical coverage separately without calling the graph complete", async () => {
     const g = graph(
       source({

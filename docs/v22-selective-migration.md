@@ -12,7 +12,7 @@ Validation: 585 Worker/Agent tests passed, one skipped. Docker 8/8 passed, cover
 
 Historical late E07 preparation remains underfunded; the fix is advance reservation, not forced admission. Each completed batch is a separate commit. Private inputs, raw requests, bills and prior results remain ignored. New fields are optional; Planner proposals and permissions are unchanged.
 
-## Batch 2: rejected before paid validation
+## Earlier batch 2 candidate: rejected before paid validation
 
 The selected navigation and alias changes passed 66 component regressions, but the original-Issue free preparation replay did not pass the joint-evidence gate. E07 exposed the regression assertions and condition/draft paths while missing the crucial validation lookup body. E10 exposed the assertions and support fixtures, but lacked the required production and consumer evidence together. A bounded vocabulary-ranking experiment moved reads toward other state/storage helpers and still failed the gate. These are preparation-boundary results, not successful full Worker localization or repair tests.
 
@@ -20,6 +20,16 @@ The complete uncommitted batch-2 candidate, patch and replay results were preser
 
 Batch 3 has not started because the preceding gate failed. The v2.2 Localization input/stage-budget limitations therefore remain present and explicitly unresolved. E07/E10 paid tests were not started; no new HTTP model requests or fees were incurred. Conservative occupancy remains CNY 123.504452 of 150, with inherited uncertain occupancy retained.
 
-## Current accepted branch
+## Earlier accepted checkpoint
 
 Only batch 1 is accepted. Final checks on that branch passed lint, typecheck and 773 tests (29 skipped); Docker passed 8/8. The original working tree's 418 source/document files were hash-verified unchanged, and 79,260 private-material file entries were inventoried in place. Both the original snapshot and the rejected migration are recoverable. No publication or push occurred; version remains 2.2.0. Full E07/E10 repair success and overall capability preservation have not been established.
+
+## Local main adoption and replacement batch 2 (2026-10-08)
+
+The pre-migration tracked working state is committed as `89f78e4` on `codex/pre-v22-migration-20261008`. The normal local checkout now uses `main`, which merged the accepted migration checkpoint as `727f102`; ignored credentials, datasets, snapshots and ledgers remain in place. No force reset or remote push was used.
+
+The replacement batch fixes public-test fallback ordering, referenced tsconfig aliases, named exports before unrelated star branches, type-only import filtering, observed receiver navigation, and local-helper window merging. Earlier valid source records (including assertions) reach Planner and its existing single discovery. Full SHA is checked across preparation revisions; a revision counter change alone no longer discards identical evidence. Projection keeps complete lines under the total budget, with omitted evidence remaining unknown. No new investigation stage or write authority is introduced.
+
+Original public materials now produce the E07 regression assertions plus validation lookup, condition evaluation and draft codec in one request. E10 includes the regression assertions, condition-result producer and query consumer; one existing discovery, selected from observed receiver evidence, reaches the summary builder while retaining assertions and producer evidence. This does not establish complete localization of every persistence/event path. The replay supplies no expected consumer paths as navigation inputs. Two actual Worker request-construction replays also passed with controlled responses; these prove orchestration, not real-model decisions.
+
+Validation: full lint/typecheck and 779 tests passed (29 skipped), plus the new SHA/revision handoff regression; Docker 8/8 passed. Raw requests, source matrices and replay scripts remain private. Batch 3 and frozen paid E07/E10 verification are still pending at this checkpoint. New fees: CNY 0.

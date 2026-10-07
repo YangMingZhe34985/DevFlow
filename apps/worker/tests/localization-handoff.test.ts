@@ -44,6 +44,53 @@ const decision = {
 };
 
 describe("implementation evidence handoff", () => {
+  it("revalidates the full SHA across a preparation revision and drops changed evidence", async () => {
+    const { source, content } = fixture();
+    const evidence = await new IssueLocalizer().retrieve({
+      ...base,
+      source,
+      accessScope: "test",
+      runId: "r",
+      workspaceRevision: 0,
+      description: base.title,
+    });
+    const localization = await new IssueLocalizationAgent().run({
+      ...base,
+      source,
+      evidence,
+      model: new FakeLanguageModel([
+        fakeModelResponse({ text: JSON.stringify(decision), toolCalls: [] }),
+      ]),
+      maxTokens: 18000,
+      buildGraph: true,
+      retrieve: async () => undefined,
+    });
+    const ready = await new PlanAgent().prepare({
+      ...base,
+      source,
+      localizationEvidence: localization,
+      workspaceRevision: 1,
+    });
+    expect(ready.attempt.serializedFinalRequest).toContain("return value - 1");
+    expect(ready.attempt.evidenceRefs.every((row) => row.workspaceRevision === 1)).toBe(true);
+    const changed = content.replace("return value - 1", "return value");
+    const stale = await new PlanAgent().prepare({
+      ...base,
+      workspaceRevision: 1,
+      localizationEvidence: localization,
+      source: {
+        ...source,
+        lookup: async () => ({
+          path: "src/critical.ts",
+          kind: "FILE",
+          sizeBytes: Buffer.byteLength(changed),
+          contentHash: hash(changed),
+        }),
+      },
+    });
+    expect(stale.attempt.serializedFinalRequest).not.toContain("return value - 1");
+    expect(stale.attempt.diagnostics.some((d) => d.code === "PLAN_STALE_EVIDENCE")).toBe(true);
+  });
   it("keeps implementation after 1600 characters in Localization and the actual Planner request, even without model-selected candidates", async () => {
     const { source, read, content } = fixture();
     const evidence = await new IssueLocalizer().retrieve({

@@ -30,6 +30,14 @@ export interface ImplementationWindow {
 }
 export interface NavigationResult {
   windows: ImplementationWindow[];
+  relations?: {
+    from: string;
+    to: string;
+    sourceHash: string;
+    targetHash: string | null;
+    kind: string;
+    line: number;
+  }[];
   missing: string[];
   observations: string[];
   metrics: {
@@ -100,6 +108,11 @@ export async function navigateImplementation(input: {
   maxSnippetBytes?: number;
   maxWindows?: number;
   maxLines?: number;
+  /** Planner follow-up: explicit requested files take precedence over another speculative hop. */
+  prioritizeCandidates?: boolean;
+  behaviorNavigation?: boolean;
+  /** SHA-verified earlier projection; reuse behavior names without rereading assertions. */
+  observedWindows?: readonly { path: string; snippet: string }[];
   onFile?(path: string, content: string): Promise<void>;
 }): Promise<NavigationResult> {
   const result: NavigationResult = {
@@ -149,6 +162,13 @@ export async function navigateImplementation(input: {
   await graph.inspect([], signal, false);
   const initialEdges = graph.snapshot().edges.length;
   const contentCache = new Map<string, { content: string; digest: string }>();
+  const requested = new Set(
+    input.prioritizeCandidates
+      ? (input.candidates ?? []).map((c) => c.path).filter((p) => entries.has(p))
+      : [],
+  );
+  const pendingRequested = () =>
+    [...requested].filter((p) => !result.windows.some((w) => w.path === p));
   const queue: {
     path: string;
     names: string[];
@@ -157,6 +177,17 @@ export async function navigateImplementation(input: {
     reason: string;
   }[] = [];
   const seen = new Set<string>();
+  const publicMembers = new Set<string>();
+  for (const row of input.observedWindows ?? []) {
+    if (
+      !/\.(?:test|spec)\.[^.]+$/u.test(row.path) &&
+      !(input.candidates ?? []).some((c) => c.path === row.path)
+    )
+      continue;
+    for (const match of row.snippet.matchAll(/\b(?:this\.)?([#\w$]+)\.([\w$]+)\s*\(/gu))
+      if (!/^(?:expect|assert|console|Object|JSON|Array)$/u.test(match[1]!))
+        publicMembers.add(match[2]!);
+  }
   const basePriority = (path: string) =>
     sourcePathPriority(path, signals) +
     ((entries.get(path)?.sizeBytes ?? 0) > 64 * 1024 && sourceRole(path) === "IMPLEMENTATION"
@@ -248,6 +279,31 @@ export async function navigateImplementation(input: {
     }
   }
   for (const path of signals.paths) enqueue(path, names, 40, 0, "Public Issue path");
+  if (
+    (input.behaviorNavigation || input.prioritizeCandidates) &&
+    ![...(input.candidates ?? []), ...(input.observedWindows ?? [])].some((c) =>
+      /\.(?:test|spec)\.[^.]+$/u.test(c.path),
+    )
+  ) {
+    const tests = [...entries.keys()]
+      .filter(
+        (p) =>
+          sourceRole(p) === "TEST" &&
+          (/(?:^|\/)regression\//u.test(p) ||
+            issueSearchTerms(signals).some(
+              (t) => t.length > 3 && p.toLowerCase().includes(t.toLowerCase()),
+            )),
+      )
+      .sort(
+        (a, b) =>
+          Number(/(?:^|\/)regression\//u.test(b)) - Number(/(?:^|\/)regression\//u.test(a)) ||
+          basePriority(b) - basePriority(a) ||
+          a.localeCompare(b),
+      )
+      .slice(0, 1);
+    for (const path of tests)
+      enqueue(path, names, 45, 0, "Public behavior test candidate; relation unverified");
+  }
   // Repository-wide path/role recall remains bounded and is never an allowlist.
   if (names.length)
     for (const path of [...entries.keys()]
@@ -271,12 +327,47 @@ export async function navigateImplementation(input: {
     parser: "AST" | "LEXICAL_STATIC" = "AST",
     forwarding = false,
   ) => {
+    // Merge nearby units before spending another window. A local declaration
+    // already inside a displayed function is not another useful evidence unit.
+    const neighbour = result.windows.find(
+      (w) =>
+        w.path === path &&
+        w.contentHash === file.digest &&
+        w.kind === kind &&
+        Math.max(w.endLine, end) - Math.min(w.startLine, start) < limits.lines &&
+        start <= w.endLine + 8 &&
+        end >= w.startLine - 8,
+    );
+    if (neighbour) {
+      const first = Math.min(neighbour.startLine, start);
+      const last = Math.max(neighbour.endLine, end);
+      const snippet = file.content
+        .split(/\r?\n/u)
+        .slice(first - 1, last)
+        .join("\n");
+      const delta = Buffer.byteLength(snippet) - Buffer.byteLength(neighbour.snippet);
+      if (result.metrics.snippetBytes + delta <= limits.snippets) {
+        Object.assign(neighbour, { startLine: first, endLine: last, snippet });
+        result.metrics.snippetBytes += delta;
+        return;
+      }
+    }
     if (result.windows.length >= limits.windows) return;
+    const pendingOthers = pendingRequested().filter((p) => p !== path).length;
+    if (
+      requested.size &&
+      result.windows.some((w) => w.path === path) &&
+      limits.windows - result.windows.length <= pendingOthers
+    )
+      return;
     const lines = file.content.split(/\r?\n/u);
     const startLine = Math.max(1, start),
       last = Math.min(lines.length, end, startLine + limits.lines - 1);
     const selected: string[] = [];
-    const remaining = Math.min(4096, limits.snippets - result.metrics.snippetBytes);
+    const remaining = Math.max(
+      0,
+      limits.snippets - result.metrics.snippetBytes - pendingOthers * 128,
+    );
     for (let line = startLine; line <= last; line++) {
       const next = [...selected, lines[line - 1]!].join("\n");
       if (Buffer.byteLength(next) > remaining) break;
@@ -340,7 +431,10 @@ export async function navigateImplementation(input: {
         ),
     );
     const priority = (item: (typeof queue)[number]) =>
-      item.priority -
+      item.priority +
+      (/\.(?:test|spec)\.[^.]+$/u.test(item.path) ? 1100 : 0) +
+      (item.reason.startsWith("Public test dependency") ? 1200 - item.depth * 120 : 0) +
+      (requested.has(item.path) && !contentCache.has(item.path) ? 1000 : 0) -
       (staticSourceLanguage(item.path) &&
       result.windows.filter((w) => w.path === item.path).length >= 3 &&
       (input.candidates ?? []).some(
@@ -363,6 +457,7 @@ export async function navigateImplementation(input: {
       );
     if (
       focus.length &&
+      !pendingRequested().length &&
       focus.every(observedName) &&
       !queue.some(
         (q) =>
@@ -373,7 +468,12 @@ export async function navigateImplementation(input: {
       result.metrics.exitReason = "EVIDENCE_FOUND";
       break;
     }
-    if (result.windows.some((w) => w.kind === "IMPLEMENTATION") && queue[0]!.priority < 35) {
+    if (
+      !input.prioritizeCandidates &&
+      !pendingRequested().length &&
+      result.windows.some((w) => w.kind === "IMPLEMENTATION") &&
+      priority(queue[0]!) < 35
+    ) {
       result.metrics.exitReason = "EVIDENCE_FOUND";
       break;
     }
@@ -599,6 +699,17 @@ export async function navigateImplementation(input: {
       result.observations.push(
         `${item.path}: ${unit.language} ${unit.parser} PARTIAL; ${unit.unknown.slice(0, 2).join(" ")}`,
       );
+      if (requested.has(item.path) && !result.windows.some((w) => w.path === item.path))
+        addWindow(
+          item.path,
+          file,
+          1,
+          Math.min(lines.length, limits.lines),
+          null,
+          "REFERENCE",
+          "Explicit follow-up file; observed text only, no verified behavioral definition.",
+          "LEXICAL_STATIC",
+        );
       continue;
     }
     const parsed = node?.parse;
@@ -617,7 +728,9 @@ export async function navigateImplementation(input: {
       ]),
     ];
     const desired = item.depth ? resolvedNames : [...new Set([...focus, ...candidateNames])];
-    const definitions = parsed.symbols
+    if (item.reason.startsWith("Public test dependency") || requested.has(item.path))
+      desired.push(...publicMembers);
+    let definitions = parsed.symbols
       .filter(
         (s) =>
           s.implementation &&
@@ -632,9 +745,36 @@ export async function navigateImplementation(input: {
           );
         return score(b) - score(a) || a.startLine - b.startLine;
       });
-    const before = result.windows.length;
     const lines = file.content.split(/\r?\n/u);
-    for (const definition of definitions.slice(0, 2)) {
+    if (!definitions.length && requested.has(item.path)) {
+      const relevance = (s: RelationParse["symbols"][number]) => {
+        const body = lines
+          .slice(s.startLine - 1, s.endLine)
+          .join("\n")
+          .toLowerCase();
+        return evidenceTerms.filter((t) => body.includes(t.toLowerCase())).length;
+      };
+      definitions = parsed.symbols
+        .filter((s) => s.implementation && s.kind !== "CLASS" && relevance(s) > 0)
+        .sort((a, b) => relevance(b) - relevance(a) || a.startLine - b.startLine);
+    }
+    const assertionFile =
+      /\.(?:test|spec)\.[^.]+$/u.test(item.path) && lines.length <= limits.lines;
+    if (assertionFile)
+      addWindow(
+        item.path,
+        file,
+        1,
+        lines.length,
+        null,
+        "REFERENCE",
+        "Public test assertions and imports; expectations must be checked against the Issue.",
+      );
+    const methods = definitions.filter((d) => d.kind === "METHOD");
+    if (methods.length) definitions = methods;
+    for (const definition of assertionFile
+      ? []
+      : definitions.slice(0, methods.length ? limits.windows : 2)) {
       addWindow(
         item.path,
         file,
@@ -642,7 +782,7 @@ export async function navigateImplementation(input: {
         definition.endLine,
         definition.name,
         implementationKind(item.path),
-        `Observed AST ${definition.kind ?? "definition"}; static name relevance only, root cause unverified.`,
+        `Observed AST ${definition.kind ?? "definition"}; ${item.reason}; static relevance only, root cause unverified.`,
       );
       if (definition.endLine - definition.startLine > limits.lines) {
         const hits = lines
@@ -667,8 +807,33 @@ export async function navigateImplementation(input: {
           );
       }
     }
+    // Establish the displayed fallback BEFORE deriving calls/imports from it. Public
+    // tests commonly have no named AST definition but contain the best entry points.
+    if (
+      (requested.has(item.path) || sourceRole(item.path) === "TEST") &&
+      !result.windows.some((w) => w.path === item.path)
+    ) {
+      const hit =
+        sourceRole(item.path) === "TEST" && lines.length > limits.lines
+          ? lines.findIndex(
+              (line) =>
+                !/^\s*(?:\/\/|import\b)/u.test(line) &&
+                resolvedNames.some((name) => line.includes(name)),
+            )
+          : -1;
+      const start = hit < 0 ? 1 : Math.max(1, hit - 8);
+      addWindow(
+        item.path,
+        file,
+        start,
+        Math.min(lines.length, start + limits.lines - 1),
+        null,
+        "REFERENCE",
+        "Public source entry observed; resolved imports guide investigation, not write authority.",
+      );
+    }
     const observed = result.windows
-      .slice(before)
+      .filter((w) => w.path === item.path)
       .map((w) => w.snippet)
       .join("\n");
     const localCalls = [
@@ -676,14 +841,51 @@ export async function navigateImplementation(input: {
     ]
       .map((m) => m[1] ?? m[2]!)
       .filter((n) => !lexicalCommon.has(n));
+    if (assertionFile) {
+      for (const match of observed.matchAll(/\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/gu)) {
+        // Assertion library members are expectations, not repository entry points.
+        if (!/^(?:expect|assert|console|Object|JSON|Array)$/u.test(match[1]!))
+          publicMembers.add(match[2]!);
+      }
+    }
+    const receiverTypes = new Set<string>();
+    if (item.reason.startsWith("Public test dependency") || requested.has(item.path)) {
+      for (const call of observed.matchAll(/this\.([#\w$]+)\.([\w$]+)\s*\(/gu)) {
+        publicMembers.add(call[2]!);
+        const receiver = call[1]!.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+        const declaration = file.content.match(
+          new RegExp(`${receiver}\\s*(?:[!?]?\\s*:\\s*|=\\s*new\\s+)([\\w$]+)`, "u"),
+        );
+        if (declaration) receiverTypes.add(declaration[1]!);
+      }
+    }
     const helper = parsed.symbols.find(
       (s) =>
         s.implementation &&
-        (s.kind === "FUNCTION" || s.kind === "METHOD" || s.kind === "CLASS") &&
-        localCalls.includes(s.name) &&
-        !definitions.includes(s),
+        (s.kind === "FUNCTION" ||
+          s.kind === "METHOD" ||
+          s.kind === "CLASS" ||
+          s.kind === "VARIABLE") &&
+        (localCalls.includes(s.name) ||
+          (s.kind === "VARIABLE" &&
+            new RegExp(
+              `(?:^|[^\\w$])${s.name.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?=[^\\w$]|$)`,
+              "u",
+            ).test(observed))) &&
+        !definitions.includes(s) &&
+        !parsed.symbols.some(
+          (owner) =>
+            owner !== s &&
+            owner.implementation &&
+            owner.startLine <= s.startLine &&
+            owner.endLine >= s.endLine &&
+            (owner.startLine < s.startLine || owner.endLine > s.endLine),
+        ) &&
+        !result.windows.some(
+          (w) => w.path === item.path && w.startLine <= s.startLine && w.endLine >= s.endLine,
+        ),
     );
-    if (helper && result.windows.length - before < 2)
+    if (helper)
       addWindow(
         item.path,
         file,
@@ -694,11 +896,12 @@ export async function navigateImplementation(input: {
         "Observed call to a local helper; behavior remains a hypothesis.",
       );
     for (const dependency of parsed.imports.filter(
-      (e) => e.resolution === "RESOLVED" && e.resolvedPath,
+      (e) => e.resolution === "RESOLVED" && e.resolvedPath && !e.typeOnly,
     )) {
       const wanted: string[] = [];
       let namedForwarding = false;
       for (const binding of dependency.bindings) {
+        if (binding.typeOnly) continue;
         if (binding.imported === "*")
           wanted.push(
             ...[
@@ -712,6 +915,7 @@ export async function navigateImplementation(input: {
           );
         else if (
           item.names.includes(binding.local) ||
+          receiverTypes.has(binding.local) ||
           localCalls.includes(binding.local) ||
           new RegExp(
             `(?:^|[^\\w$])${binding.local.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?=[^\\w$]|$)`,
@@ -722,7 +926,15 @@ export async function navigateImplementation(input: {
         if (wanted.length) namedForwarding = true;
       }
       for (const exported of parsed.exports.filter((e) => e.specifier === dependency.specifier)) {
-        if (exported.name === "*" && exported.local === null) wanted.push(...item.names);
+        if (exported.name === "*" && exported.local === null)
+          wanted.push(
+            ...item.names.filter(
+              (name) =>
+                !parsed.exports.some(
+                  (e) => e.name === name && e.specifier !== dependency.specifier,
+                ),
+            ),
+          );
         else if (item.names.includes(exported.name) && exported.local) {
           wanted.push(exported.local);
           namedForwarding = true;
@@ -732,21 +944,170 @@ export async function navigateImplementation(input: {
         enqueue(
           dependency.resolvedPath!,
           wanted,
-          namedForwarding ? 45 : 35,
+          dependency.bindings.some((b) => receiverTypes.has(b.local))
+            ? 75
+            : namedForwarding
+              ? 45
+              : 35,
           item.depth + 1,
-          `Observed ${namedForwarding ? "symbol forwarding" : "star export"} from ${item.path}:${dependency.line}`,
+          sourceRole(item.path) === "TEST" || item.reason.startsWith("Public test dependency")
+            ? `Public test dependency from ${item.path}:${dependency.line}`
+            : `Observed ${namedForwarding ? "symbol forwarding" : "star export"} from ${item.path}:${dependency.line}`,
         );
     }
+    if (requested.has(item.path) && !result.windows.some((w) => w.path === item.path))
+      addWindow(
+        item.path,
+        file,
+        1,
+        Math.min(lines.length, limits.lines),
+        null,
+        "REFERENCE",
+        "Explicit requested entry/declaration observed; follow resolved dependencies for implementation.",
+      );
     if (!definitions.length && !parsed.exports.length)
       result.observations.push(
         `No implementation for requested symbols in ${item.path}; another branch remains eligible.`,
       );
   }
+  // A definition alone does not establish the behavior of its consumers.
+  // Prefer observed reverse edges; a small lexical search is only a hypothesis.
+  const anchors = result.windows.filter((w) => w.kind === "IMPLEMENTATION" && w.symbol).slice(0, 4);
+  const anchorPaths = new Set(anchors.map((w) => w.path));
+  const incoming = graph
+    .snapshot()
+    .edges.filter(
+      (e) =>
+        !e.stale &&
+        e.resolution === "RESOLVED" &&
+        e.to &&
+        anchorPaths.has(e.to) &&
+        !anchorPaths.has(e.from),
+    );
+  const consumerPaths = [
+    ...new Set([
+      ...incoming.map((e) => e.from),
+      ...[...entries.keys()]
+        .filter(
+          (p) =>
+            codePath(p) &&
+            !anchorPaths.has(p) &&
+            !graph
+              .snapshot()
+              .edges.some(
+                (e) => !e.stale && e.kind === "REEXPORT" && e.to === p && !anchorPaths.has(e.to),
+              ) &&
+            sourceRole(p) === "IMPLEMENTATION" &&
+            (anchors.some((a) => posix.dirname(a.path) === posix.dirname(p)) ||
+              issueSearchTerms(signals).some(
+                (t) =>
+                  t.length > 3 &&
+                  !lexicalCommon.has(t) &&
+                  p.toLowerCase().includes(t.toLowerCase()),
+              )),
+        )
+        .sort((a, b) => basePriority(b) - basePriority(a) || a.localeCompare(b))
+        .slice(0, 4),
+    ]),
+  ];
+  let consumerReads = 0;
+  for (const path of consumerPaths) {
+    if (!anchors.length || consumerReads >= 2) break;
+    let current = contentCache.get(path);
+    const entry = entries.get(path);
+    if (!entry) continue;
+    if (!current) {
+      if (
+        result.metrics.reads >= limits.reads ||
+        entry.sizeBytes > 512 * 1024 ||
+        result.metrics.sourceBytes + entry.sizeBytes > limits.bytes
+      )
+        break;
+      const read = await input.source.read(path, signal);
+      consumerReads++;
+      result.metrics.reads++;
+      result.metrics.sourceBytes += Buffer.byteLength(read.content);
+      if (
+        read.truncated ||
+        read.content.includes("\0") ||
+        Buffer.byteLength(read.content) > 512 * 1024 ||
+        result.metrics.sourceBytes > limits.bytes ||
+        (entry.contentHash && entry.contentHash !== hash(read.content))
+      )
+        continue;
+      current = { content: read.content, digest: hash(read.content) };
+      contentCache.set(path, current);
+      await graph.observe(path, read.content, signal);
+      await input.onFile?.(path, read.content);
+    }
+    const consumer = graph
+      .snapshot()
+      .files.find((f) => f.path === path && f.sha256 === current!.digest);
+    const hasImportRelation =
+      consumer?.parse?.imports.some((e) => e.resolvedPath && anchorPaths.has(e.resolvedPath)) ??
+      false;
+    if (consumer?.parse?.status === "PARSED" && !hasImportRelation) continue;
+    const aliases =
+      consumer?.parse?.imports
+        .filter((e) => e.resolvedPath && anchorPaths.has(e.resolvedPath))
+        .flatMap((e) => e.bindings.map((b) => b.local)) ?? [];
+    const terms = [...anchors.map((a) => a.symbol!), ...aliases];
+    const lines = current.content.split("\n");
+    const hit = lines.findIndex(
+      (line) =>
+        !/^\s*(?:import|export\s+.*from)\b/u.test(line) &&
+        terms.some((t) =>
+          new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}\\b`, "u").test(line),
+        ),
+    );
+    if (hit < 0) continue;
+    const definition = consumer?.parse?.symbols
+      .filter((s) => s.kind !== "CLASS")
+      .sort((a, b) => a.endLine - a.startLine - (b.endLine - b.startLine))
+      .find((s) => s.implementation && s.startLine <= hit + 1 && s.endLine >= hit + 1);
+    if (result.windows.length >= limits.windows) {
+      const redundant = result.windows.findLastIndex(
+        (w) =>
+          w.reason.startsWith("Observed call to a local helper") &&
+          result.windows.some((other) => other !== w && other.path === w.path),
+      );
+      if (redundant < 0) break;
+      result.metrics.snippetBytes -= Buffer.byteLength(result.windows[redundant]!.snippet);
+      result.windows.splice(redundant, 1);
+    }
+    addWindow(
+      path,
+      current,
+      definition?.startLine ?? Math.max(1, hit - 4),
+      definition?.endLine ?? hit + 12,
+      definition?.name ?? null,
+      "REFERENCE",
+      `Consumer reference to ${anchors.map((a) => a.symbol).join(", ")}; ${hasImportRelation ? "resolved import" : "bounded lexical match"}; behavior relation remains unverified.`,
+      consumer?.parse?.status === "PARSED" ? "AST" : "LEXICAL_STATIC",
+    );
+  }
+  if (anchors.length && !result.windows.some((w) => w.reason.startsWith("Consumer reference")))
+    result.missing.push(
+      "Consumers of observed definitions remain unverified; use bounded reference search when required by Issue behavior.",
+    );
   result.metrics.windows = result.windows.length;
   result.metrics.implementationWindows = result.windows.filter(
     (w) => w.kind === "IMPLEMENTATION",
   ).length;
   result.metrics.newRelations = Math.max(0, graph.snapshot().edges.length - initialEdges);
+  const snapshot = graph.snapshot();
+  result.relations = snapshot.edges
+    .filter((e) => !e.stale && e.to && e.resolution === "RESOLVED")
+    .slice(0, 32)
+    .map((e) => ({
+      from: e.from,
+      to: e.to!,
+      sourceHash: e.sourceSha256,
+      targetHash:
+        snapshot.files.find((f) => f.path === e.to && f.state === "CURRENT")?.sha256 ?? null,
+      kind: e.kind,
+      line: e.line,
+    }));
   for (const name of names.slice(0, 8))
     if (
       !result.windows.some(

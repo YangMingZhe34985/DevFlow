@@ -4,7 +4,7 @@ import { z } from "zod";
 import { acquireParser } from "./parser.js";
 import { workspacePackages } from "./workspace-packages.js";
 
-export const RELATION_PARSER_VERSION = "typescript-5.9.3-relations-v2";
+export const RELATION_PARSER_VERSION = "typescript-5.9.3-relations-v4";
 export const RelationParseSchema = z.object({
   status: z.enum(["PARSED", "PARSE_ERROR"]),
   symbols: z.array(
@@ -34,7 +34,12 @@ export const RelationParseSchema = z.object({
       resolvedPath: z.string().nullable(),
       resolution: z.enum(["RESOLVED", "EXTERNAL", "UNRESOLVED", "DYNAMIC"]),
       reason: z.string(),
-      bindings: z.array(z.object({ local: z.string(), imported: z.string() })).default([]),
+      typeOnly: z.boolean().optional(),
+      bindings: z
+        .array(
+          z.object({ local: z.string(), imported: z.string(), typeOnly: z.boolean().optional() }),
+        )
+        .default([]),
     }),
   ),
   configurationErrors: z.array(z.string()),
@@ -79,6 +84,24 @@ if(d.configPath) {
     for(const err of cfg.errors) if(err.code!==18003) configurationErrors.push(ts.flattenDiagnosticMessageText(err.messageText,' '));
   }
 }
+// Solution configurations may delegate paths to referenced projects. Consider
+// captured references only; conflicting targets stay unresolved rather than guessed.
+const referencedOptions=[];
+const pendingConfigs=d.configPath?[d.configPath]:[], seenConfigs=new Set();
+while(pendingConfigs.length && seenConfigs.size<16) {
+ const configPath=pendingConfigs.shift(); if(seenConfigs.has(configPath))continue; seenConfigs.add(configPath);
+ const parsed=ts.readConfigFile(root+configPath,host.readFile); if(parsed.error)continue;
+ for(const ref of parsed.config.references||[]) {
+  if(typeof ref.path!=='string')continue;
+  let target=p.normalize(p.join(p.dirname(configPath),ref.path));
+  if(!target.endsWith('.json'))target=p.join(target,'tsconfig.json');
+  if(!Object.hasOwn(config,target)||seenConfigs.has(target))continue;
+  pendingConfigs.push(target);
+  const child=ts.readConfigFile(root+target,host.readFile); if(child.error)continue;
+  const cfg=ts.parseJsonConfigFileContent(child.config,host,p.dirname(root+target),undefined,root+target);
+  referencedOptions.push({...options,...cfg.options,allowJs:true});
+ }
+}
 const file=root+d.path, source=ts.createSourceFile(file,d.content,ts.ScriptTarget.Latest,true);
 const imports=[], symbols=[], exports=[]; let truncated=false;
 let shadowedRequire=false;
@@ -93,18 +116,23 @@ function dependency(node,specifier,kind) {
   const bindings=[];
   if(ts.isImportDeclaration(node)&&node.importClause) {
     const clause=node.importClause;
-    if(clause.name)bindings.push({local:clause.name.text,imported:'default'});
+    if(clause.name)bindings.push({local:clause.name.text,imported:'default',typeOnly:clause.isTypeOnly});
     if(clause.namedBindings) {
-      if(ts.isNamespaceImport(clause.namedBindings))bindings.push({local:clause.namedBindings.name.text,imported:'*'});
-      else for(const el of clause.namedBindings.elements)bindings.push({local:el.name.text,imported:(el.propertyName||el.name).text});
+      if(ts.isNamespaceImport(clause.namedBindings))bindings.push({local:clause.namedBindings.name.text,imported:'*',typeOnly:clause.isTypeOnly});
+      else for(const el of clause.namedBindings.elements)bindings.push({local:el.name.text,imported:(el.propertyName||el.name).text,typeOnly:clause.isTypeOnly||el.isTypeOnly});
     }
   }
-  const row={specifier,kind,line:line(node),resolvedPath:null,resolution:'DYNAMIC',reason:'Nonliteral runtime expression; no static target',bindings};
+  const row={specifier,kind,line:line(node),resolvedPath:null,resolution:'DYNAMIC',reason:'Nonliteral runtime expression; no static target',bindings,typeOnly:!!node.isTypeOnly||!!node.importClause?.isTypeOnly};
   if(specifier!==null) {
     if(kind==='REQUIRE'&&shadowedRequire) { row.resolution='DYNAMIC'; row.reason='A repository declaration shadows require; syntax is not a verified module dependency'; imports.push(row); return; }
-    const resolved=ts.resolveModuleName(specifier,file,options,host,undefined,undefined,kind==='REQUIRE'?ts.ModuleKind.CommonJS:ts.ModuleKind.ESNext).resolvedModule;
-    const target=resolved&&canonical(resolved.resolvedFileName);
-    if(target&&target.startsWith(root)&&paths.has(target)) { row.resolvedPath=target.slice(root.length); row.resolution='RESOLVED'; row.reason='TypeScript module resolution against captured manifest'; }
+    const candidates=[...new Set([options,...referencedOptions].flatMap(candidate=>{
+      const resolved=ts.resolveModuleName(specifier,file,candidate,host,undefined,undefined,kind==='REQUIRE'?ts.ModuleKind.CommonJS:ts.ModuleKind.ESNext).resolvedModule;
+      const target=resolved&&canonical(resolved.resolvedFileName);
+      return target&&target.startsWith(root)&&paths.has(target)?[target]:[];
+    }))];
+    const target=candidates.length===1?candidates[0]:undefined;
+    if(candidates.length>1) { row.resolution='UNRESOLVED'; row.reason='Conflicting referenced compiler configurations: '+candidates.map(p=>p.slice(root.length)).join(', '); }
+    else if(target) { row.resolvedPath=target.slice(root.length); row.resolution='RESOLVED'; row.reason='TypeScript resolution against captured manifest/configuration references'; }
     else { row.resolution=/^(?:\.|\/|#)/.test(specifier)||Object.keys(options.paths||{}).some(k=>new RegExp('^'+k.replace(/[.+?^$(){}|[\]\\]/g,'\\$&').replace('*','.*')+'$').test(specifier))?'UNRESOLVED':'EXTERNAL'; row.reason=configurationErrors.length?'Incomplete or invalid compiler configuration':'No repository target found (external dependencies are not traversed)'; }
   }
   imports.push(row);

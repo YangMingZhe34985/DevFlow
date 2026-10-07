@@ -151,6 +151,7 @@ import {
 } from "../localization/relation-graph.js";
 import {
   IssueLocalizationAgent,
+  type IssueLocalizationResult,
   localizationRanges,
 } from "../localization/issue-localization-agent.js";
 import {
@@ -1214,6 +1215,13 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         const discoveryModel = this.modelFactory
           ? implementationModel
           : this.createModel(run, benchmark?.configuration.modelParameters, "PLANNER");
+        const savedLocalization = (await this.database.artifacts.list(run.id)).find(
+          (artifact) => artifact.name === "issue-localization-agent-plan-v1.json",
+        )?.content;
+        const localizationEvidence =
+          typeof savedLocalization === "string"
+            ? (JSON.parse(savedLocalization) as IssueLocalizationResult)
+            : undefined;
         const discovery = await new PlanAgent().run({
           title: run.task.title,
           description: run.task.description,
@@ -1229,6 +1237,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ? planningSnapshotSource(localSnapshot)
             : gitWorkspaceSource(run.task.baseCommitSha!, activeSandbox),
           evidence,
+          ...(localizationEvidence?.version === "issue-localization-agent-v1"
+            ? { localizationEvidence }
+            : {}),
           policy: {
             protectTests: benchmark !== undefined,
             protectInfrastructure: benchmark !== undefined,

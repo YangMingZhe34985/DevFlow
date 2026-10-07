@@ -27,6 +27,122 @@ const base = {
 };
 
 describe("shared implementation navigation", () => {
+  it("follows public receiver methods through a named barrel without spending the budget on types or unrelated star exports", async () => {
+    const f = fixture({
+      "tests/regression/behavior.test.ts":
+        "import { Client } from '../../src/index.js';\nconst api = new Client();\nexpect(api.summary()).toEqual(1);",
+      "src/index.ts": "export { Client } from './client.js';\nexport * from './errors.js';",
+      "src/client.ts":
+        "import { Reader } from './reader.js';\nimport type { Options } from './options.js';\nexport class Client {\n readonly #reader: Reader;\n summary() { return this.#reader.report(); }\n}",
+      "src/reader.ts": "export class Reader {\n report() { return 0; }\n}",
+      "src/options.ts": "export interface Options { summary: string }",
+      "src/errors.ts": "export class ClientError extends Error {}",
+    });
+    const result = await navigateImplementation({
+      ...base,
+      source: f.source,
+      description: "Reported summary should agree with the operation result",
+      maxReads: 4,
+      behaviorNavigation: true,
+    });
+    expect(result.windows.map((w) => w.path)).toEqual(
+      expect.arrayContaining([
+        "tests/regression/behavior.test.ts",
+        "src/client.ts",
+        "src/reader.ts",
+      ]),
+    );
+    expect(f.reads).not.toContain("src/options.ts");
+    expect(f.reads).not.toContain("src/errors.ts");
+    expect(result.windows.some((w) => w.snippet.includes("return 0"))).toBe(true);
+  });
+  it("keeps the actual local helper instead of counting a contained variable as another definition", async () => {
+    const f = fixture({
+      "tests/regression/behavior.test.ts":
+        "import { validate } from '../../src/validate.js';\nexpect(validate('parent.child')).toEqual('parent.child');",
+      "src/validate.ts":
+        "export function validate(path: string) {\n const result = lookup(path);\n return result;\n}\nfunction lookup(path: string) {\n return path.split('.').at(-1);\n}",
+    });
+    const result = await navigateImplementation({
+      ...base,
+      source: f.source,
+      description: "Nested validation loses its parent",
+      behaviorNavigation: true,
+      maxWindows: 2,
+    });
+    expect(result.windows).toHaveLength(2);
+    expect(result.windows.find((w) => w.path === "src/validate.ts")?.snippet).toContain(
+      "path.split",
+    );
+  });
+  it("follows imports from fallback test assertions before unrelated declarations", async () => {
+    const f = fixture({
+      "tests/behavior.test.ts":
+        "import { evaluate } from '../src/evaluator.js';\nimport { encode } from '../src/codec.js';\nexpect(evaluate({ nested: { key: 1 } })).toBe(1);\nexpect(encode('nested.key')).toBe('nested.key');",
+      "src/evaluator.ts": "export function evaluate(value: any) { return value['key']; }",
+      "src/codec.ts": "export function encode(path: string) { return path.split('.').at(-1); }",
+      "src/types.ts": "export interface Value { key: number }",
+    });
+    const result = await navigateImplementation({
+      ...base,
+      source: f.source,
+      description: "Nested values are lost",
+      prioritizeCandidates: true,
+      candidates: [{ path: "src/types.ts" }, { path: "tests/behavior.test.ts" }],
+      maxReads: 4,
+    });
+    expect(result.windows.map((w) => w.path)).toEqual(
+      expect.arrayContaining(["tests/behavior.test.ts", "src/evaluator.ts", "src/codec.ts"]),
+    );
+    expect(result.windows.map((w) => w.snippet).join("\n")).toContain("return path.split");
+  });
+  it("visits explicit fifth candidates and public tests before following familiar helper branches", async () => {
+    const files = {
+      "tests/reopen_test.cpp": "void testReopen() { compact(); reopen(); assert(retained()); }",
+      "src/manager.cpp": "void rotate() { rebuild(); }\nvoid rebuild() { rotate(); }",
+      "include/record_index.h": "bool isUnused() const { return count == 0; }",
+      "include/key_index.h": "int size() const { return keys.size(); }",
+      "src/compactor.cpp": "void compact() { persist(); }",
+    };
+    const f = fixture(files);
+    const result = await navigateImplementation({
+      ...base,
+      source: f.source,
+      description: "Retained records disappear after compaction and reopening",
+      candidates: Object.keys(files).map((path) => ({ path })),
+      prioritizeCandidates: true,
+    });
+    for (const path of Object.keys(files))
+      expect(
+        result.windows.some((w) => w.path === path),
+        path,
+      ).toBe(true);
+    expect(result.metrics.reads).toBeLessThanOrEqual(8);
+    expect(result.windows.length).toBeLessThanOrEqual(6);
+  });
+  it("retains a consumer body through an aliased import without claiming a confirmed root cause", async () => {
+    const { source } = fixture({
+      "src/helper.ts": "export function lookupPath(x: string) { return x; }",
+      "src/consumer.ts":
+        "import {lookupPath as read} from './helper.js';\nexport function evaluate(x: string) { return read(x).length; }",
+    });
+    const result = await navigateImplementation({
+      ...base,
+      source,
+      description: "lookupPath() is correct but evaluate consumes its result incorrectly",
+      candidates: [{ path: "src/helper.ts", symbol: "lookupPath" }],
+    });
+    expect(result.windows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "src/consumer.ts",
+          kind: "REFERENCE",
+          reason: expect.stringContaining("unverified"),
+        }),
+      ]),
+    );
+    expect(result.metrics.reads).toBeLessThanOrEqual(8);
+  });
   it("recognizes real function bodies in an entry file without treating a forwarding-only entry as implementation", async () => {
     const { source } = fixture({
       "src/index.ts":

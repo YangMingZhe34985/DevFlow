@@ -395,10 +395,45 @@ class PlanSession {
     this.check();
     if (!Number.isSafeInteger(this.input.workspaceRevision) || this.input.workspaceRevision < 0)
       throw new Blocked("PLAN_SOURCE_IDENTITY", "A nonnegative workspace revision is required.");
+    const localization = this.input.localizationEvidence;
+    if (localization?.observedEvidence?.length) {
+      const current: NonNullable<typeof localization.observedEvidence> = [];
+      for (const item of localization.observedEvidence) {
+        const entry = await this.lookup(item.path);
+        if (!entry) continue;
+        const digest =
+          entry.contentHash ?? (await this.readFile(item.path, "SUPPLEMENTARY")).contentHash;
+        if (digest === item.contentHash) current.push(item);
+        else
+          this.diagnostic(
+            "PLAN_STALE_EVIDENCE",
+            "Changed source evidence omitted; refresh before using it.",
+            { path: item.path },
+          );
+      }
+      this.input.localizationEvidence = {
+        ...localization,
+        observedEvidence: current,
+        ...(localization.evidenceState
+          ? {
+              evidenceState: {
+                ...localization.evidenceState,
+                workspaceRevision: this.input.workspaceRevision,
+              },
+            }
+          : {}),
+        implementationEvidence: (localization.implementationEvidence ?? []).filter((item) =>
+          current.some((row) => row.path === item.path && row.contentHash === item.contentHash),
+        ),
+        candidates: localization.candidates.filter((item) =>
+          current.some((row) => row.path === item.path && row.contentHash === item.contentHash),
+        ),
+      };
+    }
     const projected = planEvidenceRows(
       this.input,
       this.input.discoveryCandidates?.length
-        ? Math.min(4096, Math.floor(this.limits.maxSnippetBytes / 3))
+        ? Math.floor(this.limits.maxSnippetBytes / 2)
         : this.limits.maxSnippetBytes,
     );
     this.rows = projected.rows;
@@ -486,6 +521,8 @@ class PlanSession {
       },
       description: this.input.title + "\n" + this.input.description,
       candidates,
+      prioritizeCandidates: true,
+      observedWindows: this.input.localizationEvidence?.observedEvidence ?? [],
       signal: this.signal,
       maxReads: 8,
       maxSourceBytes: Math.max(0, this.limits.maxSourceBytes - this.attempt.metrics.sourceBytes),
@@ -503,7 +540,7 @@ class PlanSession {
             reason: `${window.kind}: ${window.reason}`.slice(0, 500),
           },
           file,
-          4096,
+          available,
         );
     }
     this.observations.push(

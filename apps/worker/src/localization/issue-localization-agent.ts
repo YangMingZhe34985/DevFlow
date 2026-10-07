@@ -77,6 +77,8 @@ export interface IssueLocalizationResult {
   candidates: LocalizationCandidate[];
   /** Host-observed code, independent of the model's candidate selections. No edit authority. */
   implementationEvidence?: LocalizationCandidate[];
+  /** Current public source records, including assertions and consumers. Read-only handoff. */
+  observedEvidence?: EvidenceItem[];
   evidenceState?: {
     workspaceRevision: number;
     pendingReads?: {
@@ -333,6 +335,7 @@ export class IssueLocalizationAgent {
         baseCommitSha: input.baseCommitSha,
         source,
         graph,
+        behaviorNavigation: true,
         signal,
         description: `${input.title}\n${input.description}`,
         candidates: [...catalogue.values()].map((e) => ({
@@ -896,6 +899,7 @@ export class IssueLocalizationAgent {
       baseCommitSha: input.baseCommitSha,
       summary,
       candidates,
+      observedEvidence: [...catalogue.values()].sort((a, b) => priority(b) - priority(a)),
       ...(implementationEvidence.length ? { implementationEvidence } : {}),
       evidenceState: {
         workspaceRevision: graph?.snapshot().workspaceRevision ?? 0,

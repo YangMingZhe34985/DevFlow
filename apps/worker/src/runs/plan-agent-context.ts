@@ -216,9 +216,19 @@ export function planEvidenceRows(
     const key = [path, item.contentHash, item.startLine, item.endLine, planHash(item.snippet)].join(
       ":",
     );
+    if (
+      rows.some(
+        (row) =>
+          row.path === path &&
+          row.contentHash === item.contentHash &&
+          row.startLine <= item.startLine &&
+          row.endLine >= item.endLine,
+      )
+    )
+      return;
     if (seen.has(key)) return;
     seen.add(key);
-    const snippet = boundPlanSnippet(item.snippet, Math.min(remaining, 3072));
+    const snippet = boundPlanSnippet(item.snippet, remaining);
     if (!snippet) {
       omitted++;
       return;
@@ -244,6 +254,39 @@ export function planEvidenceRows(
       reason: item.reason,
     });
   };
+  // Preserve complete, diverse behavioral records before declaration/background rows.
+  const observed =
+    input.localizationEvidence?.baseCommitSha === input.baseCommitSha &&
+    input.localizationEvidence.evidenceState?.workspaceRevision === input.workspaceRevision
+      ? (input.localizationEvidence.observedEvidence ?? [])
+      : [];
+  const paths = new Set<string>();
+  const ordered = observed
+    .map((item, index) => {
+      const first = !paths.has(item.path);
+      paths.add(item.path);
+      return { item, first, index };
+    })
+    .sort(
+      (a, b) =>
+        Number(/\.(?:test|spec)\.[^.]+$/u.test(b.item.path)) -
+          Number(/\.(?:test|spec)\.[^.]+$/u.test(a.item.path)) ||
+        Number(b.first) - Number(a.first) ||
+        a.index - b.index,
+    );
+  for (let i = 0; i < ordered.length; i++) {
+    const item = ordered[i]!.item;
+    const allowance = Math.min(remaining, Math.floor(maxSnippetBytes / 2));
+    const snippet = boundPlanSnippet(item.snippet, allowance);
+    if (snippet)
+      add({
+        ...item,
+        snippet,
+        endLine: item.startLine + snippet.split("\n").length - 1,
+        truncated: item.truncated || snippet !== item.snippet,
+      });
+    else omitted++;
+  }
   if (
     input.localizationEvidence?.baseCommitSha === input.baseCommitSha &&
     input.localizationEvidence.evidenceState?.workspaceRevision === input.workspaceRevision

@@ -45,3 +45,7 @@ DEVFLOW_FINALIZE_TIMEOUT_MS=30000
 ```
 
 Normal Review reserves its request, one still-available recovery and candidate finalization (480 seconds by default). Once both workflow recovery credits are consumed, it reserves 270 seconds. Execute/Repair close exploration before consuming this downstream reserve. Source supplements have a 120-second host deadline; probe operations reserve their actual deadline plus the subsequent judgment. These are deadlines, not guarantees of model completion. Insufficient time prevents dispatch and records the shortfall; a request timeout leaves Review incomplete. A separate bounded finalization signal saves the candidate and pending findings after cancellation. Unconfirmed request costs remain reserved at their upper bound.
+
+### Localization request budget
+
+The host derives the Localization lease from current serialized task/evidence, configured stage outputs and downstream planning/execution/Repair/Review reservations. Unknown envelope/evidence growth is an explicit estimate, rechecked at each boundary. The input plus configured output must fit both the stage balance and configured context window. Insufficient capacity stops before dispatch; the host does not lower the output ceiling to make a request fit. Up to four Localization requests, including recovery, share the lease. Consumption journals survive task interruption; uncertain interrupted state is blocked rather than restarted with fresh allowance.

@@ -64,6 +64,15 @@ afterEach(() => {
 });
 
 describe("PlanAgent production PLAN integration", () => {
+  it("does not grant a fresh Localization allowance after an interrupted dispatch", async () => {
+    const current = fixture({ localizationFailure: true });
+    await current.execute();
+    const count = current.model.requests.length;
+    expect(current.artifacts.some((a) => a.name === "localization-consumption-v1.json")).toBe(true);
+    await current.execute();
+    expect(current.model.requests).toHaveLength(count);
+    expect(JSON.stringify(current.events)).toContain("LOCALIZATION_RESUME_UNCERTAIN");
+  });
   it("always runs both Agents before approval, including when retired flags are false", async () => {
     const implicit = fixture();
     const explicit = fixture({ retiredFlags: true });

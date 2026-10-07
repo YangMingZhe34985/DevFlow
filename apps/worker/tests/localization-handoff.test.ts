@@ -247,6 +247,7 @@ describe("implementation evidence handoff", () => {
     });
     expect(result.metrics.meaningfulProgress).toBe(0);
     expect(result.metrics.sourceReads).toBe(1);
-    expect(result.metrics.modelCalls).toBe(3);
+    expect(result.metrics.modelCalls).toBe(2);
+    expect(result.evidenceState?.exitReason).toBe("STALLED");
   });
 });

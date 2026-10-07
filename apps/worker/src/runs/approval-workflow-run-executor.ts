@@ -154,6 +154,7 @@ import {
   type IssueLocalizationResult,
   localizationRanges,
 } from "../localization/issue-localization-agent.js";
+import { localizationLease } from "./localization-lease.js";
 import {
   planningSnapshotSource,
   snapshotSource,
@@ -355,6 +356,24 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     try {
       // Freeze LOCAL input before the approval wait so host edits made while a plan
       // is being reviewed cannot change what the approved run eventually executes.
+      const localizationArtifacts = await this.database.artifacts.list(run.id);
+      if (
+        localizationArtifacts.some((a) => a.name === "localization-consumption-v1.json") &&
+        !localizationArtifacts.some((a) => a.name === "issue-localization-agent-plan-v1.json")
+      ) {
+        await this.database.events.append({
+          runId: run.id,
+          type: "WORKFLOW_CHECKPOINT",
+          occurredAt: new Date().toISOString(),
+          payload: { stopReason: "LOCALIZATION_RESUME_UNCERTAIN", requestIssued: false },
+        });
+        throw new DevflowError({
+          code: "INSUFFICIENT_EVIDENCE",
+          message:
+            "Interrupted Localization consumption is preserved; resume cannot grant new IO or model calls.",
+          details: { requestIssued: false, stopReason: "LOCALIZATION_RESUME_UNCERTAIN" },
+        });
+      }
       const snapshotStarted = Date.now();
       await ensureLocalRunSnapshot(this.database, run, planSignal);
       const planningSnapshot = await requireLocalRunSnapshot(this.database, run);
@@ -427,7 +446,66 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
         metrics,
       );
+      const localizationBudget = localizationLease({
+        remainingTokens: planBudget.remainingTotalTokens(metrics),
+        title: run.task.title,
+        description: run.task.description,
+        evidence: planningEvidence.evidence,
+        outputs: {
+          localization:
+            this.modelBindings.get(localizationModel)?.settings?.maxOutputTokens ?? 4096,
+          planner: this.modelBindings.get(model)?.settings?.maxOutputTokens ?? 4096,
+          execute: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+          repair: this.environment.stageModels?.REPAIR?.maxOutputTokens ?? 8192,
+          review: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 4096,
+        },
+      });
       const issueLocalization = await (async () => {
+        const prior = await this.database.artifacts.list(run.id);
+        const completed = prior.findLast((a) => a.name === "issue-localization-agent-plan-v1.json");
+        if (completed?.content) {
+          const saved = JSON.parse(completed.content) as IssueLocalizationResult;
+          if (
+            saved.baseCommitSha !== planningBaseCommit ||
+            saved.version !== "issue-localization-agent-v1"
+          )
+            throw new DevflowError({
+              code: "INSUFFICIENT_EVIDENCE",
+              message: "Saved Localization identity cannot be verified; no new request was issued.",
+            });
+          return saved;
+        }
+        const priorEvents = await this.database.events.list(run.id, { limit: 1000 });
+        const legacyConsumption =
+          priorEvents.length >= 1000 ||
+          priorEvents.some(
+            (event) =>
+              event.type === "LLM_REQUEST" && recordValue(event.payload).purpose === "LOCALIZATION",
+          );
+        if (legacyConsumption || prior.some((a) => a.name === "localization-consumption-v1.json"))
+          throw new DevflowError({
+            code: "INSUFFICIENT_EVIDENCE",
+            message:
+              "Interrupted Localization consumption is preserved. Automatic replay cannot grant fresh calls or source allowance.",
+            details: { requestIssued: false, stopReason: "LOCALIZATION_RESUME_UNCERTAIN" },
+          });
+        const checkpoint = async (state: Record<string, unknown>) => {
+          await this.database.artifacts.create({
+            runId: run.id,
+            kind: "OTHER",
+            name: "localization-consumption-v1.json",
+            mimeType: "application/json",
+            content: JSON.stringify({
+              version: 1,
+              baseCommitSha: planningBaseCommit,
+              sourceIdentity: planningSource.identity,
+              lease: localizationBudget,
+              ...state,
+            }),
+            metadata: { visibility: "HOST_ONLY" },
+          });
+        };
+        await checkpoint({ status: "STARTED", requestIssued: false, modelCalls: 0 });
         const result = await new IssueLocalizationAgent().run({
           title: run.task.title,
           description: run.task.description,
@@ -438,12 +516,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           model: localizationModel,
           maxOutputTokens:
             this.modelBindings.get(localizationModel)?.settings?.maxOutputTokens ?? 4096,
+          contextTokens: this.environment.stageModels?.LOCALIZATION?.contextTokens ?? 32000,
+          onCheckpoint: checkpoint,
           timeoutMs: planBudget!.remainingTimeoutMs("PLAN"),
           signal: planSignal,
-          maxTokens: Math.max(
-            0,
-            Math.min(18000, planBudget!.remainingTotalTokens(metrics) - 12000),
-          ),
+          maxTokens: localizationBudget.maxTokens,
           buildGraph: this.environment.DEVFLOW_RELATION_GRAPH_ENABLED ?? true,
           onGraph: async (graph, issue) => {
             const content = JSON.stringify(graph);

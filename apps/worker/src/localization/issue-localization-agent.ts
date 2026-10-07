@@ -153,6 +153,8 @@ export class IssueLocalizationAgent {
     maxTokens: number;
     /** Effective stage/model ceiling, shared by preflight and the actual request. */
     maxOutputTokens?: number;
+    contextTokens?: number;
+    onCheckpoint?(state: Record<string, unknown>): Promise<void>;
     timeoutMs?: number;
     buildGraph?: boolean;
     onGraph?(graph: RelationGraphArtifact, issue: IssueGraphReference): Promise<string | undefined>;
@@ -395,14 +397,25 @@ export class IssueLocalizationAgent {
         const outputTokens = Math.min(
           request.settings?.maxOutputTokens ?? configuredOutputTokens,
           configuredOutputTokens,
-          Math.floor(remainingTokens - estimated),
         );
+        const contextTokens = input.contextTokens ?? 32000;
         if (
           metrics.modelCalls >= 4 ||
-          estimated > 8000 ||
+          estimated + outputTokens > contextTokens ||
+          estimated + outputTokens > remainingTokens ||
           !Number.isSafeInteger(outputTokens) ||
           outputTokens < 1
         ) {
+          await input.onCheckpoint?.({
+            status: "PREFLIGHT_BLOCKED",
+            ...metrics,
+            estimatedInputTokens: estimated,
+            outputTokens,
+            contextTokens,
+            remainingTokens,
+            missingTokens: Math.max(0, estimated + outputTokens - remainingTokens),
+            requestIssued: false,
+          });
           throw new DevflowError({
             code: "INSUFFICIENT_EVIDENCE",
             message:
@@ -412,13 +425,25 @@ export class IssueLocalizationAgent {
               configuredOutputTokens,
               effectiveOutputTokens: outputTokens,
               remainingTokens,
+              contextTokens,
+              missingTokens: Math.max(0, estimated + outputTokens - remainingTokens),
               modelCalls: metrics.modelCalls,
               requestIssued: false,
             },
           });
         }
-        await input.onRequest?.();
         metrics.modelCalls++;
+        await input.onCheckpoint?.({
+          status: "DISPATCH_RESERVED",
+          ...metrics,
+          reservedTokens: estimated + outputTokens,
+          contextTokens,
+          outputTokens,
+          requestIssued: null,
+          evidence: request.messages,
+          progressKeys: [...progressKeys],
+        });
+        await input.onRequest?.();
         const started = Date.now();
         let response: ModelResponse;
         try {
@@ -432,6 +457,12 @@ export class IssueLocalizationAgent {
         }
         metrics.totalTokens += response.usage.totalTokens;
         await input.onResponse?.(response);
+        await input.onCheckpoint?.({
+          status: "RESPONSE",
+          ...metrics,
+          reservedTokens: 0,
+          requestIssued: true,
+        });
         if (metrics.totalTokens > input.maxTokens)
           throw new DevflowError({
             code: "INSUFFICIENT_EVIDENCE",
@@ -710,10 +741,24 @@ export class IssueLocalizationAgent {
         break;
       }
       let expanded = false;
+      const queryKey = (query: string) => query.trim().replace(/\s+/gu, " ").toLowerCase();
+      const readKey = (r: { path: string; startLine: number; endLine: number }) =>
+        `${r.path.replaceAll("\\", "/")}:${r.startLine}:${Math.min(r.endLine, r.startLine + LOCALIZATION_READ_LIMITS.maxLines - 1)}`;
+      if (
+        (decision.hypotheses.length || decision.inspect.length) &&
+        decision.hypotheses.every((h) => seenQueries.has(queryKey(h.query))) &&
+        decision.inspect.every((r) => seenReads.has(readKey(r)))
+      ) {
+        exitReason = "STALLED";
+        uncertainty.push(
+          "All evidence requests repeat earlier attempts. Missing evidence must be investigated in a new authorized task; no paid summary request was issued.",
+        );
+        break;
+      }
       for (const hypothesis of decision.hypotheses) {
         const query = hypothesis.query.trim();
-        if (metrics.searches >= 2 || seenQueries.has(query)) continue;
-        seenQueries.add(query);
+        if (metrics.searches >= 2 || seenQueries.has(queryKey(query))) continue;
+        seenQueries.add(queryKey(query));
         await input.onSearch?.();
         metrics.searches++;
         const pack = await input.retrieve(`${input.title}\n${query}`, source, signal);
@@ -862,6 +907,21 @@ export class IssueLocalizationAgent {
       const progress = Math.max(0, progressKeys.size - progressBefore);
       metrics.meaningfulProgress += progress;
       stalledRounds = progress ? 0 : stalledRounds + 1;
+      await input.onCheckpoint?.({
+        status: "EVIDENCE",
+        ...metrics,
+        stalledRounds,
+        seenQueries: [...seenQueries],
+        seenReads: [...seenReads],
+        evidence: [...catalogue.values()],
+      });
+      if (stalledRounds >= 2) {
+        exitReason = "STALLED";
+        uncertainty.push(
+          "Two rounds added no new source evidence. Stop exploration; the remaining hypotheses are unverified.",
+        );
+        break;
+      }
       if (expanded && !progress)
         observations.push(
           "No new relevant source evidence; repeated queries or hypothesis wording do not count as progress.",
@@ -873,6 +933,15 @@ export class IssueLocalizationAgent {
         ...uncertainty,
         "Some proposed evidence was rejected; candidates are only the verified regions listed here.",
       ];
+    await input.onCheckpoint?.({
+      status: "STOPPED",
+      ...metrics,
+      stalledRounds,
+      exitReason,
+      seenQueries: [...seenQueries],
+      seenReads: [...seenReads],
+      uncertainty,
+    });
     let graphReference: IssueGraphReference | undefined;
     if (graph) {
       await graph.inspect(

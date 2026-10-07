@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import { describe, expect, it, vi } from "vitest";
-import { z } from "zod";
 import { FakeLanguageModel, fakeModelResponse, type ModelRequest } from "@devflow/agent";
 import {
   IssueLocalizationAgent,
@@ -73,6 +72,99 @@ function run(source: IndexSource, model: FakeLanguageModel, evidence?: EvidenceP
 const state = (r: ModelRequest) => JSON.parse(String(r.messages[1]!.content));
 
 describe("read-only semantic Issue localization", () => {
+  it("accepts input above the retired 8000-token gate, preserves output and persists dispatch before calling", async () => {
+    const content = "// an actual complete source record\n".repeat(850);
+    const source = memorySource({
+      "src/large.ts": content,
+      "src/next.ts": "export const freshEvidence = 1;",
+    });
+    const pack = await new IssueLocalizer().retrieve({
+      repositoryId: "repo",
+      accessScope: "test",
+      baseCommitSha: "base",
+      runId: "r",
+      workspaceRevision: 0,
+      description: "src/large.ts",
+      source,
+      signal,
+    });
+    pack.evidence = [
+      {
+        ...pack.evidence[0]!,
+        snippet: content.trimEnd(),
+        startLine: 1,
+        endLine: 850,
+        contentHash: hash(content),
+        truncated: false,
+      },
+    ];
+    const journal: Record<string, unknown>[] = [];
+    const model = new FakeLanguageModel([
+      (request) => {
+        expect(journal.at(-1)).toMatchObject({
+          status: "DISPATCH_RESERVED",
+          modelCalls: 1,
+          outputTokens: 4096,
+        });
+        expect(Buffer.byteLength(JSON.stringify(request.messages)) / 3).toBeGreaterThan(8000);
+        expect(request.settings?.maxOutputTokens).toBe(4096);
+        return response(
+          decision({
+            inspect: [
+              {
+                path: "src/next.ts",
+                startLine: 1,
+                endLine: 1,
+                reason: "Resolve missing implementation",
+              },
+            ],
+          }),
+        );
+      },
+      (request) => {
+        expect(JSON.stringify(request.messages)).toContain("freshEvidence");
+        expect(request.settings?.maxOutputTokens).toBe(4096);
+        return response(decision());
+      },
+    ]);
+    await new IssueLocalizationAgent().run({
+      title: "bug",
+      description: "Observe source",
+      repositoryId: "repo",
+      baseCommitSha: "base",
+      source,
+      evidence: pack,
+      model,
+      signal,
+      maxTokens: 60000,
+      contextTokens: 64000,
+      maxOutputTokens: 4096,
+      onCheckpoint: async (state) => {
+        journal.push(state);
+      },
+      retrieve: async () => undefined,
+    });
+    expect(model.requests).toHaveLength(2);
+    expect(journal.at(-1)).toMatchObject({ status: "STOPPED", modelCalls: 2 });
+    const blocked = new FakeLanguageModel([]);
+    await expect(
+      new IssueLocalizationAgent().run({
+        title: "bug",
+        description: "Observe source",
+        repositoryId: "repo",
+        baseCommitSha: "base",
+        source,
+        evidence: pack,
+        model: blocked,
+        signal,
+        maxTokens: 60000,
+        contextTokens: 8000,
+        maxOutputTokens: 4096,
+        retrieve: async () => undefined,
+      }),
+    ).rejects.toMatchObject({ details: { contextTokens: 8000, requestIssued: false } });
+    expect(blocked.requests).toHaveLength(0);
+  });
   it("normalizes the recorded 200-line request and exposes actual bounds without losing source identity", async () => {
     const path = "packages/zod/src/v4/core/schemas.ts";
     const text = Array.from({ length: 220 }, (_, i) => `// source line ${i + 1}`).join("\n");
@@ -193,7 +285,7 @@ describe("read-only semantic Issue localization", () => {
     expect(result.candidates[0]?.path).toBe(path);
   });
 
-  it("announces FINAL-only mode and reports an unexecutable last-round action", async () => {
+  it("stops after two ungrounded decisions without paying for a final summary", async () => {
     const source = memorySource({ "src/a.ts": "export const a = 1;" });
     const model = new FakeLanguageModel([
       response(decision({ candidates: [{ evidenceId: "absent", explanation: "Need evidence" }] })),
@@ -213,8 +305,8 @@ describe("read-only semantic Issue localization", () => {
     ]);
     const result = await run(source, model);
     expect(source.read).not.toHaveBeenCalled();
-    expect(result.observations.join(" ")).toContain("FINAL_ROUND");
-    expect(result.uncertainty.join(" ")).toContain("not executed");
+    expect(result.evidenceState?.exitReason).toBe("STALLED");
+    expect(model.requests).toHaveLength(2);
   });
 
   it("bounds invalid attempts and rejects stale reads without manufacturing evidence", async () => {
@@ -447,7 +539,7 @@ describe("read-only semantic Issue localization", () => {
       ),
     );
     const result = await run(source, model);
-    expect(result.metrics).toMatchObject({ searches: 1, modelCalls: 3 });
+    expect(result.metrics).toMatchObject({ searches: 1, modelCalls: 2 });
     expect(result.status).toBe("INCONCLUSIVE");
   });
 
@@ -470,31 +562,26 @@ describe("read-only semantic Issue localization", () => {
     expect(model.requests).toHaveLength(0);
   });
 
-  it("uses the configured ceiling and shrinks it to the remaining shared budget", async () => {
-    const model = new FakeLanguageModel([response(decision())]);
-    await new IssueLocalizationAgent().run({
-      title: "bug",
-      description: "bug",
-      repositoryId: "repo",
-      baseCommitSha: "base",
-      source: memorySource({}),
-      model,
-      signal,
-      maxTokens: 3000,
-      maxOutputTokens: 8192,
-      retrieve: async () => undefined,
+  it("does not silently shrink configured output to fit an underfunded stage", async () => {
+    const model = new FakeLanguageModel([]);
+    await expect(
+      new IssueLocalizationAgent().run({
+        title: "bug",
+        description: "bug",
+        repositoryId: "repo",
+        baseCommitSha: "base",
+        source: memorySource({}),
+        model,
+        signal,
+        maxTokens: 3000,
+        maxOutputTokens: 8192,
+        retrieve: async () => undefined,
+      }),
+    ).rejects.toMatchObject({
+      code: "INSUFFICIENT_EVIDENCE",
+      details: { configuredOutputTokens: 8192, effectiveOutputTokens: 8192, requestIssued: false },
     });
-    const actual = model.requests[0]!;
-    const estimated = Math.ceil(
-      Buffer.byteLength(
-        JSON.stringify({
-          messages: actual.messages,
-          schema: z.toJSONSchema(actual.output!.schema),
-        }),
-      ) / 3,
-    );
-    expect(actual.settings?.maxOutputTokens).toBe(3000 - estimated);
-    expect(actual.settings!.maxOutputTokens).toBeGreaterThan(0);
+    expect(model.requests).toHaveLength(0);
   });
 
   it("accounts for a LENGTH/empty response and one semantic regeneration", async () => {
@@ -547,7 +634,7 @@ describe("read-only semantic Issue localization", () => {
         source: memorySource({}),
         model,
         signal,
-        maxTokens: 4496,
+        maxTokens: 6000,
         maxOutputTokens: 4096,
         retrieve: async () => undefined,
       }),
@@ -567,7 +654,7 @@ describe("read-only semantic Issue localization", () => {
           }),
         ),
         toolCalls: [],
-        usage: { inputTokens: 1200, outputTokens: 1000, totalTokens: 2200 },
+        usage: { inputTokens: 4200, outputTokens: 1000, totalTokens: 5200 },
       }),
     ]);
     const result = await new IssueLocalizationAgent().run({
@@ -578,14 +665,14 @@ describe("read-only semantic Issue localization", () => {
       source: memorySource({}),
       model,
       signal,
-      maxTokens: 2300,
+      maxTokens: 6000,
       maxOutputTokens: 4096,
       retrieve: async () => undefined,
     });
     expect(result.status).toBe("INCONCLUSIVE");
     expect(result.candidates).toEqual([]);
     expect(result.uncertainty.join(" ")).toContain("Planner must verify");
-    expect(result.metrics).toMatchObject({ modelCalls: 1, totalTokens: 2200 });
+    expect(result.metrics).toMatchObject({ modelCalls: 1, totalTokens: 5200 });
     expect(model.requests).toHaveLength(1);
   });
 

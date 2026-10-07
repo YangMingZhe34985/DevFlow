@@ -1,4 +1,4 @@
-import { contentHash, type PostPatchController } from "@devflow/agent";
+import { contentHash, type PostPatchController, type WorkingCode } from "@devflow/agent";
 import { SandboxGitService } from "@devflow/git";
 import type { SandboxSession } from "@devflow/sandbox";
 import {
@@ -11,6 +11,8 @@ import type { ToolExecutionRequest, ToolExecutionResult } from "@devflow/tools";
 import { patchTargetPaths } from "./working-set.js";
 
 export function requestPaths(request: ToolExecutionRequest): string[] {
+  // Commands may write anywhere, regardless of a caller-supplied path hint.
+  if (request.name === "runCommand") return [];
   const args = request.input as Record<string, unknown> | null;
   if (!args || typeof args !== "object") return [];
   const paths =
@@ -122,12 +124,84 @@ export function normalizeMutation(
     mutationAttempted: true,
     mutationApplied: applied,
     workspaceChanged,
+    observationComplete: observed,
+    affectedPaths: [...new Set(paths)],
     reason,
     beforeRevision: revision,
     afterRevision: revision + (workspaceChanged ? 1 : 0),
     changedFiles,
     currentHashes: after,
   };
+}
+
+/** Reconcile current code authority from host observations, including failed writes. */
+export function reconcileMutationEvidence(
+  toolName: string,
+  result: ToolExecutionResult,
+  state: {
+    versions: Map<string, string>;
+    fullReads: Set<string>;
+    stalePaths: Set<string>;
+    observedSources: WorkingCode[];
+  },
+): { unchanged: boolean; paths: string[]; unknownScope: boolean } {
+  const observation = result.mutation;
+  const unchanged =
+    observation?.observationComplete === true &&
+    !observation.workspaceChanged &&
+    !observation.mutationApplied &&
+    observation.changedFiles.length === 0 &&
+    observation.beforeRevision === observation.afterRevision;
+  if (unchanged) return { unchanged: true, paths: [], unknownScope: false };
+  const paths = [
+    ...new Set(
+      observation?.observationComplete === true &&
+        observation.workspaceChanged &&
+        observation.changedFiles.length
+        ? observation.changedFiles
+        : (observation?.affectedPaths ?? []),
+    ),
+  ];
+  const unknownScope = toolName === "runCommand" || paths.length === 0;
+  const affected = new Set(
+    unknownScope
+      ? [
+          ...state.versions.keys(),
+          ...state.fullReads,
+          ...state.observedSources.map((source) => source.path),
+        ]
+      : paths,
+  );
+  const output =
+    result.ok && result.output && typeof result.output === "object"
+      ? (result.output as Record<string, unknown>)
+      : {};
+  const wasComplete = typeof output.path === "string" && state.fullReads.has(output.path);
+  for (const path of affected) {
+    state.stalePaths.add(path);
+    state.versions.delete(path);
+    state.fullReads.delete(path);
+  }
+  state.observedSources.splice(
+    0,
+    state.observedSources.length,
+    ...state.observedSources.filter((source) => !affected.has(source.path)),
+  );
+  if (
+    observation?.observationComplete === true &&
+    observation.workspaceChanged &&
+    ["writeFile", "replaceText"].includes(toolName) &&
+    typeof output.path === "string" &&
+    typeof output.sha256 === "string" &&
+    /^[a-f0-9]{64}$/u.test(output.sha256) &&
+    observation.currentHashes[output.path] === output.sha256 &&
+    observation.changedFiles.includes(output.path)
+  ) {
+    state.versions.set(output.path, output.sha256);
+    state.stalePaths.delete(output.path);
+    if (wasComplete || toolName === "writeFile") state.fullReads.add(output.path);
+  }
+  return { unchanged: false, paths, unknownScope };
 }
 
 export async function observePostPatchTool(input: {

@@ -1,9 +1,32 @@
 import { describe, expect, it } from "vitest";
 import { readFileContent, type SandboxSession } from "@devflow/sandbox";
 import { vi } from "vitest";
-import { checkRepairResponse } from "../src/runs/repair-response.js";
+import { checkRepairResponse, repairFinishInputError } from "../src/runs/repair-response.js";
 import { PhaseCompletionSchema } from "@devflow/shared";
 describe("repair response provenance", () => {
+  it("reports unknown finding IDs and stale citations before accepting finishPhase", () => {
+    const versions = new Map([["a.ts", "a".repeat(64)]]);
+    expect(
+      repairFinishInputError({ outcome: "CHANGED", findingIds: ["fake"] }, [], versions, ["real"]),
+    ).toContain("unknown IDs fake");
+    expect(
+      repairFinishInputError(
+        {
+          outcome: "CONTRADICTED",
+          evidence: [{ path: "a.ts", quote: "return true", fileSha256: "b".repeat(64) }],
+        },
+        [],
+        versions,
+      ),
+    ).toContain("current complete SHA required");
+    expect(
+      repairFinishInputError(
+        { outcome: "INSUFFICIENT_EVIDENCE", summary: "Need source outside scope" },
+        [],
+        versions,
+      ),
+    ).toBeUndefined();
+  });
   it("validates per-finding no-edit responses and retains stale/unknown/unanswered IDs", async () => {
     const content = "return true",
       read = readFileContent(Buffer.from(content), { path: "a.ts" });

@@ -39,34 +39,119 @@ function readIdentity(v: Record<string, unknown>): string {
 }
 
 export function invalidateHistoricalReads(messages: readonly ModelMessage[]): ModelMessage[] {
-  let mutation = -1;
+  const mutations: { index: number; paths?: ReadonlySet<string> }[] = [];
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i];
-    if (
-      m?.role === "ASSISTANT" &&
-      m.toolCalls?.some((c) =>
-        ["writeFile", "replaceText", "applyPatch", "runCommand"].includes(c.name),
+    if (m?.role === "ASSISTANT") {
+      for (const call of m.toolCalls ?? []) {
+        if (!["writeFile", "replaceText", "applyPatch", "runCommand"].includes(call.name)) continue;
+        if (
+          !messages.some(
+            (candidate, index) =>
+              index > i &&
+              candidate.role === "TOOL" &&
+              candidate.toolCallId === call.id &&
+              candidate.toolName === call.name,
+          )
+        )
+          mutations.push({ index: i });
+      }
+    } else if (
+      m?.role === "TOOL" &&
+      (m.mutation !== undefined ||
+        ["writeFile", "replaceText", "applyPatch", "runCommand"].includes(m.toolName))
+    ) {
+      const observed = m.mutation;
+      // A failed call can change bytes. Only a complete host observation establishes no change.
+      if (
+        observed?.observationComplete === true &&
+        !observed.workspaceChanged &&
+        !observed.mutationApplied &&
+        observed.changedFiles.length === 0 &&
+        observed.beforeRevision === observed.afterRevision
       )
-    )
-      mutation = i;
+        continue;
+      const paths =
+        observed?.observationComplete === true && observed.workspaceChanged
+          ? observed.changedFiles.length > 0
+            ? observed.changedFiles
+            : observed.affectedPaths
+          : observed?.affectedPaths;
+      mutations.push({
+        index: i,
+        ...(paths?.length ? { paths: new Set(paths.map(normalizeEvidencePath)) } : {}),
+      });
+    }
   }
   return messages.map((m, i) => {
     if (
-      i >= mutation ||
       m.role !== "TOOL" ||
       m.isError ||
       !["readFile", "batchReadFiles", "locateIssue"].includes(m.toolName)
     )
       return m;
+    const later = mutations.filter((mutation) => mutation.index > i);
+    if (later.length === 0) return m;
+    if (later.some((mutation) => mutation.paths === undefined))
+      return { ...m, content: staleRead(m.content) };
+    const paths = new Set(later.flatMap((mutation) => [...mutation.paths!]));
+    const output = object(m.content);
+    const content =
+      m.toolName === "readFile" && typeof output?.path !== "string"
+        ? staleRead(m.content)
+        : m.toolName === "batchReadFiles" && Array.isArray(output?.files)
+          ? {
+              ...output,
+              files: output.files.map((file) =>
+                typeof object(file)?.path === "string"
+                  ? invalidateReadPaths(file, paths)
+                  : staleRead(file),
+              ),
+            }
+          : invalidateReadPaths(m.content, paths);
+    if (content === m.content) return m;
     return {
       ...m,
-      content: {
-        note: "Base evidence superseded by a mutation attempt; read current code if needed.",
-        previousResultHash: contentHash(JSON.stringify(m.content)),
-        stale: true,
-      },
+      content,
     };
   });
+}
+
+function normalizeEvidencePath(path: string): string {
+  return path.replaceAll("\\", "/").replace(/^\.\//u, "");
+}
+
+function staleRead(value: unknown): Record<string, unknown> {
+  const record = object(value);
+  if (record?.stale === true) return record;
+  const path = record?.path;
+  return {
+    ...(typeof path === "string" ? { path } : {}),
+    note: "Source evidence was superseded by an observed or unverified workspace change; read current code if needed.",
+    previousResultHash: contentHash(JSON.stringify(value) ?? "null"),
+    stale: true,
+  };
+}
+
+/** Keep unrelated entries in batch/localization results; source identity follows each path. */
+function invalidateReadPaths(value: unknown, paths: ReadonlySet<string>): unknown {
+  if (Array.isArray(value)) {
+    const projected = value.map((item) => invalidateReadPaths(item, paths));
+    return projected.some((item, index) => item !== value[index]) ? projected : value;
+  }
+  const record = object(value);
+  if (!record) return value;
+  if (typeof record.path === "string" && paths.has(normalizeEvidencePath(record.path)))
+    return staleRead(value);
+  let changed = false;
+  const projected = Object.fromEntries(
+    Object.entries(record).map(([key, item]) => {
+      const next = invalidateReadPaths(item, paths);
+      changed ||= next !== item;
+      return [key, next];
+    }),
+  );
+  return changed ? projected : value;
 }
 
 /** Only replace code when the exact same bytes remain visible in this projected request. */

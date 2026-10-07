@@ -7,6 +7,46 @@ import { prepareStageContext } from "@devflow/agent";
 import { createTools } from "../src/runs/approval-workflow-run-executor.js";
 
 describe("bounded Repair input with recoverable public evidence", () => {
+  it("seeds the innermost Python implementation with a complete SHA even when the diff is empty", async () => {
+    const git = {
+      status: async () => ({ files: [] }),
+      diff: async () => ({ patch: "", filesChanged: 0, truncated: false }),
+    } as unknown as SandboxGitService;
+    const readFile = vi.fn(async (input) => ({
+      path: input.path,
+      startLine: input.startLine,
+      endLine: input.startLine + 5,
+      fileSha256: "b".repeat(64),
+      truncated: true,
+      content: "def lookup_execution(name):\n    raise KeyError(name)",
+    }));
+    const sandbox = {
+      readFile,
+      listFiles: async () => ({
+        entries: [{ path: "src/pyplugin/registry/registry.py", kind: "FILE" }],
+      }),
+    } as unknown as SandboxSession;
+    const context = await buildRepairContext(
+      git,
+      sandbox,
+      {
+        exitCode: 1,
+        stdout:
+          'File "/workspace/src/pyplugin/registry/registry.py", line 115, in lookup_execution\nKeyError: plugin',
+        stderr: "",
+        timedOut: false,
+        outputTruncated: false,
+        durationMs: 1,
+      },
+      AbortSignal.timeout(10_000),
+    );
+    expect(context.currentSources[0]).toMatchObject({
+      path: "src/pyplugin/registry/registry.py",
+      contentHash: "b".repeat(64),
+      startLine: 107,
+    });
+    expect(context.stableTaskContext).toContain("KeyError: plugin");
+  });
   it("prioritizes diagnostic line 2357 over the first hunk, and keeps tasks separate from old SHA", async () => {
     const git = {
       status: async () => ({ files: [{ path: "packages/zod/src/v4/core/schemas.ts" }] }),
@@ -37,7 +77,13 @@ describe("bounded Repair input with recoverable public evidence", () => {
       ]);
     const context = await buildRepairContext(
       git,
-      { readFile } as unknown as SandboxSession,
+      {
+        readFile,
+        listFiles: async () => ({
+          entries: [{ path: "packages/zod/src/v4/core/schemas.ts", kind: "FILE" }],
+          truncated: false,
+        }),
+      } as unknown as SandboxSession,
       {
         exitCode: 1,
         stdout:
@@ -69,6 +115,12 @@ describe("bounded Repair input with recoverable public evidence", () => {
       startLine: 1,
       endLine: 300,
     };
+    expect(readRepairEvidence({ sha256: input.sha256, section: "stdout" }, evidence)).toMatchObject(
+      { defaultRange: true, startLine: 1, endLine: 80 },
+    );
+    expect(() =>
+      readRepairEvidence({ sha256: input.sha256, section: "stdout", startLine: 1 }, evidence),
+    ).toThrow("supply both");
     expect(readRepairEvidence(input, evidence)).toMatchObject({
       historical: true,
       artifactSha256: input.sha256,
@@ -120,8 +172,8 @@ describe("bounded Repair input with recoverable public evidence", () => {
       expect.any(AbortSignal),
     );
     expect(Buffer.byteLength(context.text)).toBeLessThan(24 * 1024);
-    expect(context.text).toContain("Expected: default: hello");
-    expect(context.text).toContain("3718 passed");
+    expect(context.stableTaskContext).toContain("Expected: default: hello");
+    expect(context.stableTaskContext).toContain("3718 passed");
     expect(context.text).toContain("return innerDefault;");
     expect(context.currentSources[0]).toMatchObject({
       contentHash: "a".repeat(64),
@@ -139,7 +191,7 @@ describe("bounded Repair input with recoverable public evidence", () => {
       authoritative: { revision: 1, approved: ["core.ts"] },
     });
     expect(view.viewBytes).toBeLessThan(96000);
-    expect(JSON.stringify(view.view)).toContain("regression");
+    expect(context.stableTaskContext).toContain("regression");
   });
   it("registers evidence recovery only as READ and respects explicit disabled benchmark tools", () => {
     const recover = vi.fn();

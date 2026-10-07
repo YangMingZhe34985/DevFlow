@@ -94,9 +94,83 @@ it("never guesses among zero or duplicate old-block matches, stale hashes or unk
     status: "REJECTED",
     kind: "UNSUPPORTED_PATCH",
   });
-  expect(prepare(malformed, source.replaceAll("\n", "\r\n"))).toMatchObject({
+});
+it.each(["LF", "CRLF"])(
+  "normalizes malformed %s patch payloads against uniform CRLF source and preserves its bytes",
+  async (patchEnding) => {
+    const content = source.replaceAll("\n", "\r\n");
+    const candidate = patchEnding === "CRLF" ? malformed.replaceAll("\n", "\r\n") : malformed;
+    const fixed = prepare(candidate, content);
+    expect(fixed.status).toBe("NORMALIZED");
+    if (fixed.status !== "NORMALIZED") throw new Error("Expected normalized CRLF fixture");
+    expect(fixed.expectedHash).toBe(digest(content));
+    expect(fixed.repairs).toContain("PRESERVE_CRLF_SOURCE");
+    const d = await fixture(content);
+    expect(apply(d, fixed.patch, { "a.ts": digest(content) })).toMatchObject({
+      applied: true,
+      changedFiles: ["a.ts"],
+    });
+    expect(await readFile(path.join(d, "a.ts"), "utf8")).toBe(
+      content.replaceAll("].sort();", "].sort((a, b) => a - b);"),
+    );
+    expect(prepare(fixed.patch, content)).toEqual({ status: "UNCHANGED", patch: fixed.patch });
+  },
+);
+it("adapts valid LF hunk payloads to exact CRLF source, while preserving valid CRLF patches verbatim", async () => {
+  const base = prepare();
+  if (base.status !== "NORMALIZED") throw new Error("Expected LF fixture");
+  const content = source.replaceAll("\n", "\r\n");
+  const fixed = prepare(base.patch, content);
+  expect(fixed.status).toBe("NORMALIZED");
+  if (fixed.status !== "NORMALIZED") return;
+  expect(fixed.repairs).toContain("MATCH_SOURCE_LINE_ENDINGS");
+  const d = await fixture(content);
+  expect(apply(d, fixed.patch, { "a.ts": digest(content) }).applied).toBe(true);
+  expect(await readFile(path.join(d, "a.ts"), "utf8")).toBe(
+    content.replaceAll("].sort();", "].sort((a, b) => a - b);"),
+  );
+  const physicalCrLf = fixed.patch.replace(/(?<!\r)\n/gu, "\r\n");
+  expect(prepare(physicalCrLf, content)).toEqual({ status: "UNCHANGED", patch: physicalCrLf });
+  const physicalFixture = await fixture(content);
+  expect(apply(physicalFixture, physicalCrLf, { "a.ts": digest(content) }).applied).toBe(true);
+  expect(await readFile(path.join(physicalFixture, "a.ts"), "utf8")).toBe(
+    content.replaceAll("].sort();", "].sort((a, b) => a - b);"),
+  );
+});
+it("normalizes uniform CRLF patch serialization to LF source without changing literal backslash text", async () => {
+  const content = 'const literal = "\\r\\n";\nconst value = 1;\n';
+  const candidate =
+    '--- a/a.ts\r\n+++ b/a.ts\r\n@@\r\n const literal = "\\r\\n";\r\n-const value = 1;\r\n+const value = 2;\r\n';
+  const fixed = prepare(candidate, content);
+  if (fixed.status !== "NORMALIZED") throw new Error("Expected normalized serialized patch");
+  const d = await fixture(content);
+  expect(apply(d, fixed.patch, { "a.ts": digest(content) }).applied).toBe(true);
+  expect(await readFile(path.join(d, "a.ts"), "utf8")).toBe(
+    content.replace("value = 1", "value = 2"),
+  );
+});
+it("rejects mixed or lone-CR compatibility inputs, missing final newlines, stale SHA and ambiguous CRLF blocks", () => {
+  const crlf = source.replaceAll("\n", "\r\n");
+  for (const content of [
+    crlf.replace("\r\n", "\n"),
+    source.replace("\n", "\r"),
+    crlf.slice(0, -2),
+  ]) {
+    expect(prepare(malformed, content)).toMatchObject({
+      status: "REJECTED",
+      kind: "UNSUPPORTED_PATCH",
+    });
+  }
+  expect(
+    prepare(malformed.replace("   const left = [\n", "   const left = [\r\n"), crlf),
+  ).toMatchObject({ status: "REJECTED", kind: "UNSUPPORTED_PATCH" });
+  expect(prepare(malformed, crlf, "0".repeat(64))).toMatchObject({
     status: "REJECTED",
-    kind: "UNSUPPORTED_PATCH",
+    kind: "STALE_SOURCE",
+  });
+  expect(prepare(malformed, crlf + crlf)).toMatchObject({
+    status: "REJECTED",
+    kind: "CONTEXT_MISMATCH",
   });
 });
 it("rejects another target and overlapping hunks", () => {

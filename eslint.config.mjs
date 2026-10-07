@@ -18,6 +18,7 @@ export default tseslint.config(
       ".claude/**",
       "docs/performance/**",
       "benchmarks/real-issues/**",
+      "datasets/**",
       "tests/fixtures/planner-*/**",
       "scripts/{execute-recovery-v*,oracle-coverage-v*,plan-factorial-v*,plan-agent,phase171,phase172,real-issues}/**",
       "scripts/{real-dataset-*,score-real-dataset,stage-*,staged-planner-*,summarize-*,localization-graph-fix-replay,review-length-recovery-live,build-historical-benchmark}.mjs",

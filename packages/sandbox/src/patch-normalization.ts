@@ -1,5 +1,13 @@
 import { createHash } from "node:crypto";
 
+const withoutTrailingCr = (line: string) => line.replace(/\r$/u, "");
+function sourceLineEndings(content: string): "LF" | "CRLF" | "MIXED" | "NONE" {
+  if (/\r(?!\n)/u.test(content)) return "MIXED";
+  const crlf = /\r\n/u.test(content),
+    lf = /(?<!\r)\n/u.test(content);
+  return crlf && lf ? "MIXED" : crlf ? "CRLF" : lf ? "LF" : "NONE";
+}
+
 export type PatchFailureKind =
   | "FORMAT_INVALID"
   | "CONTEXT_MISMATCH"
@@ -36,15 +44,15 @@ export function normalizePatchCandidate(input: {
   if (lines.at(-1) === "") lines.pop();
   let needsRepair = false;
   const repairs: string[] = [];
-  if (lines.at(-1) === "*** End Patch") {
+  if (withoutTrailingCr(lines.at(-1) ?? "") === "*** End Patch") {
     lines.pop();
     needsRepair = true;
     repairs.push("REMOVE_TRAILING_END_PATCH_MARKER");
   }
   const headers = lines.flatMap((line, i) => (line.startsWith("--- ") ? [i] : []));
   for (const i of headers) {
-    const oldPath = lines[i]!.slice(4),
-      newPath = lines[i + 1]?.slice(4);
+    const oldPath = withoutTrailingCr(lines[i]!).slice(4),
+      newPath = lines[i + 1] && withoutTrailingCr(lines[i + 1]!).slice(4);
     const name = oldPath === "/dev/null" ? newPath?.slice(2) : oldPath.slice(2);
     const target = input.targets.find((t) => t.path === name);
     const operation =
@@ -64,7 +72,7 @@ export function normalizePatchCandidate(input: {
   // Standard multi-file/create/delete patches remain under the existing Git path.
   if (headers.length !== 1) {
     const diagnostics: string[] = [];
-    const paths = headers.map((i) => lines[i]!.slice(4));
+    const paths = headers.map((i) => withoutTrailingCr(lines[i]!).slice(4));
     if (new Set(paths).size < paths.length)
       diagnostics.push(
         "Repeated file sections: use one file header with non-overlapping hunks, or replaceText for exact edits.",
@@ -95,8 +103,8 @@ export function normalizePatchCandidate(input: {
       : { status: "UNCHANGED", patch: input.patch };
   }
   const header = headers[0]!;
-  const from = lines[header]!.match(/^--- a\/(.+)$/u)?.[1];
-  const to = lines[header + 1]?.match(/^\+\+\+ b\/(.+)$/u)?.[1];
+  const from = withoutTrailingCr(lines[header]!).match(/^--- a\/(.+)$/u)?.[1];
+  const to = withoutTrailingCr(lines[header + 1] ?? "").match(/^\+\+\+ b\/(.+)$/u)?.[1];
   if (!from || from !== to)
     return needsRepair || lines.some((l) => l === "@@")
       ? reject(
@@ -107,7 +115,7 @@ export function normalizePatchCandidate(input: {
   const hunks: { body: string[]; old: string[]; next: string[] }[] = [];
   let hasNoNewlineMarker = false;
   for (let i = header + 2; i < lines.length;) {
-    const marker = lines[i++]!;
+    const marker = withoutTrailingCr(lines[i++]!);
     const parsed = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?:.*)$/u.exec(marker);
     if (marker !== "@@" && !parsed)
       return reject(
@@ -121,7 +129,7 @@ export function normalizePatchCandidate(input: {
     const body: string[] = [];
     while (i < lines.length && !lines[i]!.startsWith("@@")) {
       const line = lines[i++]!;
-      if (line === "\\ No newline at end of file") {
+      if (withoutTrailingCr(line) === "\\ No newline at end of file") {
         hasNoNewlineMarker = true;
         continue;
       }
@@ -143,6 +151,22 @@ export function normalizePatchCandidate(input: {
     }
     hunks.push({ body, old, next });
   }
+  const current = input.current.get(from);
+  const ending = current && sourceLineEndings(current.content);
+  const bodyLines = hunks.flatMap((hunk) => hunk.body);
+  const crlfBody = bodyLines.some((line) => line.endsWith("\r"));
+  const lfBody = bodyLines.some((line) => !line.endsWith("\r"));
+  // A model may supply logical LF hunk lines for verified CRLF source (or
+  // serialize the whole diff with CRLF for LF source). Convert only uniform
+  // payload endings after the same exact-block/SHA checks used for syntax repair.
+  if (
+    !needsRepair &&
+    bodyLines.length &&
+    ((ending === "CRLF" && lfBody && !crlfBody) || (ending === "LF" && crlfBody && !lfBody))
+  ) {
+    needsRepair = true;
+    repairs.push("MATCH_SOURCE_LINE_ENDINGS");
+  }
   if (!needsRepair) return { status: "UNCHANGED", patch: input.patch };
   if (hasNoNewlineMarker)
     return reject(
@@ -157,15 +181,14 @@ export function normalizePatchCandidate(input: {
       .slice(0, header)
       .some(
         (l) =>
-          l !== `diff --git a/${from} b/${from}` &&
-          !/^index [0-9a-f]+\.\.[0-9a-f]+(?: 100644| 100755)?$/u.test(l),
+          withoutTrailingCr(l) !== `diff --git a/${from} b/${from}` &&
+          !/^index [0-9a-f]+\.\.[0-9a-f]+(?: 100644| 100755)?$/u.test(withoutTrailingCr(l)),
       )
   )
     return reject(
       "UNSUPPORTED_PATCH",
       "Metadata, mode changes, renames and unknown envelopes cannot be normalized.",
     );
-  const current = input.current.get(from);
   if (
     !current ||
     createHash("sha256").update(current.content).digest("hex") !== current.expectedHash
@@ -174,14 +197,29 @@ export function normalizePatchCandidate(input: {
       "STALE_SOURCE",
       "Current content hash must match the approved execution evidence.",
     );
-  if (current.content.includes("\r") || !current.content.endsWith("\n"))
+  if (
+    (ending !== "LF" && ending !== "CRLF") ||
+    !current.content.endsWith(ending === "CRLF" ? "\r\n" : "\n")
+  )
     return reject(
       "UNSUPPORTED_PATCH",
-      "Compatibility currently requires LF text with a final newline; original bytes were preserved.",
+      "Compatibility requires uniform LF/CRLF source with a final newline; mixed endings, lone CR or a missing final newline require exact replaceText or a valid standard patch. Original bytes were preserved.",
+    );
+  if ((crlfBody && lfBody) || bodyLines.some((line) => withoutTrailingCr(line).includes("\r")))
+    return reject(
+      "UNSUPPORTED_PATCH",
+      "Compatibility requires uniform hunk body line endings; mixed endings or lone CR were not guessed. Use exact replaceText or a valid standard patch.",
     );
   if (!hunks.length || hunks.length > 16)
     return reject("FORMAT_INVALID", "Expected 1–16 bounded hunks.");
-  const source = current.content.slice(0, -1).split("\n");
+  const newline = ending === "CRLF" ? "\r\n" : "\n";
+  const source = current.content.slice(0, -newline.length).split(newline);
+  for (const hunk of hunks) {
+    hunk.old = hunk.old.map(withoutTrailingCr);
+    hunk.next = hunk.next.map(withoutTrailingCr);
+  }
+  if (ending === "CRLF") repairs.push("PRESERVE_CRLF_SOURCE");
+  if (crlfBody && ending === "LF") repairs.push("MATCH_SOURCE_LINE_ENDINGS");
   const edits: { start: number; end: number; next: string[] }[] = [];
   for (const hunk of hunks) {
     if (!hunk.old.length || hunk.body.every((l) => l[0] === " "))
@@ -231,7 +269,7 @@ export function normalizePatchCandidate(input: {
     const newCount = body.filter((l) => l[0] !== "-").length;
     output.push(
       `@@ -${group.start + 1},${oldCount} +${group.start + offset + 1},${newCount} @@`,
-      ...body,
+      ...body.map((line) => line + (ending === "CRLF" ? "\r" : "")),
     );
     offset += newCount - oldCount;
   }

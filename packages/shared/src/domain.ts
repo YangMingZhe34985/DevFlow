@@ -267,6 +267,8 @@ export const AdaptiveBudgetMetricsSchema = z.object({
 export type AdaptiveBudgetMetrics = z.infer<typeof AdaptiveBudgetMetricsSchema>;
 
 export const RunMetricsSchema = z.object({
+  modelRequestAttempts: z.number().int().nonnegative().optional(),
+  modelRequestsDispatched: z.number().int().nonnegative().optional(),
   durationMs: z.number().int().nonnegative(),
   steps: z.number().int().nonnegative(),
   modelCalls: z.number().int().nonnegative(),
@@ -315,6 +317,17 @@ export const RepairFindingResponseSchema = z
   })
   .strict();
 export const PhaseCompletionSchema = z.object({
+  evidenceRefs: z
+    .array(z.string().regex(/^source-[a-f0-9]{24}$/u))
+    .max(4)
+    .optional(),
+  replanRequest: z
+    .object({
+      candidatePaths: z.array(z.string().min(1).max(1024)).min(1).max(8),
+      reason: z.string().min(1).max(2000),
+    })
+    .strict()
+    .optional(),
   findingResponses: z
     .array(
       RepairFindingResponseSchema.extend({

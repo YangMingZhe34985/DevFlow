@@ -1,4 +1,4 @@
-import type { TokenUsage } from "@devflow/shared";
+import type { MutationResult, TokenUsage } from "@devflow/shared";
 import type { z } from "zod";
 
 export type ModelMessageRole = "SYSTEM" | "USER" | "ASSISTANT" | "TOOL";
@@ -16,6 +16,8 @@ export type ModelMessage =
       toolCallId: string;
       toolName: string;
       isError: boolean;
+      /** Trusted executor observation; never inferred from model-authored tool output. */
+      mutation?: MutationResult;
     };
 
 export interface ModelToolDescriptor {

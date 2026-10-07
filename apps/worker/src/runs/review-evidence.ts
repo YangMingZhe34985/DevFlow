@@ -1,3 +1,4 @@
+import { matchTaskQuote } from "./task-quote.js";
 import { z } from "zod";
 import {
   ReviewResultSchema,
@@ -270,7 +271,7 @@ export function assessReview(
       !scope.taskQuote ||
       Boolean(
         evidence?.task &&
-        `${evidence.task.title}\n${evidence.task.description}`.includes(scope.taskQuote),
+        matchTaskQuote(`${evidence.task.title}\n${evidence.task.description}`, scope.taskQuote),
       );
     const baselineLinked = Boolean(
       scope.baselineEvidence &&
@@ -419,9 +420,10 @@ export function assessReview(
     if (
       quote &&
       evidence?.task &&
-      !`${evidence.task.title}\n${evidence.task.description}`.includes(quote)
+      !matchTaskQuote(`${evidence.task.title}\n${evidence.task.description}`, quote)
     ) {
-      const fromPlan = evidence.planInterpretation?.summary.includes(quote);
+      const fromPlan =
+        evidence.planInterpretation && matchTaskQuote(evidence.planInterpretation.summary, quote);
       return [
         {
           ...row,
@@ -464,6 +466,23 @@ export function assessReview(
           field: "scopeAssessment.baselineEvidence",
           message:
             "A regression or unrelated-existing-defect assessment needs the exact baseline source quote. Request BASELINE evidence rather than rereading current source.",
+        },
+      ];
+    // An acknowledged gap is not a claimed defect: obtain the missing evidence
+    // before demanding a failure derivation. Invalid task/source references above
+    // still require correction, and the finding remains blocking until re-review.
+    if (
+      (issue.kind ?? (output.verdict === "NEEDS_EVIDENCE" ? "EVIDENCE_GAP" : "DEFECT")) ===
+      "EVIDENCE_GAP"
+    )
+      return [
+        {
+          ...row,
+          category: "SOURCE" as const,
+          code: "ESSENTIAL_SOURCE_EVIDENCE_MISSING",
+          field: "evidenceRequests",
+          message:
+            "Obtain the missing current or baseline evidence using a public path or symbol. Then reassess this finding and its task relationship; a gap is not a confirmed defect and cannot be closed by omission.",
         },
       ];
     if (!issue.behavior)
@@ -530,4 +549,4 @@ export const REVIEW_PROMPT =
   " Omit probeId on first submission or provide a client label. The host assigns a durable probe ID and registers the label as an alias. Corrections must use the same finding's host ID or registered alias, never an unknown old ID or another finding's ID. Example: assertBehavior(entry.value === 2, 'value=2', String(entry.value)); actual must be a string, not an object or boolean." +
   " For every defect provide scopeAssessment {category: ISSUE_UNRESOLVED|PATCH_REGRESSION|PREEXISTING_UNRELATED|UNDETERMINED, explanation, taskQuote?, baselineEvidence?: {path, quote}}. ISSUE_UNRESOLVED must address a stated task requirement, not a newly invented extension. PATCH_REGRESSION needs a concrete base/current behavioral comparison (public probe or static derivation) and an exact baseline source quote; request BASELINE evidence if absent. PREEXISTING_UNRELATED needs baseline evidence that the same defect already exists and an explanation why it is outside this Issue; mark it DEFERRED and do not instruct Repair. The reported Issue itself is preexisting and still must be fixed. A public API defect alone does not establish task scope. Unverified relation is UNDETERMINED and requires evidence only when necessary to decide the current task. Do not close a prior blocker merely by omission or relabeling; independently explain its resolution or deferral." +
   " The diff is cumulative from the approved base; repairResponse.summary describes the latest Repair increment, so these may legitimately describe different change scopes. A claimed counterexample must actually fail; examples that satisfy their expected outcomes do not demonstrate a defect." +
-  " Distinguish DEFECT, EVIDENCE_GAP and SUGGESTION. Suggestions never block. For a medium/high DEFECT include behavior {scenario, expected, actual, requirementBasis: ISSUE|PUBLIC_API|REGRESSION, requirement, evidenceBasis?: STATIC_DERIVATION|PUBLIC_PROBE} and a current exact source quote; actual may be a specific static failure derivation. Set evidenceBasis STATIC_DERIVATION when independently reasoning from source despite an inconclusive probe, or PUBLIC_PROBE when relying on a valid host behavior assertion. Missing support is an EVIDENCE_GAP, not a Repair instruction. Do not demand arbitrary unsupported generalizations. If essential evidence is missing, request up to three evidenceRequests {path?, symbol?, view?: CURRENT|BASELINE, question}. The host can supply at most two rounds sharing eight reads, 1 MiB originals and 32 KiB snippets. CURRENT and BASELINE are different versions; a partial range does not prove missing implementation. Check complete processing and finalization/helper paths before asserting a placeholder stays empty or a marker is unused. Do not infer coverage from absence of a new protected test edit. Reuse known findingIds from findingHistory, and report RESOLVED or CONTRADICTED only with current evidence and explicit explanation. Check repairResponse before repeating a finding; unverified prose is a hypothesis. Missing evidence remains blocking until independent re-review resolves it. Tools remain unavailable.";
+  " Distinguish DEFECT, EVIDENCE_GAP and SUGGESTION. Suggestions never block. For a medium/high DEFECT include behavior {scenario, expected, actual, requirementBasis: ISSUE|PUBLIC_API|REGRESSION, requirement, evidenceBasis?: STATIC_DERIVATION|PUBLIC_PROBE} and a current exact source quote; actual may be a specific static failure derivation. Set evidenceBasis STATIC_DERIVATION when independently reasoning from source despite an inconclusive probe, or PUBLIC_PROBE when relying on a valid host behavior assertion. Missing support is an EVIDENCE_GAP, not a Repair instruction. Do not demand arbitrary unsupported generalizations. If essential evidence is missing, request up to three evidenceRequests {path?, symbol?, view?: CURRENT|BASELINE, question}. Each source request must identify a public path or symbol; a question alone cannot locate code. Do not invent a failure merely to justify reading missing implementation. The host can supply at most two rounds sharing eight reads, 1 MiB originals and 32 KiB snippets. CURRENT and BASELINE are different versions; a partial range does not prove missing implementation. Check complete processing and finalization/helper paths before asserting a placeholder stays empty or a marker is unused. Do not infer coverage from absence of a new protected test edit. Reuse known findingIds from findingHistory, and report RESOLVED or CONTRADICTED only with current evidence and explicit explanation. Check repairResponse before repeating a finding; unverified prose is a hypothesis. Missing evidence remains blocking until independent re-review resolves it. Tools remain unavailable.";

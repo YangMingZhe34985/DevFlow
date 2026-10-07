@@ -37,17 +37,21 @@ for (const path of paths) {
   if (/\b(?:sk-|github_pat_|ghp_)[A-Za-z0-9_-]{24,}\b/u.test(content))
     problems.push({ path, reason: "Possible embedded credential (value omitted)" });
 }
+const releaseVersion = JSON.parse(readFileSync("package.json", "utf8")).version;
+if (!/^\d+\.\d+\.\d+$/u.test(releaseVersion))
+  problems.push({ path: "package.json", reason: "Invalid release version" });
 const lock = JSON.parse(readFileSync("package-lock.json", "utf8"));
 for (const [path, metadata] of Object.entries(lock.packages)) {
   if (path !== "" && !/^(?:apps|packages)\/[^/]+$/u.test(path)) continue;
   const file = path ? `${path}/package.json` : "package.json";
   const pkg = JSON.parse(readFileSync(file, "utf8"));
-  if (pkg.version !== "2.0.0" || metadata.version !== pkg.version)
+  if (pkg.version !== releaseVersion || metadata.version !== pkg.version)
     problems.push({ path: file, reason: "Release version mismatch" });
   for (const name of Object.keys(pkg.dependencies ?? {}))
     if (
       name.startsWith("@devflow/") &&
-      (pkg.dependencies[name] !== "2.0.0" || metadata.dependencies?.[name] !== "2.0.0")
+      (pkg.dependencies[name] !== releaseVersion ||
+        metadata.dependencies?.[name] !== releaseVersion)
     )
       problems.push({ path: file, reason: `Workspace dependency mismatch: ${name}` });
 }

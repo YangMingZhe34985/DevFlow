@@ -1,9 +1,10 @@
+import { parseStaticSource } from "./source-units.js";
 import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 
 import { z } from "zod";
 
-export const PARSER_VERSION = "typescript-5.9.3-declarations-v2-512k";
+export const PARSER_VERSION = "typescript-5.9.3-declarations-v3-source-units";
 export const ParsedFileSchema = z.object({
   status: z.enum(["PARSED", "LEXICAL", "PARSE_ERROR"]),
   symbols: z
@@ -94,7 +95,23 @@ async function parseInWorker(
 ): Promise<ParsedFile> {
   signal.throwIfAborted();
   if (!/^(?:ts|tsx|js|jsx|mts|cts|mjs|cjs)$/u.test(extension)) {
-    return { status: "LEXICAL", symbols: [], imports: [] };
+    const unit = parseStaticSource(`source.${extension}`, content);
+    return {
+      status: "LEXICAL",
+      symbols:
+        unit?.definitions.map((d) => ({
+          name: d.name,
+          signature: content.split("\n")[d.startLine - 1]!.slice(0, 512),
+          startLine: d.startLine,
+          endLine: d.endLine,
+        })) ?? [],
+      imports:
+        unit?.dependencies.map((d) => ({
+          specifier: d.specifier,
+          kind: "import" as const,
+          line: d.line,
+        })) ?? [],
+    };
   }
   if (Buffer.byteLength(content) > 512 * 1024) throw new Error("Parser input exceeds 512 KiB");
   const worker = new Worker(script, {

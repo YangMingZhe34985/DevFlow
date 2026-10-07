@@ -1,6 +1,6 @@
 {
   "name": "@devflow/eval",
-  "version": "2.0.0",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -22,8 +22,8 @@
     "typecheck": "tsc -b"
   },
   "dependencies": {
-    "@devflow/database": "2.0.0",
-    "@devflow/shared": "2.0.0",
+    "@devflow/database": "2.2.0",
+    "@devflow/shared": "2.2.0",
     "zod": "4.6.5"
   }
 }

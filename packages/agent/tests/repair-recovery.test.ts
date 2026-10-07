@@ -206,3 +206,168 @@ it("restores consumed credit without resetting it, and rejects empty Repair comp
   ).run(request, fixture().context);
   expect(empty.error?.code).toBe("AGENT_STALLED");
 });
+
+it("corrects a protocol error once at a closed exploration boundary and persists the shared credit", async () => {
+  const f = fixture();
+  let saved: AgentState | undefined;
+  f.context.stateStore = {
+    load: async () => undefined,
+    save: async (state) => {
+      saved = structuredClone(state);
+    },
+  };
+  let reads = 0;
+  f.context.executeTool = async () =>
+    ++reads === 1
+      ? {
+          ok: false,
+          durationMs: 0,
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "readFile.startLine must be positive",
+            retryable: false,
+          },
+        }
+      : {
+          ok: true,
+          durationMs: 0,
+          output: {
+            path: "a.py",
+            fileSha256: "a".repeat(64),
+            startLine: 1,
+            endLine: 1,
+            content: "import unused",
+          },
+        };
+  const model = new FakeLanguageModel([
+    fakeModelResponse({
+      toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "a.py", startLine: -1 } }],
+    }),
+    async (r) => {
+      expect(r.tools.map((t) => t.name)).toEqual(["readFile", "finishPhase"]);
+      expect(saved?.executionRecovery).toMatchObject({
+        used: true,
+        correctionReason: "PROTOCOL_INVALID",
+        correctionTool: "readFile",
+      });
+      return fakeModelResponse({
+        toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "a.py", startLine: 1 } }],
+      });
+    },
+    finish(),
+  ]);
+  const result = await new DefaultAgentRuntime(model).run(request, f.context);
+  expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+  expect(reads).toBe(2);
+});
+it("does not count a repeated parameter failure as progress or renew correction after restore", async () => {
+  const f = fixture();
+  f.context.executeTool = async () => ({
+    ok: false,
+    durationMs: 0,
+    error: { code: "VALIDATION_ERROR", message: "readFile.startLine invalid", retryable: false },
+  });
+  const response = fakeModelResponse({
+    toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "a.py", startLine: -1 } }],
+  });
+  const model = new FakeLanguageModel([response, response, finish()]);
+  const result = await new DefaultAgentRuntime(model).run(request, f.context);
+  expect(result.error?.message).toContain("PROTOCOL_CORRECTION_EXHAUSTED");
+  expect(model.requests).toHaveLength(2);
+  const restored = new FakeLanguageModel([response, finish()]);
+  const second = await new DefaultAgentRuntime(restored).run(
+    {
+      ...request,
+      executionRecovery: {
+        pending: false,
+        used: true,
+        explorationClosed: false,
+        correctionReason: "PROTOCOL_INVALID",
+        correctionTool: "readFile",
+      },
+    },
+    f.context,
+  );
+  expect(second.error?.message).toContain("PROTOCOL_CORRECTION_EXHAUSTED");
+  expect(restored.requests).toHaveLength(1);
+});
+it("allows one finishPhase field correction without bypassing evidence validation", async () => {
+  const f = fixture();
+  f.context.validateFinishPhase = (input) =>
+    (input as { findingIds?: string[] }).findingIds?.length
+      ? "finishPhase.findingId: unknown host ID"
+      : undefined;
+  const model = new FakeLanguageModel([
+    fakeModelResponse({
+      toolCalls: [
+        {
+          id: randomUUID(),
+          name: "finishPhase",
+          input: { summary: "blocked", outcome: "SCOPE_CONFLICT", findingIds: ["invented"] },
+        },
+      ],
+    }),
+    async (r) => {
+      expect(r.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+      return finish();
+    },
+  ]);
+  expect((await new DefaultAgentRuntime(model).run(request, f.context)).status).toBe("SUCCEEDED");
+});
+
+it.each(["EDIT_CORRECTION_REQUIRED: exploration is closed", "APPROVAL_SCOPE: denied"])(
+  "does not spend protocol correction on host rejection: %s",
+  async (reason) => {
+    const f = fixture();
+    let saved: AgentState | undefined;
+    f.context.authorizeTool = () => reason;
+    f.context.stateStore = {
+      load: async () => undefined,
+      save: async (s) => {
+        saved = structuredClone(s);
+      },
+    };
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "new.py" } }],
+      }),
+      async (r) => {
+        expect(JSON.stringify(r.messages)).toContain("HOST_AUTHORIZATION");
+        expect(r.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+        expect(saved?.executionRecovery?.used ?? false).toBe(false);
+        expect(saved?.executionRecovery?.pending ?? false).toBe(false);
+        return finish();
+      },
+    ]);
+    expect((await new DefaultAgentRuntime(model).run(request, f.context)).status).toBe("SUCCEEDED");
+    expect(f.executed()).toBe(0);
+  },
+);
+
+it("keeps a restored authorization handoff read-free and cannot renew it after repeated denial", async () => {
+  const f = fixture(),
+    model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "x.py" } }],
+      }),
+      fakeModelResponse({
+        toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "y.py" } }],
+      }),
+    ]);
+  const result = await new DefaultAgentRuntime(model).run(
+    {
+      ...request,
+      executionRecovery: {
+        pending: false,
+        used: false,
+        explorationClosed: true,
+        authorizationHandoffUsed: true,
+      },
+    },
+    f.context,
+  );
+  expect(result.status).toBe("FAILED");
+  expect(result.error?.code).toBe("AGENT_STALLED");
+  expect(model.requests).toHaveLength(1);
+  expect(f.executed()).toBe(0);
+});

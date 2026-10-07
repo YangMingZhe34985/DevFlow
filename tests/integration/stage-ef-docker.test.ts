@@ -8,6 +8,7 @@ import {
   DefaultAgentRuntime,
   FakeLanguageModel,
   fakeModelResponse,
+  PostPatchController,
   type ModelRequest,
 } from "@devflow/agent";
 import { PrismaDatabaseAdapter } from "@devflow/database";
@@ -28,6 +29,9 @@ import {
   createTools,
   initialWorkflowMetrics,
 } from "../../apps/worker/src/runs/approval-workflow-run-executor.js";
+import { observePostPatchTool } from "../../apps/worker/src/runs/post-patch.js";
+import { ensureLocalRunSnapshot } from "../../apps/worker/src/runs/local-run-snapshot.js";
+import { proposalMutationDenial } from "../../apps/worker/src/runs/plan-proposal.js";
 
 const integration = process.env.DEVFLOW_EF_INTEGRATION === "1" ? describe : describe.skip;
 const exec = promisify(execFile);
@@ -90,6 +94,239 @@ integration("E/F real Docker and database integration", () => {
       await rm(fixtureRoot, { recursive: true, force: true });
     }
   });
+
+  it.each(["APPROVE", "BUDGET_STOP", "TEST_ONLY", "HOST_TEST_EVIDENCE"] as const)(
+    "bounded scope replan and candidate restoration: %s",
+    async (mode) => {
+      const repository = await database.repositories.create({
+        name: `scope-${randomUUID()}`,
+        sourceKind: "LOCAL",
+        sourceUri: fixtureRoot,
+      });
+      const task = await database.tasks.create({
+        repositoryId: repository.id,
+        title: "Repair subtraction",
+        description: "Fix subtract; preserve add and existing tests.",
+        baseCommitSha: baseCommit,
+      });
+      const { run: created } = await database.runs.create({
+        taskId: task.id,
+        maxSteps: 20,
+        maxTestRetries: 3,
+        maxReviewRetries: 1,
+      });
+      const owner = `scope-${randomUUID()}`,
+        signal = AbortSignal.timeout(180000);
+      const oldPlan: AgentPlan = {
+        summary: "Investigate subtraction through the export wrapper",
+        steps: [
+          {
+            id: "wrapper",
+            title: "Inspect wrapper",
+            description: "Investigate the approved wrapper.",
+          },
+        ],
+        proposalVersion: "plan-proposal-v1",
+        approvalScope: {
+          version: "plan-approval-scope-v1",
+          mode: "READY",
+          baseCommitSha: baseCommit,
+          workspaceRevision: 0,
+          files: [{ path: "src/barrel.js", operation: "MODIFY" }],
+        },
+      };
+      let claimed = (await database.runs.claim(created.id, owner, 240000))!;
+      await ensureLocalRunSnapshot(database, claimed, signal);
+      const initial = await database.runs.pauseForApproval(created.id, owner, oldPlan);
+      await database.approvals.resolveForWorkflow(initial.approval.id, { status: "APPROVED" });
+      claimed = (await database.runs.claim(created.id, owner, 240000))!;
+      const change = {
+        path: "src/calculator.js",
+        oldText: "return left + right;",
+        newText: "return left - right;",
+        expectedSha256: sha(original),
+        expectedOccurrences: 1,
+      };
+      // The first + is in add too: use the exact function-local fragment.
+      change.oldText =
+        "// Intentional fixture bug: the agent should change + to -.\n  return left + right;";
+      change.newText =
+        "// Intentional fixture bug: the agent should change + to -.\n  return left - right;";
+      const both = (edit: unknown) =>
+        fakeModelResponse({
+          toolCalls: [
+            { id: randomUUID(), name: "replaceText", input: edit },
+            {
+              id: randomUUID(),
+              name: "finishPhase",
+              input: { summary: "Current approved candidate", outcome: "CHANGED" },
+            },
+          ],
+          usage: { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
+        });
+      const model = new FakeLanguageModel([
+        both({
+          path: "src/barrel.js",
+          oldText: 'export { subtract } from "./calculator.js";',
+          newText: '// Candidate wrapper retained\nexport { subtract } from "./calculator.js";',
+          expectedSha256: sha('export { subtract } from "./calculator.js";\n'),
+        }),
+        call("readFile", { path: "src/calculator.js" }),
+        ...(mode === "TEST_ONLY" ? [call("readFile", { path: "test/calculator.test.js" })] : []),
+        call("replaceText", change), // Must be rejected under the original wrapper-only approval.
+        {
+          ...call("finishPhase", {
+            summary: "The public diagnostic identifies the implementation outside approval",
+            outcome: "SCOPE_CONFLICT",
+            ...(mode === "TEST_ONLY"
+              ? {
+                  evidence: [
+                    {
+                      path: "test/calculator.test.js",
+                      quote: await readFile(
+                        path.join(fixtureRoot, "test/calculator.test.js"),
+                        "utf8",
+                      ),
+                      fileSha256: sha(
+                        await readFile(path.join(fixtureRoot, "test/calculator.test.js"), "utf8"),
+                      ),
+                    },
+                  ],
+                }
+              : {}),
+            replanRequest: {
+              candidatePaths: ["src/calculator.js"],
+              reason: "The public check fails in the subtract implementation",
+            },
+          }),
+          ...(mode === "BUDGET_STOP"
+            ? { usage: { inputTokens: 45000, outputTokens: 100, totalTokens: 45100 } }
+            : {}),
+        },
+        fakeModelResponse({
+          output: {
+            decision: "PROPOSE",
+            goal: "subtract returns the difference",
+            approach: ["Correct subtract and retain the wrapper candidate"],
+            candidateFiles: [
+              {
+                path: "src/calculator.js",
+                intent: "EDIT",
+                reason: "Current public failing behavior",
+              },
+            ],
+            verification: ["public arithmetic checks"],
+            uncertainties: [],
+          },
+          toolCalls: [],
+        }),
+        both(change),
+      ]);
+      const review = new FakeLanguageModel([
+        fakeModelResponse({
+          output: {
+            verdict: "PASS",
+            summary: "Subtraction corrected; public verification passes.",
+            issues: [],
+          },
+          toolCalls: [],
+        }),
+      ]);
+      const environment = loadWorkerEnvironment({
+        ...process.env,
+        DATABASE_URL: process.env.TEST_DATABASE_URL,
+        DEVFLOW_TIMEOUT_MS: "1500000",
+        DEVFLOW_MAX_TOTAL_TOKENS: mode === "BUDGET_STOP" ? "120000" : "400000",
+        DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: "60000",
+        DEVFLOW_MAX_RETRIES: "0",
+        DEVFLOW_CONTEXT_COMPRESSION_ENABLED: "false",
+        DEVFLOW_EVIDENCE_ACTION_ENABLED: "false",
+      });
+      const profile = {
+        version: 1 as const,
+        checks: [
+          {
+            kind: "test" as const,
+            source: "public synthetic arithmetic check",
+            command: {
+              program: "node",
+              args: [
+                "--input-type=module",
+                "-e",
+                `import {subtract,add} from "./src/calculator.js"; if(subtract(4,2)!==2 || add(4,2)!==6) { console.error("${mode === "TEST_ONLY" || mode === "HOST_TEST_EVIDENCE" ? "test/calculator.test.js:12" : "src/calculator.js:5"}: incorrect subtract behavior; expected 2, actual "+subtract(4,2)); process.exit(1); } console.log("public arithmetic passes");`,
+              ],
+              cwd: ".",
+              environment: {},
+            },
+          },
+        ],
+      };
+      const worker = new ApprovalWorkflowRunExecutor(
+        database,
+        environment,
+        () => model,
+        () => review,
+        undefined,
+        () => profile,
+      );
+      const paused = await worker.execute(claimed, signal);
+      if (mode === "BUDGET_STOP") {
+        expect(paused.status, JSON.stringify(paused)).toBe("FAILED");
+        if (paused.status !== "FAILED") throw new Error("Expected preflight stop");
+        expect(paused.error.message).toContain("REPLAN_DOWNSTREAM_RESERVE_INSUFFICIENT");
+        expect(model.requests).toHaveLength(4);
+        expect(JSON.stringify(await database.events.list(created.id, { limit: 1000 }))).toContain(
+          '"requestIssued":false',
+        );
+        return;
+      }
+      expect(paused.status, JSON.stringify(paused)).toBe("WAITING_APPROVAL");
+      if (paused.status !== "WAITING_APPROVAL" || paused.approvalKind === "GITHUB")
+        throw new Error("Expected PLAN approval");
+      expect(proposalMutationDenial(oldPlan, "replaceText", ["src/calculator.js"])).toContain(
+        "APPROVAL_SCOPE",
+      );
+      const checkpoint = JSON.parse(
+        (await database.artifacts.list(created.id)).findLast(
+          (a) => a.name === "scope-replan-v1.json",
+        )!.content!,
+      );
+      expect(checkpoint.used).toBe(1);
+      expect(checkpoint.repairAttempts).toBe(1);
+      expect(
+        checkpoint.files.find((f: { path: string }) => f.path === "src/barrel.js").content,
+      ).toContain("Candidate wrapper retained");
+      const approval = await database.runs.pauseForApproval(created.id, owner, paused.plan);
+      expect(approval.approval.id).not.toBe(initial.approval.id);
+      await database.approvals.resolveForWorkflow(approval.approval.id, { status: "APPROVED" });
+      claimed = (await database.runs.claim(created.id, owner, 240000))!;
+      const completed = await worker.execute(claimed, signal);
+      expect(completed.status, JSON.stringify(completed)).toBe("SUCCEEDED");
+      const final = JSON.parse(
+        (await database.artifacts.list(created.id)).findLast(
+          (a) => a.name === "scope-replan-v1.json",
+        )!.content!,
+      );
+      expect(final.used).toBe(1);
+      expect(final.repairAttempts).toBe(2);
+      expect(final.repairInFlight).toBe(false);
+      expect(
+        final.files.find((f: { path: string }) => f.path === "src/calculator.js").content,
+      ).toContain("return left - right;");
+      expect(
+        final.files.find((f: { path: string }) => f.path === "src/barrel.js").content,
+      ).toContain("Candidate wrapper retained");
+      expect(model.requests).toHaveLength(mode === "TEST_ONLY" ? 7 : 6);
+      if (mode === "HOST_TEST_EVIDENCE") {
+        expect(checkpoint.evidenceRecords[0].testEvidence[0].source).toBe("HOST_DIAGNOSTIC_READ");
+        expect(checkpoint.evidenceRecords[0].testEvidence[0].fileSha256).toMatch(/^[a-f0-9]{64}$/u);
+      }
+      const events = await database.events.list(created.id, { limit: 1000 });
+      expect(JSON.stringify(events)).toContain("APPROVAL_SCOPE");
+      expect(JSON.stringify(events)).toContain("APPROVED_SCOPE_REPLAN");
+    },
+    180000,
+  );
 
   it("corrects a malformed patch at a soft boundary in a real sandbox, without changing source on rejection", async () => {
     const runId = randomUUID();
@@ -203,6 +440,99 @@ integration("E/F real Docker and database integration", () => {
           "// Intentional fixture bug: the agent should change + to -.\n  return left + right;",
           "// Intentional fixture bug: the agent should change + to -.\n  return left - right;",
         ),
+      );
+      expect((await sandbox.exec({ program: "npm", args: ["test"] })).exitCode).toBe(0);
+    } finally {
+      await sandbox.dispose();
+    }
+  }, 120000);
+
+  it("preserves current CRLF evidence after a failed exact edit and corrects it without changing unrelated bytes", async () => {
+    const runId = randomUUID();
+    const sandbox = await new DockerSandboxManager({
+      image: "devflow-sandbox:local",
+      workspaceRoot: fixtureRoot,
+    }).create({
+      runId,
+      repository: { sourceUri: pathToFileURL(fixtureRoot).href },
+      limits: { cpuCount: 1, memoryMb: 256, pids: 64, timeoutMs: 60000, networkEnabled: false },
+    });
+    try {
+      const sourcePath = "src/calculator.js";
+      const crlf = original.replace(/\n/gu, "\r\n");
+      await sandbox.writeFile({ path: sourcePath, content: crlf });
+      const oldText =
+        "// Intentional fixture bug: the agent should change + to -.\n  return left + right;";
+      const newText = oldText.replace("left + right", "left - right");
+      const { executor, tools } = createTools(new SandboxGitService());
+      const controller = new PostPatchController([sourcePath]);
+      const model = new FakeLanguageModel([
+        call("readFile", { path: sourcePath }),
+        call("replaceText", {
+          path: sourcePath,
+          oldText,
+          newText,
+          expectedSha256: sha(crlf),
+          expectedOccurrences: 1,
+        }),
+        call("replaceText", {
+          path: sourcePath,
+          oldText,
+          newText,
+          lineEndingMode: "MATCH_FILE",
+          expectedSha256: sha(crlf),
+          expectedOccurrences: 1,
+        }),
+        call("finishPhase", { summary: "Corrected subtraction", outcome: "CHANGED" }),
+      ]);
+      const result = await new DefaultAgentRuntime(model).run(
+        { maxSteps: 4, timeoutMs: 60000, maxRetries: 0 },
+        {
+          runId,
+          task: {
+            taskId: randomUUID(),
+            repositoryId: randomUUID(),
+            title: "Fix subtraction",
+            description: "Preserve existing tests and source line endings.",
+          },
+          signal: AbortSignal.timeout(60000),
+          tools: [...tools, FinishPhaseTool],
+          emit: async () => {},
+          executeTool: async (stepId, request, signal) => {
+            const observed = await observePostPatchTool({
+              controller,
+              request,
+              sandbox,
+              signal: signal!,
+              execute: () =>
+                executor.execute(request, {
+                  runId,
+                  stepId,
+                  sandbox,
+                  signal: signal!,
+                  emit: async () => {},
+                }),
+            });
+            if (request.name === "replaceText" && !observed.ok) {
+              expect((await sandbox.readFile({ path: sourcePath })).content).toBe(crlf);
+              expect(observed.mutation).toMatchObject({
+                observationComplete: true,
+                workspaceChanged: false,
+                beforeRevision: 0,
+                afterRevision: 0,
+              });
+            }
+            return observed;
+          },
+        },
+      );
+      expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+      const read = model.requests[2]!.messages.find(
+        (message) => message.role === "TOOL" && message.toolName === "readFile",
+      );
+      expect(read?.content).toMatchObject({ content: crlf });
+      expect((await sandbox.readFile({ path: sourcePath })).content).toBe(
+        crlf.replace(oldText.replace(/\n/gu, "\r\n"), newText.replace(/\n/gu, "\r\n")),
       );
       expect((await sandbox.exec({ program: "npm", args: ["test"] })).exitCode).toBe(0);
     } finally {

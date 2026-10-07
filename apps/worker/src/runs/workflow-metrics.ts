@@ -44,6 +44,8 @@ export function recordModelResponse(
 ): void {
   const target = stageMetrics(metrics, stage);
   metrics.modelCalls += 1;
+  metrics.modelRequestAttempts = metrics.modelCalls;
+  metrics.modelRequestsDispatched = (metrics.modelRequestsDispatched ?? 0) + 1;
   target.modelCalls += 1;
   metrics.modelLatencyMs += nonnegativeInteger(response.latencyMs);
   target.modelLatencyMs += nonnegativeInteger(response.latencyMs);
@@ -64,6 +66,8 @@ export function recordModelFailure(
   const latency = nonnegativeInteger(latencyMs);
   const target = stageMetrics(metrics, stage);
   metrics.modelCalls += 1;
+  metrics.modelRequestAttempts = metrics.modelCalls;
+  metrics.modelRequestsDispatched = (metrics.modelRequestsDispatched ?? 0) + 1;
   target.modelCalls += 1;
   metrics.modelLatencyMs += latency;
   target.modelLatencyMs += latency;
@@ -111,6 +115,9 @@ export function mergeAgentPhaseMetrics(
   target.steps += source.steps;
   phase.steps += source.steps;
   target.modelCalls += source.modelCalls;
+  target.modelRequestAttempts = target.modelCalls;
+  target.modelRequestsDispatched =
+    (target.modelRequestsDispatched ?? 0) + (source.modelRequestsDispatched ?? source.modelCalls);
   phase.modelCalls += source.modelCalls;
   target.toolCalls += source.toolCalls;
   phase.toolCalls += source.toolCalls;

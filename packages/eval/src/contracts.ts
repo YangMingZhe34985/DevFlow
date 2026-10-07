@@ -13,6 +13,33 @@ const JsonRecordSchema = z.record(z.string(), z.json());
 export const BENCHMARK_RUNTIME_VERSION = "approval-workflow-v1";
 export const BENCHMARK_TOOLS_VERSION = "core-tools-v1";
 
+/** Host-provided public project checks. Evaluator commands never belong here. */
+export const PublicVerificationProfileSchema = z
+  .object({
+    version: z.literal(1),
+    checks: z
+      .array(
+        z
+          .object({
+            kind: z.enum(["build", "typecheck", "lint", "test"]),
+            source: z.string().min(1).max(2000),
+            command: z
+              .object({
+                program: z.string().min(1),
+                args: z.array(z.string()).default([]),
+                cwd: z.string().min(1).default("."),
+                timeoutMs: z.number().int().positive().max(300_000).optional(),
+                environment: z.record(z.string(), z.string()).default({}),
+              })
+              .strict(),
+          })
+          .strict(),
+      )
+      .max(16),
+  })
+  .strict();
+export type PublicVerificationProfile = z.infer<typeof PublicVerificationProfileSchema>;
+
 export const BenchmarkRuntimeConfigurationSchema = z
   .object({
     pipeline: z.literal("approval").optional(),
@@ -20,6 +47,7 @@ export const BenchmarkRuntimeConfigurationSchema = z
     maxSteps: z.number().int().min(1).max(200).optional(),
     maxTestRetries: z.number().int().min(0).max(20).optional(),
     maxReviewRetries: z.number().int().min(0).max(10).optional(),
+    publicVerificationProfile: PublicVerificationProfileSchema.optional(),
   })
   .strict();
 export type BenchmarkRuntimeConfiguration = z.infer<typeof BenchmarkRuntimeConfigurationSchema>;

@@ -111,6 +111,9 @@ export interface EvidencePack {
     fileCount: number;
     indexedBytes: number;
     parsedFiles: number;
+    astParsedFiles?: number;
+    lexicalFiles?: number;
+    parseErrorFiles?: number;
     cacheHits: number;
     duplicateQueries: number;
     cacheState: "COLD" | "WARM" | "PARTIAL";
@@ -172,7 +175,8 @@ export function sourceRole(path: string): SourceRole {
     return "BENCHMARK";
   if (/(?:^|\/)(?:docs?|website)(?:\/|$)/iu.test(path)) return "METADATA";
   if (/(?:^|\/)(?:index|external)\.[cm]?[jt]sx?$/iu.test(path)) return "ENTRY";
-  if (!/\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|c|cpp|h|cs)$/iu.test(path)) return "METADATA";
+  if (!/\.(?:[cm]?[jt]sx?|py|go|rs|rb|java|c|cc|cpp|cxx|h|hh|hpp|hxx|cs)$/iu.test(path))
+    return "METADATA";
   return "IMPLEMENTATION";
 }
 

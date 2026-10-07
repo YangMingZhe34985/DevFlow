@@ -10,6 +10,7 @@ import {
   createInitialAgentState,
   JsonFileAgentStateStore,
 } from "../src/index.js";
+import { invalidateHistoricalReads } from "../src/working-set.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -22,6 +23,63 @@ afterEach(async () => {
 });
 
 describe("AgentState persistence", () => {
+  it("retains and validates trusted mutation observations after restore", () => {
+    const messages = [
+      {
+        role: "TOOL" as const,
+        toolCallId: "r",
+        toolName: "readFile",
+        isError: false,
+        content: { path: "a.ts", content: "current" },
+      },
+      {
+        role: "ASSISTANT" as const,
+        content: "",
+        toolCalls: [{ id: "w", name: "replaceText", input: { path: "a.ts" } }],
+      },
+      {
+        role: "TOOL" as const,
+        toolCallId: "w",
+        toolName: "replaceText",
+        isError: true,
+        content: { code: "CONFLICT" },
+        mutation: {
+          status: "REJECTED" as const,
+          executionSucceeded: false,
+          mutationAttempted: true,
+          mutationApplied: false,
+          workspaceChanged: false,
+          reason: "TEXT_MATCH_COUNT",
+          beforeRevision: 1,
+          afterRevision: 1,
+          changedFiles: [],
+          currentHashes: { "a.ts": "a".repeat(64) },
+          observationComplete: true,
+          affectedPaths: ["a.ts"],
+        },
+      },
+    ];
+    const serializer = new AgentStateSerializer();
+    const state = createInitialAgentState(randomUUID(), messages);
+    const restored = serializer.deserialize(serializer.serialize(state));
+    expect(restored.messages).toEqual(messages);
+    expect(invalidateHistoricalReads(restored.messages)).toEqual(messages);
+    const deleted = JSON.parse(serializer.serialize(state));
+    deleted.messages[2].mutation.currentHashes["a.ts"] = "ABSENT";
+    expect(serializer.deserialize(JSON.stringify(deleted)).messages[2]).toMatchObject({
+      mutation: { currentHashes: { "a.ts": "ABSENT" } },
+    });
+    const invalid = JSON.parse(serializer.serialize(state));
+    invalid.messages[2].mutation.observationComplete = "true";
+    expect(() => serializer.deserialize(JSON.stringify(invalid))).toThrow(
+      "Persisted AgentState is invalid",
+    );
+    invalid.messages[2].mutation.observationComplete = true;
+    invalid.messages[2].mutation.currentHashes["a.ts"] = "truncated-sha";
+    expect(() => serializer.deserialize(JSON.stringify(invalid))).toThrow(
+      "Persisted AgentState is invalid",
+    );
+  });
   it("serializes and validates a state round trip", () => {
     const runId = randomUUID();
     const state = createInitialAgentState(runId, [{ role: "USER", content: "修复 Unicode 测试" }]);

@@ -50,6 +50,10 @@ export interface MutationResult {
   mutationAttempted: boolean;
   mutationApplied: boolean;
   workspaceChanged: boolean;
+  /** All potentially affected paths have complete before/after file identities. */
+  observationComplete?: boolean;
+  /** Host-resolved paths; absence means the potential write scope is unknown. */
+  affectedPaths?: string[];
   reason: string;
   beforeRevision: number;
   afterRevision: number;

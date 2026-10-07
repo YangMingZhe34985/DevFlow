@@ -39,6 +39,24 @@ const ModelToolCallSchema = z.object({
   input: z.unknown(),
 });
 
+const MutationObservationSchema = z.object({
+  status: z.enum(["APPLIED", "NO_OP", "REJECTED", "FAILED"]),
+  executionSucceeded: z.boolean(),
+  mutationAttempted: z.boolean(),
+  mutationApplied: z.boolean(),
+  workspaceChanged: z.boolean(),
+  reason: z.string(),
+  beforeRevision: z.number().int().nonnegative(),
+  afterRevision: z.number().int().nonnegative(),
+  changedFiles: z.array(z.string()),
+  currentHashes: z.record(
+    z.string(),
+    z.union([z.string().regex(/^[a-f0-9]{64}$/u), z.literal("ABSENT")]),
+  ),
+  observationComplete: z.boolean().optional(),
+  affectedPaths: z.array(z.string()).optional(),
+});
+
 const ModelMessageSchema = z.discriminatedUnion("role", [
   z.object({ role: z.enum(["SYSTEM", "USER"]), content: z.string() }),
   z.object({
@@ -52,10 +70,12 @@ const ModelMessageSchema = z.discriminatedUnion("role", [
     toolCallId: z.string(),
     toolName: z.string(),
     isError: z.boolean(),
+    mutation: MutationObservationSchema.optional(),
   }),
 ]);
 
 export const AgentStateMetricsSchema = z.object({
+  modelRequestsDispatched: z.number().int().nonnegative().optional(),
   modelCalls: z.number().int().nonnegative(),
   toolCalls: z.number().int().nonnegative(),
   toolExecutions: z.number().int().nonnegative().default(0),
@@ -69,6 +89,7 @@ export const AgentStateMetricsSchema = z.object({
   tokenUsage: TokenUsageSchema,
 });
 export interface AgentStateMetrics {
+  modelRequestsDispatched?: number;
   modelCalls: number;
   toolCalls: number;
   toolExecutions: number;
@@ -112,7 +133,11 @@ export const AgentStateSchema = z.object({
       used: z.boolean(),
       explorationClosed: z.boolean(),
       handoffPending: z.boolean().optional(),
-      correctionReason: z.enum(["FORMAT_INVALID", "OUTPUT_LENGTH"]).optional(),
+      authorizationHandoffUsed: z.boolean().optional(),
+      evidenceRefreshUsed: z.boolean().optional(),
+      correctionTool: z.string().optional(),
+      correctionInput: z.string().optional(),
+      correctionReason: z.enum(["FORMAT_INVALID", "OUTPUT_LENGTH", "PROTOCOL_INVALID"]).optional(),
     })
     .optional(),
   lastError: DevflowErrorShapeSchema.optional(),
@@ -124,7 +149,11 @@ export interface AgentState {
     used: boolean;
     explorationClosed: boolean;
     handoffPending?: boolean;
-    correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH";
+    authorizationHandoffUsed?: boolean;
+    evidenceRefreshUsed?: boolean;
+    correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
+    correctionTool?: string;
+    correctionInput?: string;
   };
   schemaVersion: 1;
   runId: RunId;

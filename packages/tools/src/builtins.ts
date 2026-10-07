@@ -103,13 +103,14 @@ export function registerCoreTools(registry: ToolRegistry, git: GitService): void
   registry.register({
     name: "replaceText",
     description:
-      "Replace exact literal text in one existing UTF-8 file. Supply its current complete expectedSha256, oldText and newText. Default expectedOccurrences=1 rejects ambiguous matches; never use regex. A mismatch writes nothing. Returns APPLIED/NO_OP and the new complete hash. Supports sequential edits after reading the updated version.",
+      "Replace exact literal text in one existing UTF-8 file. Supply its current complete expectedSha256, oldText and newText. Default lineEndingMode=EXACT preserves literal matching. For a uniform LF/CRLF mismatch explicitly use MATCH_FILE with expectedOccurrences=1: only actual newlines in oldText/newText match the file's style, preserving all other bytes. Mixed endings, lone CR and literal backslash escapes are never guessed. Default expectedOccurrences=1 rejects ambiguous matches; never use regex. A mismatch writes nothing and reports newline diagnostics. Returns APPLIED/NO_OP and the new complete hash. Supports sequential edits after reading the updated version.",
     inputSchema: z.object({
       path: z.string().min(1),
       oldText: z.string().min(1),
       newText: z.string(),
       expectedSha256: z.string().regex(/^[a-f0-9]{64}$/),
       expectedOccurrences: z.number().int().positive().max(20).default(1),
+      lineEndingMode: z.enum(["EXACT", "MATCH_FILE"]).default("EXACT"),
     }),
     outputSchema: z.unknown(),
     permission: "WRITE",

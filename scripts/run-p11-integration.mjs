@@ -38,6 +38,19 @@ const compose = ["compose", "-f", "docker/compose.yml"];
 const npmCli = process.env.npm_execpath;
 if (npmCli === undefined) throw new Error("npm_execpath is required to run P11 integration.");
 run("docker", ["version"]);
+// A paused experiment may intentionally retain its sandbox. Only containers
+// created during this acceptance run can be attributed to this run as leaks.
+const managedContainers = () =>
+  run(
+    "docker",
+    ["ps", "--all", "--filter", "label=devflow.managed=true", "--quiet"],
+    process.env,
+    true,
+  )
+    .trim()
+    .split(/\r?\n/u)
+    .filter(Boolean);
+const initialContainers = new Set(managedContainers());
 const initiallyRunning = new Set(
   run("docker", [...compose, "ps", "--status", "running", "--services"], process.env, true)
     .split(/\r?\n/u)
@@ -123,12 +136,10 @@ try {
   ]);
 }
 
-const residual = run(
-  "docker",
-  ["ps", "--all", "--filter", "label=devflow.managed=true", "--quiet"],
-  process.env,
-  true,
-).trim();
+const residual = managedContainers().filter((id) => !initialContainers.has(id));
 if (startedInfrastructure) run("docker", [...compose, "down"]);
-if (residual.length > 0) throw new Error("P11 integration left DevFlow sandbox containers behind.");
+if (residual.length > 0)
+  throw new Error(
+    `P11 integration left new DevFlow sandbox containers behind: ${residual.join(", ")}`,
+  );
 if (failed) process.exitCode = 1;

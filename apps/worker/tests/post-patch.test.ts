@@ -13,6 +13,7 @@ import { DevflowError, type NewAgentEvent } from "@devflow/shared";
 import {
   normalizeMutation,
   observePostPatchTool,
+  requestPaths,
   plannedTargets,
   plannedTargetScope,
   verificationContract,
@@ -74,6 +75,15 @@ it("does not issue Review when input plus configured output exceeds the remainin
   expect(events.some((e) => e.type === "LLM_REQUEST")).toBe(false);
 });
 const ok = { ok: true as const, output: {}, durationMs: 1 };
+it("does not infer a command's entire mutation scope from unvalidated path hints", () => {
+  expect(
+    requestPaths({
+      name: "runCommand",
+      input: { program: "node", args: [], path: "a.ts", paths: ["b.ts"] },
+    }),
+  ).toEqual([]);
+  expect(requestPaths({ name: "replaceText", input: { path: "src/a.ts" } })).toEqual(["src/a.ts"]);
+});
 it("normalizes execution success separately from APPLIED, NO_OP, rejected, malformed and unobserved mutations", () => {
   expect(normalizeMutation(ok, { a: "old" }, { a: "new" }, ["a"], 5)).toMatchObject({
     status: "APPLIED",
@@ -103,6 +113,38 @@ it("normalizes execution success separately from APPLIED, NO_OP, rejected, malfo
       5,
     ),
   ).toMatchObject({ status: "REJECTED", workspaceChanged: false });
+});
+it("distinguishes complete unchanged failures from partial or unknown mutation observations", () => {
+  const failed = {
+    ok: false as const,
+    durationMs: 1,
+    error: new DevflowError({ code: "CONFLICT", message: "TEXT_MATCH_COUNT" }).toJSON(),
+  };
+  expect(normalizeMutation(failed, { a: "same" }, { a: "same" }, ["a"], 2)).toMatchObject({
+    observationComplete: true,
+    affectedPaths: ["a"],
+    changedFiles: [],
+    workspaceChanged: false,
+    beforeRevision: 2,
+    afterRevision: 2,
+  });
+  expect(normalizeMutation(failed, { a: "old" }, { a: "new" }, ["a"], 2)).toMatchObject({
+    status: "REJECTED",
+    observationComplete: true,
+    changedFiles: ["a"],
+    workspaceChanged: true,
+    afterRevision: 3,
+  });
+  expect(normalizeMutation(failed, { a: "old" }, {}, ["a"], 2)).toMatchObject({
+    observationComplete: false,
+    affectedPaths: ["a"],
+    workspaceChanged: false,
+  });
+  expect(normalizeMutation(failed, {}, {}, [], 2).observationComplete).toBe(false);
+  expect(
+    normalizeMutation(failed, { a: "old", b: "old" }, { a: "new" }, ["a", "b"], 2)
+      .observationComplete,
+  ).toBe(false);
 });
 it("requires every planned target, a current untruncated diff and no unresolved failures", () => {
   const c = new PostPatchController(["a", "b"], 5);
@@ -443,9 +485,7 @@ it.each([
       }),
       async (request) => {
         expect(request.tools).toEqual([]);
-        expect(JSON.stringify(request.messages)).toContain(
-          omitRequests ? "BEHAVIOR_BASIS_MISSING" : '\\"used\\":true',
-        );
+        expect(JSON.stringify(request.messages)).toContain('\\"used\\":true');
         expect(JSON.stringify(request.messages)).toContain(
           contentHash("export const value = 2;\n"),
         );
@@ -532,10 +572,10 @@ it.each([
     if (finalVerdict !== "PASS")
       expect(result.error?.details).toMatchObject({ workflowCode: "REVIEW_EVIDENCE_UNRESOLVED" });
     expect(artifacts.filter((a) => a.name === "review-evidence-supplement-v1.json")).toHaveLength(
-      omitRequests ? 0 : finalVerdict === "NEEDS_EVIDENCE" ? 2 : 1,
+      finalVerdict === "NEEDS_EVIDENCE" ? 2 : 1,
     );
     if (omitRequests)
-      expect(artifacts.filter((a) => a.name === "review-host-feedback-v1.json")).toHaveLength(1);
+      expect(artifacts.filter((a) => a.name === "review-host-feedback-v1.json")).toHaveLength(0);
     expect(events.filter((e) => e.type === "REPAIR_STARTED")).toHaveLength(0);
     expect(f.order.filter((e) => e === "WRITE")).toHaveLength(1);
   },

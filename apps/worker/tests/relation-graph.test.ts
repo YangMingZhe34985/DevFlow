@@ -25,6 +25,22 @@ function source(files: Record<string, string>): IndexSource {
 const graph = (s: IndexSource) =>
   new RepositoryRelationGraph({ repositoryId: "repo", baseCommitSha: "a".repeat(40), source: s });
 describe("versioned repository relations", () => {
+  it("reports AST and partial lexical coverage separately without calling the graph complete", async () => {
+    const g = graph(
+      source({
+        "src/registry.py": "def lookup(name): return name\n",
+        "src/Main.java": "class Main {}",
+      }),
+    );
+    await g.inspect(["src/registry.py"], signal);
+    expect(g.snapshot().coverage).toMatchObject({
+      supportedLanguages: ["TypeScript", "JavaScript", "Python", "Java", "C++"],
+      astParsedFiles: 0,
+      lexicalParsedFiles: 1,
+      unsupportedSourceFiles: 0,
+      incomplete: true,
+    });
+  });
   it("connects declared workspace dependencies to members and keeps registry dependencies external", async () => {
     const g = graph(
       source({

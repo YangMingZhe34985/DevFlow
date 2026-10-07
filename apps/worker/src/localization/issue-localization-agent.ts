@@ -79,6 +79,14 @@ export interface IssueLocalizationResult {
   implementationEvidence?: LocalizationCandidate[];
   evidenceState?: {
     workspaceRevision: number;
+    pendingReads?: {
+      path: string;
+      startLine: number;
+      endLine: number;
+      reason: string;
+      source: string;
+    }[];
+    candidateState?: "RELATED_FILES" | "IMPLEMENTATION_OBSERVED" | "ROOT_CAUSE_UNVERIFIED";
     observedImplementations: {
       path: string;
       symbol: string | null;
@@ -104,6 +112,8 @@ export interface IssueLocalizationResult {
     readCacheHits?: number;
     meaningfulProgress?: number;
     sourceReads?: number;
+    finalReason?: string;
+    finalReserveTokens?: number;
   };
 }
 
@@ -193,14 +203,27 @@ export class IssueLocalizationAgent {
           24,
         );
         if (catalogue.size >= 16 && !catalogue.has(id)) {
-          const worst = [...catalogue].sort((a, b) => priority(a[1]) - priority(b[1]))[0]!;
-          if (priority(item) < priority(worst[1])) continue;
+          const pathCounts = new Map<string, number>();
+          for (const row of catalogue.values())
+            pathCounts.set(row.path, (pathCounts.get(row.path) ?? 0) + 1);
+          const diverse = !pathCounts.has(item.path);
+          const replaceable = [...catalogue].filter(
+            ([, row]) => !diverse || (pathCounts.get(row.path) ?? 0) > 1,
+          );
+          const worst = (replaceable.length ? replaceable : [...catalogue]).sort(
+            (a, b) => priority(a[1]) - priority(b[1]),
+          )[0]!;
+          if (
+            priority(item) < priority(worst[1]) &&
+            !(diverse && (pathCounts.get(worst[1].path) ?? 0) > 1)
+          )
+            continue;
           catalogue.delete(worst[0]);
         }
         catalogue.set(id, item);
         if (
           ["IMPLEMENTATION", "ENTRY"].includes(sourceRole(item.path)) &&
-          item.parseStatus === "PARSED"
+          /^[a-f0-9]{64}$/u.test(item.contentHash)
         ) {
           const sourceKey = `${item.path}:${item.contentHash}`;
           const ranges = progressCoverage.get(sourceKey) ?? [];
@@ -304,7 +327,6 @@ export class IssueLocalizationAgent {
     const issueSymbols = extractIssueSignals(`${input.title}\n${input.description}`).symbols;
     let implementationEvidence: LocalizationCandidate[] = [];
     let navigationMissing: string[] = [];
-    let navigationExit = "DISABLED";
     if (graph) {
       const navigation = await navigateImplementation({
         repositoryId: input.repositoryId,
@@ -316,6 +338,8 @@ export class IssueLocalizationAgent {
         candidates: [...catalogue.values()].map((e) => ({
           path: e.path,
           symbol: e.symbol,
+          startLine: e.startLine,
+          endLine: e.endLine,
           reason: e.reason,
         })),
         maxSourceBytes: Math.max(0, 2 * 1024 * 1024 - metrics.readBytes),
@@ -327,9 +351,13 @@ export class IssueLocalizationAgent {
       issueSymbols.push(...navigation.windows.flatMap((w) => (w.symbol ? [w.symbol] : [])));
       implementationEvidence = navigation.windows
         .filter((w) => w.kind === "IMPLEMENTATION")
-        .map((w) => ({ ...w, explanation: w.reason, fileType: "SOURCE", parseStatus: "PARSED" }));
+        .map((w) => ({
+          ...w,
+          explanation: w.reason,
+          fileType: "SOURCE",
+          parseStatus: w.parser === "LEXICAL_STATIC" ? "LEXICAL" : "PARSED",
+        }));
       navigationMissing = navigation.missing;
-      navigationExit = navigation.metrics.exitReason;
       observations.push(...navigation.observations.slice(0, 8), ...navigation.missing.slice(0, 4));
       add(
         navigation.windows.map((w) => ({
@@ -342,7 +370,7 @@ export class IssueLocalizationAgent {
           language: w.path.split(".").at(-1) ?? "text",
           module: w.path.split("/").slice(0, -1).join("/"),
           fileType: isTestFile(w.path) ? ("TEST" as const) : ("SOURCE" as const),
-          parseStatus: "PARSED" as const,
+          parseStatus: w.parser === "LEXICAL_STATIC" ? ("LEXICAL" as const) : ("PARSED" as const),
           signature: null,
           directImports: [],
           truncated: true,
@@ -415,12 +443,37 @@ export class IssueLocalizationAgent {
     let decisions = 0;
     let lengthRegenerations = 0;
     let stalledRounds = 0;
+    let exitReason = "MODEL_FINAL";
+    const pendingReads: NonNullable<
+      NonNullable<IssueLocalizationResult["evidenceState"]>["pendingReads"]
+    > = [];
+    const estimateState = (state: unknown) =>
+      Math.ceil(
+        Buffer.byteLength(
+          JSON.stringify({
+            messages: [
+              { role: "SYSTEM", content: SYSTEM },
+              { role: "USER", content: JSON.stringify(state) },
+            ],
+            schema: z.toJSONSchema(DecisionSchema),
+          }),
+        ) / 3,
+      );
     for (let round = 0; metrics.modelCalls < 4; round++) {
       const progressBefore = progressKeys.size;
+      const remainingCalls = 4 - metrics.modelCalls;
       let finalOnly =
-        4 - metrics.modelCalls <= 2 ||
+        remainingCalls <= 2 ||
         stalledRounds >= 2 ||
         (metrics.searches >= 2 && metrics.readAttempts >= LOCALIZATION_READ_LIMITS.maxReadAttempts);
+      exitReason =
+        remainingCalls <= 2
+          ? "MODEL_CALL_RESERVE"
+          : stalledRounds >= 2
+            ? "NO_PROGRESS"
+            : finalOnly
+              ? "READ_LIMITS"
+              : "MODEL_FINAL";
       const state = {
         issue: { title: input.title.slice(0, 1000), description: input.description.slice(0, 8000) },
         round,
@@ -454,21 +507,48 @@ export class IssueLocalizationAgent {
             directImports: item.directImports.slice(0, 4),
             fileType: item.fileType,
             parseStatus: item.parseStatus,
+            role: sourceRole(item.path),
+            observation: item.truncated
+              ? "PARTIAL_SOURCE_ROOT_CAUSE_UNVERIFIED"
+              : "SOURCE_OBSERVED_ROOT_CAUSE_UNVERIFIED",
           })),
         observations: observations.slice(-8),
         ...(graph ? { graph: graph.issueView(seeds, [], 4096, issueSymbols) } : {}),
         omittedEvidence: 0,
       };
+      const firstPaths = new Set<string>();
+      state.evidence = state.evidence
+        .map((row, index) => {
+          const first = !firstPaths.has(row.path);
+          firstPaths.add(row.path);
+          return { row, index, first };
+        })
+        .sort((a, b) => Number(b.first) - Number(a.first) || a.index - b.index)
+        .map(({ row }) => row);
       while (Buffer.byteLength(JSON.stringify(state)) > 20000 && state.evidence.length > 1) {
         state.evidence.pop();
         state.omittedEvidence++;
       }
-      const estimatedInput = Math.ceil(Buffer.byteLength(JSON.stringify(state)) / 3) + 1000;
+      const estimatedInput = estimateState(state);
+      const finalState = {
+        ...state,
+        mode: "FINAL",
+        canInspect: false,
+        remaining: { ...state.remaining, searches: 0, reads: 0, readAttempts: 0 },
+      };
+      const configuredOutput = input.maxOutputTokens ?? 4096;
+      const finalInput = estimateState(finalState);
+      // Subsequent actual requests are always rechecked; reserve one final decision and one
+      // compact format/reasoning recovery projection instead of silently shrinking final output.
+      const finalReserve =
+        finalInput + configuredOutput + Math.min(finalInput, 3072) + configuredOutput;
+      Object.assign(metrics, { finalReserveTokens: finalReserve });
       if (
         !finalOnly &&
-        input.maxTokens - metrics.totalTokens < estimatedInput * 2 + (input.maxOutputTokens ?? 4096)
+        input.maxTokens - metrics.totalTokens < estimatedInput + configuredOutput + finalReserve
       ) {
         finalOnly = true;
+        exitReason = "FINAL_TOKEN_RESERVE";
         state.mode = "FINAL";
         state.canInspect = false;
         state.remaining.reads = state.remaining.readAttempts = state.remaining.searches = 0;
@@ -508,6 +588,7 @@ export class IssueLocalizationAgent {
           observations.push(
             "Localization exploration stopped before another request: the remaining model budget is insufficient.",
           );
+          exitReason = "REQUEST_PREFLIGHT";
           uncertainty.push(
             "Localization budget ended before further evidence could be assessed; Planner must verify the remaining hypotheses.",
           );
@@ -598,8 +679,26 @@ export class IssueLocalizationAgent {
         });
       }
       candidates = rankIssueCandidates(candidates, `${input.title}\n${input.description}`);
+      if (
+        finalOnly &&
+        (decision.inspect.length || decision.hypotheses.length) &&
+        metrics.modelCalls <= 2 &&
+        stalledRounds < 2 &&
+        metrics.reads < LOCALIZATION_READ_LIMITS.maxReads &&
+        input.maxTokens - metrics.totalTokens >= finalReserve
+      ) {
+        finalOnly = false;
+        observations.push(
+          "FINAL requested evidence and a complete final/recovery reservation remains; executing one bounded evidence expansion before final assessment.",
+        );
+      }
       if (finalOnly) {
         if (decision.inspect.length || decision.hypotheses.length) {
+          for (const read of decision.inspect)
+            pendingReads.push({ ...read, source: "MODEL_FINAL" });
+          for (const hypothesis of decision.hypotheses)
+            uncertainty.push(`Pending search: ${hypothesis.query}; ${hypothesis.explanation}`);
+          exitReason = "FINAL_WITH_PENDING_EVIDENCE";
           observations.push("Rejected exploration: FINAL_ROUND; no tool request was issued.");
           uncertainty.push(
             "Final-only round requested more evidence; those requests were not executed. Planner must verify the remaining hypotheses.",
@@ -710,6 +809,14 @@ export class IssueLocalizationAgent {
           observations.push(
             `Bounded read: ${path}; requested=${request.startLine}-${request.endLine}, observed=${request.startLine}-${endLine}, maxLines=${LOCALIZATION_READ_LIMITS.maxLines}, maxSnippetBytes=${LOCALIZATION_READ_LIMITS.maxSnippetBytes}; omitted lines remain unobserved.`,
           );
+        if (endLine < Math.min(request.endLine, lines.length))
+          pendingReads.push({
+            path,
+            startLine: endLine + 1,
+            endLine: Math.min(request.endLine, lines.length),
+            reason: request.reason,
+            source: "HOST_RANGE_LIMIT",
+          });
         const parsed =
           entry.sizeBytes <= 512 * 1024
             ? await parseCandidate(file.content, path.split(".").at(-1) ?? "", signal)
@@ -736,7 +843,7 @@ export class IssueLocalizationAgent {
             module: path.split("/").slice(0, -1).join("/"),
             fileType: isTestFile(path)
               ? "TEST"
-              : /\.(?:[cm]?[jt]s|[jt]sx)$/u.test(path)
+              : /\.(?:[cm]?[jt]s|[jt]sx|py|java|c|cc|cpp|cxx|h|hh|hpp|hxx)$/u.test(path)
                 ? "SOURCE"
                 : /\.(?:json|ya?ml)$/u.test(path)
                   ? "CONFIG"
@@ -801,12 +908,25 @@ export class IssueLocalizationAgent {
             endLine,
           }),
         ),
-        missingInformation: [...navigationMissing, ...uncertainty].slice(0, 12),
-        exitReason: stalledRounds >= 2 ? "NO_PROGRESS" : navigationExit,
+        pendingReads: pendingReads
+          .filter(
+            (r) =>
+              ![...catalogue.values()].some(
+                (e) => e.path === r.path && e.startLine <= r.startLine && e.endLine >= r.endLine,
+              ),
+          )
+          .slice(0, 12),
+        candidateState: implementationEvidence.length ? "IMPLEMENTATION_OBSERVED" : "RELATED_FILES",
+        missingInformation: [
+          ...navigationMissing,
+          ...pendingReads.map((r) => `Unread ${r.path}:${r.startLine}-${r.endLine}: ${r.reason}`),
+          ...uncertainty,
+        ].slice(0, 16),
+        exitReason,
       },
       uncertainty,
       observations,
-      metrics,
+      metrics: { ...metrics, finalReason: exitReason },
     };
   }
 }

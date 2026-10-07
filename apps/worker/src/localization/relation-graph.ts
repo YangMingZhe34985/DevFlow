@@ -1,3 +1,4 @@
+import { SourceUnitSchema, parseStaticSource, staticSourceLanguage } from "./source-units.js";
 import { posix } from "node:path";
 import ts from "typescript";
 import { z } from "zod";
@@ -23,7 +24,7 @@ const CONFIG = {
   maxMetadata: 32,
   maxFileBytes: 512 * 1024,
   depth: 2,
-  factsVersion: 2,
+  factsVersion: 3,
 };
 export function graphPathAllowed(path: string) {
   return (
@@ -34,7 +35,8 @@ export function graphPathAllowed(path: string) {
     posix.normalize(path) === path
   );
 }
-const codeFile = (path: string) => /\.(?:[cm]?[jt]s|[jt]sx)$/.test(path);
+const codeFile = (path: string) =>
+  /\.(?:[cm]?[jt]s|[jt]sx)$/.test(path) || staticSourceLanguage(path) !== undefined;
 const fileType = (path: string) =>
   isTestFile(path) ? "TEST" : codeFile(path) ? "SOURCE" : "CONFIG";
 const FileSchema = z.object({
@@ -46,12 +48,13 @@ const FileSchema = z.object({
   state: z.enum(["CURRENT", "STALE", "UNREAD", "UNAVAILABLE"]),
   fileType: z.string(),
   parse: RelationParseSchema.nullable(),
+  sourceUnit: SourceUnitSchema.optional(),
 });
 const EdgeSchema = z.object({
   id: z.string(),
   from: z.string(),
   to: z.string().nullable(),
-  kind: z.enum(["IMPORT", "REEXPORT", "DYNAMIC_IMPORT", "REQUIRE"]),
+  kind: z.enum(["IMPORT", "REEXPORT", "DYNAMIC_IMPORT", "REQUIRE", "IMPLEMENTATION_PAIR"]),
   specifier: z.string().nullable(),
   line: z.number(),
   sourceSha256: z.string(),
@@ -94,6 +97,13 @@ export const RelationGraphSchema = z.object({
     .max(32000)
     .default([]),
   coverage: z.object({
+    supportedLanguages: z.array(z.string()).optional(),
+    astParsedFiles: z.number().optional(),
+    lexicalParsedFiles: z.number().optional(),
+    languageCapabilities: z
+      .array(z.object({ language: z.string(), parser: z.string(), completeness: z.string() }))
+      .optional(),
+    unsupportedSourceFiles: z.number().optional(),
     manifestFiles: z.number(),
     parsedFiles: z.number(),
     incomplete: z.boolean(),
@@ -130,6 +140,7 @@ export interface IssueGraphReference {
     path: string;
     sha256: string | null;
     state: string;
+    sourceUnit?: z.infer<typeof SourceUnitSchema>;
     symbols: { id: string; name: string; startLine: number; endLine: number }[];
     exports: RelationParse["exports"];
   }[];
@@ -388,6 +399,50 @@ export class RepositoryRelationGraph {
       sizeBytes: Buffer.byteLength(content),
       contentHash: sha256,
     });
+    const sourceUnit = parseStaticSource(path, content, [...this.manifest.keys()]);
+    if (sourceUnit) {
+      this.artifact.metrics.coldParses++;
+      this.upsert({
+        path,
+        sha256,
+        state: "CURRENT",
+        fileType: fileType(path),
+        parse: null,
+        sourceUnit,
+      });
+      this.artifact.edges = this.artifact.edges.filter((e) => e.from !== path);
+      for (const dependency of sourceUnit.dependencies) {
+        const to =
+          dependency.resolution === "RESOLVED" && graphPathAllowed(dependency.paths[0]!)
+            ? dependency.paths[0]!
+            : null;
+        this.artifact.edges.push({
+          id: hash(
+            `${path}:${sha256}:${dependency.kind}:${dependency.line}:${dependency.specifier}`,
+          ),
+          from: path,
+          to,
+          kind: dependency.kind,
+          specifier: dependency.specifier,
+          line: dependency.line,
+          sourceSha256: sha256,
+          configurationHash: this.artifact.configurationHash,
+          resolution: to ? "RESOLVED" : "UNRESOLVED",
+          reason: `${dependency.provenance}; ${dependency.resolution}; lexical, runtime dispatch unknown`,
+          stale: false,
+        });
+        if (to && !this.artifact.files.some((f) => f.path === to))
+          this.upsert({
+            path: to,
+            sha256: null,
+            state: "UNREAD",
+            fileType: fileType(to),
+            parse: null,
+          });
+      }
+      this.updateCoverage();
+      return;
+    }
     const configPath = Object.keys(this.configuration)
       .filter(
         (p) =>
@@ -574,8 +629,38 @@ export class RepositoryRelationGraph {
     this.artifact.coverage.parsedFiles = this.artifact.files.filter(
       (f) => f.state === "CURRENT" && f.parse?.status === "PARSED",
     ).length;
+    this.artifact.coverage.supportedLanguages = [
+      "TypeScript",
+      "JavaScript",
+      "Python",
+      "Java",
+      "C++",
+    ];
+    this.artifact.coverage.lexicalParsedFiles = this.artifact.files.filter(
+      (f) => f.state === "CURRENT" && f.sourceUnit,
+    ).length;
+    this.artifact.coverage.languageCapabilities = [
+      { language: "TypeScript/JavaScript", parser: "AST", completeness: "PARTIAL_STATIC" },
+      { language: "Python", parser: "LEXICAL_STATIC", completeness: "PARTIAL" },
+      { language: "Java", parser: "LEXICAL_STATIC", completeness: "PARTIAL" },
+      { language: "C++", parser: "LEXICAL_STATIC", completeness: "PARTIAL" },
+    ];
+    this.artifact.coverage.astParsedFiles = this.artifact.coverage.parsedFiles;
+    this.artifact.coverage.unsupportedSourceFiles = [...this.manifest.keys()].filter((p) =>
+      /\.(?:go|rs)$/u.test(p),
+    ).length;
+    if (
+      this.artifact.coverage.unsupportedSourceFiles > 0 &&
+      !this.artifact.coverage.reasons.includes(
+        "SEMANTIC_LANGUAGE_UNSUPPORTED: languages outside the reported capabilities have no relation adapter",
+      )
+    )
+      this.artifact.coverage.reasons.push(
+        "SEMANTIC_LANGUAGE_UNSUPPORTED: languages outside the reported capabilities have no relation adapter",
+      );
     this.artifact.coverage.incomplete =
       this.artifact.coverage.reasons.length > 0 ||
+      (this.artifact.coverage.lexicalParsedFiles ?? 0) > 0 ||
       this.artifact.coverage.parsedFiles < [...this.manifest.keys()].filter(codeFile).length;
     const adjacency = new Map<string, string[]>();
     for (const edge of this.artifact.edges)
@@ -656,8 +741,26 @@ export class RepositoryRelationGraph {
         path: f.path,
         sha256: f.sha256,
         state: f.state,
+        ...(f.sourceUnit
+          ? {
+              sourceUnit: {
+                ...f.sourceUnit,
+                definitions: f.sourceUnit.definitions
+                  .filter((d) => matchesSymbol(d.name))
+                  .slice(0, 4)
+                  .map((d) => ({ ...d, calls: d.calls.slice(0, 6) })),
+                dependencies: f.sourceUnit.dependencies.slice(0, 4),
+                receivers: {},
+                unknown: f.sourceUnit.unknown.slice(0, 2),
+              },
+            }
+          : {}),
         symbols: limit(
-          (f.parse?.symbols ?? []).filter((s) => matchesSymbol(s.name)),
+          (
+            f.parse?.symbols ??
+            f.sourceUnit?.definitions.map((d) => ({ ...d, offset: d.startLine })) ??
+            []
+          ).filter((s) => matchesSymbol(s.name)),
           20,
         ).map((s) => ({
           id: hash(`${f.path}:${f.sha256}:${s.offset}:${s.name}`),

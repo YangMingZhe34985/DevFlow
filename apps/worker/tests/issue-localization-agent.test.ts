@@ -829,3 +829,83 @@ it("verifies bounded large-file regions without claiming an unparsed symbol", as
   });
   expect(result.metrics.readBytes).toBeLessThan(2 * 1024 * 1024);
 });
+
+describe("language-independent investigation progress and explicit gaps", () => {
+  it.each(["src/registry.py", "src/Listener.java", "src/search.hpp"])(
+    "counts new SHA-verified %s ranges, not repeated subranges",
+    async (path) => {
+      const source = memorySource({
+        [path]: "implementation line 1\nimplementation line 2\nimplementation line 3\n",
+      });
+      const model = new FakeLanguageModel([
+        response(
+          decision({
+            inspect: [
+              { path, startLine: 1, endLine: 3, reason: "Public implementation candidate" },
+            ],
+          }),
+        ),
+        response(
+          decision({
+            inspect: [{ path, startLine: 2, endLine: 3, reason: "Same evidence, different range" }],
+          }),
+        ),
+        (request) => {
+          expect(state(request).evidence[0].parseStatus).toBe("LEXICAL");
+          expect(state(request).evidence[0].fileType).toBe("SOURCE");
+          return response(
+            decision({
+              inspect: [
+                {
+                  path: "src/missing.py",
+                  startLine: 40,
+                  endLine: 70,
+                  reason: "Unobserved forwarding target",
+                },
+              ],
+            }),
+          );
+        },
+      ]);
+      const result = await run(source, model);
+      expect(result.metrics.meaningfulProgress).toBe(1);
+      expect(result.evidenceState?.pendingReads).toContainEqual(
+        expect.objectContaining({
+          path: "src/missing.py",
+          startLine: 40,
+          endLine: 70,
+          source: "MODEL_FINAL",
+        }),
+      );
+      expect(result.metrics.finalReason).toBe("FINAL_WITH_PENDING_EVIDENCE");
+      expect(result.evidenceState?.candidateState).toBe("RELATED_FILES");
+    },
+  );
+  it("retains the exact unread continuation of a truncated branch", async () => {
+    const path = "src/registry.py",
+      source = memorySource({
+        [path]: Array.from({ length: 190 }, (_, i) => `value_${i} = ${i}`).join("\n"),
+      });
+    const model = new FakeLanguageModel([
+      response(
+        decision({
+          inspect: [
+            { path, startLine: 1, endLine: 180, reason: "Follow wrapper into execution lookup" },
+          ],
+        }),
+      ),
+      response(decision()),
+    ]);
+    const result = await run(source, model);
+    expect(result.evidenceState?.pendingReads).toContainEqual({
+      path,
+      startLine: 81,
+      endLine: 180,
+      reason: "Follow wrapper into execution lookup",
+      source: "HOST_RANGE_LIMIT",
+    });
+    expect(result.evidenceState?.missingInformation.join(" ")).toContain(
+      "Unread src/registry.py:81-180",
+    );
+  });
+});

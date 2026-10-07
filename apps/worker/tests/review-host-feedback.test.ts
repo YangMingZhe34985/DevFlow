@@ -156,3 +156,165 @@ it("distinguishes missing source from missing behavior and remains compatible wi
     ReviewResultSchema.parse({ approved: false, summary: "Historical", findings: [] }).hostFeedback,
   ).toBeUndefined();
 });
+
+it.each(["\n", "\r\n", "  ", "\t"])(
+  "matches task whitespace %j without waiving evidence or scope",
+  (space) => {
+    const description = "Preserve caller spelling" + space + "in successful history.";
+    const current = {
+      ...issue,
+      kind: "EVIDENCE_GAP" as const,
+      scopeAssessment: {
+        ...issue.scopeAssessment,
+        taskQuote: "Preserve caller spelling in successful history.",
+      },
+    };
+    const result = assessReview(
+      {
+        verdict: "NEEDS_EVIDENCE",
+        summary: "Need history source",
+        issues: [current],
+        evidenceRequests: [{ path: "history.py", question: "Show persistence" }],
+      },
+      { ...evidence, task: { title: "Alias execution", description } },
+    );
+    expect(result.approved).toBe(false);
+    expect(result.hostFeedback?.some((f) => f.category === "TASK_SCOPE") ?? false).toBe(false);
+    expect(reviewSupplementRequests(result)).toHaveLength(1);
+  },
+);
+it("retains original offsets and does not accept paraphrases or normalize source citations", async () => {
+  const { matchTaskQuote } = await import("../src/runs/task-quote.js");
+  const text = "prefix. Preserve caller\r\n  spelling. suffix";
+  const match = matchTaskQuote(text, "Preserve caller spelling.")!;
+  expect(text.slice(match.start, match.end)).toBe("Preserve caller\r\n  spelling.");
+  expect(matchTaskQuote(text, "Preserve canonical spelling.")).toBeUndefined();
+  expect(matchTaskQuote(text, "   ")).toBeUndefined();
+  const result = assessReview(
+    {
+      verdict: "FAIL",
+      summary: "Code citation differs",
+      issues: [
+        {
+          ...issue,
+          scopeAssessment: undefined,
+          evidence: { path: "a.ts", quote: "return  [...value];" },
+        },
+      ],
+    },
+    evidence,
+  );
+  expect(result.findings[0]?.evidenceStatus).not.toBe("SOURCE_LINKED");
+});
+
+it("routes acknowledged source gaps to supplement without demanding a hypothetical failure", () => {
+  const gap = {
+    ...issue,
+    kind: "EVIDENCE_GAP" as const,
+    behavior: undefined,
+    scopeAssessment: undefined,
+  };
+  const result = assessReview(
+    {
+      verdict: "NEEDS_EVIDENCE",
+      summary: "Normalization implementation unknown",
+      issues: [gap],
+      evidenceRequests: [
+        { path: "identity.py", symbol: "canonical", question: "Show normalization" },
+      ],
+    },
+    evidence,
+  );
+  expect(result).toMatchObject({
+    approved: false,
+    decision: "NEEDS_EVIDENCE",
+    hostFeedback: [{ category: "SOURCE", code: "ESSENTIAL_SOURCE_EVIDENCE_MISSING" }],
+  });
+  expect(reviewSupplementRequests(result)[0]?.path).toBe("identity.py");
+  expect(newReviewCorrections(result, new Set())).toEqual([]);
+  expect(
+    assessReview(
+      { verdict: "PASS", summary: "Omitted gap", issues: [] },
+      { ...evidence, findingHistory: result.findings },
+    ).approved,
+  ).toBe(false);
+});
+it("does not make an unknown gap scope a reference correction before source collection", () => {
+  const gap = {
+    ...issue,
+    kind: "EVIDENCE_GAP" as const,
+    scopeAssessment: { category: "UNDETERMINED" as const, explanation: "Missing caller source" },
+  };
+  const result = assessReview(
+    {
+      verdict: "NEEDS_EVIDENCE",
+      summary: "Caller unknown",
+      issues: [gap],
+      evidenceRequests: [{ symbol: "caller", question: "Read caller" }],
+    },
+    evidence,
+  );
+  expect(reviewSupplementRequests(result)).toHaveLength(1);
+  expect(result.hostFeedback?.[0]?.category).toBe("SOURCE");
+  expect(result.approved).toBe(false);
+});
+it("keeps genuine defect and invalid task corrections strict alongside gaps", () => {
+  const gap = {
+    ...issue,
+    kind: "EVIDENCE_GAP" as const,
+    behavior: undefined,
+    scopeAssessment: undefined,
+  };
+  const defect = { ...issue, behavior: undefined, scopeAssessment: undefined };
+  const mixed = assessReview(
+    {
+      verdict: "NEEDS_EVIDENCE",
+      summary: "Mixed",
+      issues: [gap, defect],
+      evidenceRequests: [{ path: "identity.py", question: "Read" }],
+    },
+    evidence,
+  );
+  expect(mixed.hostFeedback?.map((f) => f.category)).toEqual(["SOURCE", "BEHAVIOR"]);
+  expect(mixed.approved).toBe(false);
+  const forged = assessReview(
+    {
+      verdict: "NEEDS_EVIDENCE",
+      summary: "Forged task",
+      issues: [{ ...gap, scopeAssessment: issue.scopeAssessment }],
+    },
+    evidence,
+  );
+  expect(forged.hostFeedback?.[0]?.code).toBe("TASK_QUOTE_FROM_PLAN");
+  const invalidSource = assessReview(
+    {
+      verdict: "NEEDS_EVIDENCE",
+      summary: "Forged code",
+      issues: [{ ...gap, evidence: { path: "a.ts", quote: "invented" } }],
+    },
+    evidence,
+  );
+  expect(invalidSource.findings[0]?.evidenceStatus).toBe("UNVERIFIED");
+  expect(invalidSource.approved).toBe(false);
+});
+
+it("preserves legacy NEEDS_EVIDENCE gap classification when kind is omitted", () => {
+  const result = assessReview(
+    {
+      verdict: "NEEDS_EVIDENCE",
+      summary: "Missing callee",
+      issues: [
+        {
+          severity: "medium",
+          message: "Need callee implementation",
+          evidence: { path: "a.ts", quote: "return [...value];" },
+        },
+      ],
+      evidenceRequests: [{ path: "callee.ts", question: "Show implementation" }],
+    },
+    evidence,
+  );
+  expect(result.hostFeedback?.[0]?.category).toBe("SOURCE");
+  expect(reviewSupplementRequests(result)).toHaveLength(1);
+  expect(result.approved).toBe(false);
+});

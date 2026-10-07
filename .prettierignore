@@ -19,6 +19,7 @@ docs/performance
 docs/archive
 docs/development
 benchmarks/real-issues
+datasets
 tests/fixtures/planner-*
 scripts/execute-recovery-v*
 scripts/oracle-coverage-v*

@@ -144,6 +144,9 @@ export interface RunContext {
   signal: AbortSignal;
   tools: readonly ModelToolDescriptor[];
   availableTools?(): readonly ModelToolDescriptor[];
+  /** Host-approved files whose current edit evidence is missing. At most one closing refresh. */
+  closingReadPaths?(): readonly string[];
+  validateFinishPhase?(input: unknown): string | undefined;
   authorizeTool?(request: ToolExecutionRequest): string | undefined;
   stateStore?: AgentStateStore;
   emit(event: NewAgentEvent): Promise<void>;
@@ -195,6 +198,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
     const execution = createExecutionState(context.tools);
     execution.editCorrectionPending = state.executionRecovery?.pending ?? false;
     execution.editCorrectionUsed = state.executionRecovery?.used ?? false;
+    if (state.executionRecovery?.correctionTool)
+      execution.correctionTool = state.executionRecovery.correctionTool;
+    if (state.executionRecovery?.correctionInput)
+      execution.correctionInput = state.executionRecovery.correctionInput;
     if (state.executionRecovery?.correctionReason)
       execution.correctionReason = state.executionRecovery.correctionReason;
     const sourceProgress = new EvidenceProgress();
@@ -205,18 +212,55 @@ export class DefaultAgentRuntime implements AgentRuntime {
     let correctingEdit = false;
     let explorationClosed = state.executionRecovery?.explorationClosed ?? false;
     let closingDecisionPending = state.executionRecovery?.handoffPending ?? false;
+    let authorizationHandoffUsed = state.executionRecovery?.authorizationHandoffUsed ?? false;
+    let evidenceRefreshUsed = state.executionRecovery?.evidenceRefreshUsed ?? false;
+    const closingReadAllowed = () =>
+      !correctingEdit && !evidenceRefreshUsed && (context.closingReadPaths?.().length ?? 0) > 0;
     context = {
       ...context,
-      authorizeTool: (call) =>
-        (correctingEdit || explorationClosed) &&
-        postPatch?.active !== true &&
-        !(
-          correctingEdit && execution.correctionReason === "OUTPUT_LENGTH"
-            ? ["replaceText"]
-            : ["replaceText", "applyPatch", "writeFile"]
-        ).includes(call.name)
-          ? "EDIT_CORRECTION_REQUIRED: correct the failed edit or finish; source is unchanged."
-          : originalAuthorize?.(call),
+      authorizeTool: (call) => {
+        if (authorizationHandoffUsed && call.name !== "finishPhase")
+          return "HOST_AUTHORIZATION_HANDOFF: only finishPhase with the remaining gap or scope conflict is available.";
+        if (
+          explorationClosed &&
+          !correctingEdit &&
+          call.name === "readFile" &&
+          closingReadAllowed()
+        ) {
+          const input = objectValue(call.input);
+          if (typeof input?.path !== "string" || !context.closingReadPaths?.().includes(input.path))
+            return "CLOSING_REFRESH_PATH: refresh only the host's missing approved current evidence.";
+          if (Number(input.maxBytes ?? 16 * 1024) > 16 * 1024)
+            return "CLOSING_REFRESH_SIZE: maxBytes must be at most 16384.";
+          input.maxBytes ??= 16 * 1024;
+          const denied = originalAuthorize?.(call);
+          if (denied) return denied;
+          evidenceRefreshUsed = true;
+          return undefined;
+        }
+        if (correctingEdit && execution.correctionReason === "PROTOCOL_INVALID") {
+          if (call.name !== execution.correctionTool)
+            return "PROTOCOL_CORRECTION_REQUIRED: only correct the failed tool call or finishPhase; no new exploration.";
+          const before = objectValue(JSON.parse(execution.correctionInput ?? "{}")),
+            after = objectValue(call.input);
+          if (
+            ["path", "sha256"].some(
+              (key) => before?.[key] !== undefined && before[key] !== after?.[key],
+            )
+          )
+            return "PROTOCOL_CORRECTION_SCOPE: preserve the original path/artifact; correct its parameters only.";
+          return originalAuthorize?.(call);
+        }
+        return (correctingEdit || explorationClosed) &&
+          postPatch?.active !== true &&
+          !(
+            correctingEdit && execution.correctionReason === "OUTPUT_LENGTH"
+              ? ["replaceText"]
+              : ["replaceText", "applyPatch", "writeFile"]
+          ).includes(call.name)
+          ? "EDIT_CORRECTION_REQUIRED: edit using current evidence or finishPhase. Exploration is closed; a blocking reply may use outcome INSUFFICIENT_EVIDENCE or SCOPE_CONFLICT."
+          : originalAuthorize?.(call);
+      },
     };
     const initialRevision = request.workingSet?.workspaceRevision ?? 0;
     execution.workspaceRevision = initialRevision;
@@ -258,7 +302,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
           const snapshot = {
             ...agentProgressSnapshot(state, execution, adaptiveStepBudget),
             handoffPending: closingDecisionPending,
+            authorizationHandoffUsed,
+            evidenceRefreshUsed,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
+            ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
+            ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
             ...(postPatch ? { patchReady: postPatch.ready } : {}),
           };
           const decision = await awaitWithSignal(
@@ -308,6 +356,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
             used: execution.editCorrectionUsed,
             explorationClosed,
             handoffPending: closingDecisionPending,
+            authorizationHandoffUsed,
+            evidenceRefreshUsed,
+            ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
+            ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
+            ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
           },
           stepCount: state.stepCount + 1,
           messages,
@@ -596,9 +649,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
               postPatch?.allowed(t.name) !== false &&
               (prePatch?.available(t) ?? true) &&
               (!correctingEdit ||
-                (execution.correctionReason === "OUTPUT_LENGTH"
-                  ? ["replaceText", "finishPhase"]
-                  : ["replaceText", "applyPatch", "writeFile", "finishPhase"]
+                (execution.correctionReason === "PROTOCOL_INVALID"
+                  ? [execution.correctionTool, "finishPhase"]
+                  : execution.correctionReason === "OUTPUT_LENGTH"
+                    ? ["replaceText", "finishPhase"]
+                    : ["replaceText", "applyPatch", "writeFile", "finishPhase"]
                 ).includes(t.name)),
           );
           if (request.timeReserve) {
@@ -606,7 +661,16 @@ export class DefaultAgentRuntime implements AgentRuntime {
             explorationClosed ||= remainingTimeMs < 3 * request.timeReserve.requestMs;
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
-                ["replaceText", "applyPatch", "writeFile", "finishPhase"].includes(t.name),
+                [
+                  "replaceText",
+                  "applyPatch",
+                  "writeFile",
+                  "finishPhase",
+                  ...(correctingEdit && execution.correctionReason === "PROTOCOL_INVALID"
+                    ? [execution.correctionTool!]
+                    : []),
+                  ...(closingReadAllowed() ? ["readFile"] : []),
+                ].includes(t.name),
               );
               projectedMessages = [
                 ...projectedMessages,
@@ -641,6 +705,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 },
               });
           }
+          if (authorizationHandoffUsed)
+            availableTools = availableTools.filter((t) => t.name === "finishPhase");
           if (request.convergenceReserve && !postPatch?.active && !prePatch) {
             const inputTokens = estimateModelInput(projectedMessages, availableTools);
             const outputTokens = request.modelSettings?.maxOutputTokens ?? 8192;
@@ -651,12 +717,32 @@ export class DefaultAgentRuntime implements AgentRuntime {
               (state.contextCompression?.pendingTokenReserve ?? 0);
             const remainingSteps =
               (adaptiveStepBudget?.currentLimit ?? request.maxSteps) - state.stepCount + 1;
-            const reserveTokens = 2 * nextTokens + request.convergenceReserve.downstreamTokens;
+            const editTools = availableTools.filter((t) =>
+              ["replaceText", "applyPatch", "writeFile", "finishPhase"].includes(t.name),
+            );
+            const finishTools = availableTools.filter((t) => t.name === "finishPhase");
+            const correctionTokens =
+              estimateModelInput(projectedMessages, editTools) + outputTokens;
+            const completionTokens =
+              estimateModelInput(projectedMessages, finishTools) + outputTokens;
+            const reserveTokens =
+              (execution.editCorrectionUsed || correctingEdit ? 0 : correctionTokens) +
+              completionTokens +
+              request.convergenceReserve.downstreamTokens;
             explorationClosed ||=
               remainingTokens < nextTokens + reserveTokens || remainingSteps <= 2;
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
-                ["replaceText", "applyPatch", "writeFile", "finishPhase"].includes(t.name),
+                [
+                  "replaceText",
+                  "applyPatch",
+                  "writeFile",
+                  "finishPhase",
+                  ...(correctingEdit && execution.correctionReason === "PROTOCOL_INVALID"
+                    ? [execution.correctionTool!]
+                    : []),
+                  ...(closingReadAllowed() ? ["readFile"] : []),
+                ].includes(t.name),
               );
               projectedMessages = [
                 ...projectedMessages,
@@ -670,13 +756,19 @@ export class DefaultAgentRuntime implements AgentRuntime {
             const required =
               estimateModelInput(projectedMessages, availableTools) +
               outputTokens +
-              request.convergenceReserve.downstreamTokens;
+              request.convergenceReserve.downstreamTokens +
+              (explorationClosed && closingReadAllowed()
+                ? completionTokens + Math.ceil(16384 / 3)
+                : 0);
             const observation = {
               requestIssued: false,
               explorationClosed,
               estimatedInputTokens: inputTokens,
               configuredOutputTokens: outputTokens,
               reserveTokens,
+              correctionTokens,
+              completionTokens,
+              currentEvidenceRefreshAvailable: closingReadAllowed(),
               requiredTokens: required,
               remainingTokens,
               remainingSteps,
@@ -760,6 +852,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
               messages: projectedMessages,
               tools: availableTools,
               ...(request.modelSettings === undefined ? {} : { settings: request.modelSettings }),
+            };
+            state = {
+              ...state,
+              metrics: {
+                ...state.metrics,
+                modelRequestsDispatched: (state.metrics.modelRequestsDispatched ?? 0) + 1,
+              },
             };
             response = await this.model.generate(modelRequest, { signal });
             request.prePatch?.usage(response.usage.inputTokens, response.usage.outputTokens);
@@ -1007,7 +1106,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
             used: execution.editCorrectionUsed,
             explorationClosed,
             handoffPending: closingDecisionPending,
+            authorizationHandoffUsed,
+            evidenceRefreshUsed:
+              evidenceRefreshUsed ||
+              (explorationClosed && calls.some((c) => c.name === "readFile")),
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
+            ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
+            ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
           },
           messages,
         });
@@ -1138,6 +1243,67 @@ export class DefaultAgentRuntime implements AgentRuntime {
         );
         const normalCalls = executedCalls.filter(({ control }) => !control);
         if (
+          authorizationHandoffUsed &&
+          executedCalls.some(({ call }) => call.name !== "finishPhase")
+        )
+          throw new DevflowError({
+            code: "AGENT_STALLED",
+            message:
+              "AUTHORIZATION_HANDOFF_UNRESOLVED: the finish-only decision requested another tool.",
+            details: { requestIssued: true },
+          });
+        const authorizationHandoff =
+          request.repairMode &&
+          !authorizationHandoffUsed &&
+          executedCalls.some(
+            ({ result }) =>
+              !result.ok &&
+              objectValue(result.error.details)?.failureOrigin === "HOST_AUTHORIZATION",
+          );
+        if (authorizationHandoff) {
+          authorizationHandoffUsed = true;
+          explorationClosed = true;
+          closingDecisionPending = true;
+          messages.push({
+            role: "USER",
+            content:
+              "HOST_AUTHORIZATION_HANDOFF: the host denied further action. Use the next budgeted decision only to finishPhase with current evidence and SCOPE_CONFLICT or INSUFFICIENT_EVIDENCE. No new reads or edits; authorization denial is not a parameter correction.",
+          });
+        }
+        const protocolFailure = request.repairMode
+          ? executedCalls.find(
+              ({ call, result }) =>
+                !result.ok &&
+                !["APPROVAL_REQUIRED", "CONFLICT"].includes(result.error.code) &&
+                objectValue(result.error.details)?.failureOrigin !== "HOST_AUTHORIZATION" &&
+                ((call.name === "finishPhase" &&
+                  /finishPhase|findingId|evidenceRefs/u.test(result.error.message)) ||
+                  (["readFile", "batchReadFiles", "readEvidenceArtifact"].includes(call.name) &&
+                    (result.error.code === "VALIDATION_ERROR" ||
+                      /READ_INVALID_RANGE|startLine|endLine|Unknown public repair evidence section/u.test(
+                        result.error.message,
+                      )))),
+            )
+          : undefined;
+        if (protocolFailure) {
+          if (execution.editCorrectionUsed)
+            throw new DevflowError({
+              code: "AGENT_STALLED",
+              message: "REPAIR_PROTOCOL_CORRECTION_EXHAUSTED: failed fields remain unresolved.",
+              details: { tool: protocolFailure.call.name, requestIssued: true },
+            });
+          execution.editCorrectionPending = true;
+          execution.correctionReason = "PROTOCOL_INVALID";
+          execution.correctionTool = protocolFailure.call.name;
+          execution.correctionInput = JSON.stringify(protocolFailure.call.input);
+          messages.push({
+            role: "USER",
+            content:
+              "One shared bounded correction decision: correct only the reported parameters/finishPhase fields, preserving the same source or artifact. Or finish with INSUFFICIENT_EVIDENCE. This is not new evidence or permission; it shares the edit/LENGTH correction credit.",
+          });
+        }
+
+        if (
           !execution.editCorrectionUsed &&
           normalCalls.some(({ call, result }) => {
             if (call.name !== "applyPatch") return false;
@@ -1231,6 +1397,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
               content:
                 "Convergence warning: the previous calls produced no new evidence or workspace change. Do not repeat unchanged reads, failed calls or no-op edits; change strategy or finish with the unresolved gap.",
             });
+          } else if (authorizationHandoff) {
+            // One ordinary, budgeted finish-only decision; do not reset progress or correction credit.
           } else if (request.convergenceReserve && !explorationClosed) {
             explorationClosed = true;
             closingDecisionPending = true;
@@ -1261,7 +1429,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
             used: execution.editCorrectionUsed,
             explorationClosed,
             handoffPending: closingDecisionPending,
+            authorizationHandoffUsed,
+            evidenceRefreshUsed,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
+            ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
+            ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
           },
         });
         await context.emit({
@@ -1397,7 +1569,9 @@ interface ToolExecutionMetadata {
 }
 
 interface RuntimeExecutionState {
-  correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH";
+  correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
+  correctionTool?: string;
+  correctionInput?: string;
   editCorrectionPending: boolean;
   editCorrectionUsed: boolean;
   evidenceDiscoveries: number;
@@ -1595,10 +1769,16 @@ async function executeToolBatch(
     const summary = finishSummary(call);
     const priorSucceeded = results.slice(0, index).every((result) => result?.result.ok === true);
     const isLast = index === calls.length - 1;
-    const schemaError = finishSchemaError(call, state.tools.get("finishPhase"));
+    const schemaError =
+      finishSchemaError(call, state.tools.get("finishPhase")) ??
+      context.validateFinishPhase?.(call.input);
     context.postPatch?.toolStarted("finishPhase");
     const error =
-      context.postPatch && !context.postPatch.ready
+      context.postPatch &&
+      !context.postPatch.ready &&
+      !["INSUFFICIENT_EVIDENCE", "SCOPE_CONFLICT"].includes(
+        PhaseCompletionSchema.safeParse(call.input).data?.outcome ?? "",
+      )
         ? "PATCH_NOT_READY: resolve observed mutation/diff/target blockers before finishing."
         : !isLast
           ? "finishPhase must be the last call in a tool-call batch."
@@ -1695,10 +1875,12 @@ async function executeOneToolInner(
     input: call.input,
   });
   if (denied) {
-    if (metadata.mutatesWorkspace && context.postPatch) {
-      const revision = context.postPatch.revision;
-      context.postPatch.observeMutation(
-        {
+    let result = controlFailure(denied, "HOST_AUTHORIZATION");
+    if (metadata.mutatesWorkspace) {
+      const revision = context.postPatch?.revision ?? state.workspaceRevision;
+      result = {
+        ...result,
+        mutation: {
           status: "REJECTED",
           executionSucceeded: false,
           mutationAttempted: false,
@@ -1709,13 +1891,16 @@ async function executeOneToolInner(
           afterRevision: revision,
           changedFiles: [],
           currentHashes: {},
+          // Authorization rejected before executeTool: no workspace operation was started.
+          observationComplete: true,
+          affectedPaths: toolPaths(call, result),
         },
-        [],
-      );
+      };
+      context.postPatch?.observeMutation(result.mutation!, []);
     }
     return {
       call,
-      result: controlFailure(denied),
+      result,
       metadata,
       cached: false,
       executed: false,
@@ -1809,11 +1994,18 @@ function toolMetadata(
   return { readOnly, parallelSafe: readOnly, mutatesWorkspace };
 }
 
-function controlFailure(message: string): ToolExecutionResult {
+function controlFailure(
+  message: string,
+  failureOrigin: "INPUT_VALIDATION" | "HOST_AUTHORIZATION" = "INPUT_VALIDATION",
+): ToolExecutionResult {
   return {
     ok: false,
     durationMs: 0,
-    error: new DevflowError({ code: "VALIDATION_ERROR", message }).toJSON(),
+    error: new DevflowError({
+      code: "VALIDATION_ERROR",
+      message,
+      details: { failureOrigin },
+    }).toJSON(),
   };
 }
 
@@ -1831,7 +2023,14 @@ function finishSchemaError(
 ): string | undefined {
   if (descriptor === undefined) return undefined;
   const parsed = descriptor.inputSchema.safeParse(call.input);
-  return parsed.success ? undefined : "finishPhase input did not match its declared schema.";
+  return parsed.success
+    ? undefined
+    : "finishPhase input errors: " +
+        parsed.error.issues
+          .slice(0, 6)
+          .map((issue) => `${issue.path.join(".") || "input"}: ${issue.message}`)
+          .join("; ") +
+        '. Blocking reply example: {"summary":"Current evidence is insufficient within approved scope","outcome":"INSUFFICIENT_EVIDENCE"}. Do not invent finding IDs or SHA.';
 }
 
 async function mapWithConcurrency<T, R>(
@@ -2106,17 +2305,7 @@ function latestFileSnapshotMessage(
   messages: readonly ModelMessage[],
 ): { role: "USER"; content: string } | undefined {
   const latest = new Map<string, FileSnapshot>();
-  for (const message of messages) {
-    if (message.role === "ASSISTANT") {
-      if (
-        message.toolCalls?.some(({ name }) =>
-          new Set(["writeFile", "replaceText", "applyPatch", "runCommand"]).has(name),
-        ) === true
-      ) {
-        latest.clear();
-      }
-      continue;
-    }
+  for (const message of invalidateHistoricalReads(messages)) {
     if (message.role !== "TOOL" || message.isError === true) continue;
     if (message.toolName === "readFile") {
       rememberFileSnapshot(latest, message.content);
@@ -2301,6 +2490,7 @@ function toolResultMessage(call: ModelToolCall, result: ToolExecutionResult): Mo
         toolName: call.name,
         content: jsonValue(result.output),
         isError: false,
+        ...(result.mutation ? { mutation: result.mutation } : {}),
       }
     : {
         role: "TOOL",
@@ -2308,6 +2498,7 @@ function toolResultMessage(call: ModelToolCall, result: ToolExecutionResult): Mo
         toolName: call.name,
         content: jsonValue(result.error),
         isError: true,
+        ...(result.mutation ? { mutation: result.mutation } : {}),
       };
 }
 
@@ -2320,6 +2511,10 @@ function runMetrics(state: AgentState): RunMetrics {
     durationMs: Math.max(0, Date.now() - Date.parse(state.startedAt)),
     steps: state.stepCount,
     modelCalls: state.metrics.modelCalls,
+    modelRequestAttempts: state.metrics.modelCalls,
+    ...(state.metrics.modelRequestsDispatched === undefined
+      ? {}
+      : { modelRequestsDispatched: state.metrics.modelRequestsDispatched }),
     toolCalls: state.metrics.toolCalls,
     toolExecutions: state.metrics.toolExecutions,
     cacheHits: state.metrics.cacheHits,

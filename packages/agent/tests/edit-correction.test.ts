@@ -213,6 +213,74 @@ it("closes exploration before consuming the correction and downstream token rese
   );
   expect(result.status).toBe("SUCCEEDED");
 });
+it("permits only one bounded host-approved evidence refresh when exploration closes", async () => {
+  const f = fixture();
+  f.context.closingReadPaths = () => ["a.ts"];
+  f.context.executeTool = async (_, call) => ({
+    ok: true,
+    durationMs: 0,
+    output:
+      call.name === "readFile"
+        ? {
+            path: "a.ts",
+            content: "const current = 1;",
+            fileSha256: "a".repeat(64),
+            startLine: 1,
+            endLine: 1,
+          }
+        : {},
+  });
+  const model = new FakeLanguageModel([
+    async (request) => {
+      expect(request.tools.map((t) => t.name)).toContain("readFile");
+      return fakeModelResponse({
+        toolCalls: [
+          { id: randomUUID(), name: "readFile", input: { path: "a.ts", maxBytes: 1000 } },
+        ],
+      });
+    },
+    async (request) => {
+      expect(request.tools.map((t) => t.name)).not.toContain("readFile");
+      return response("finishPhase");
+    },
+  ]);
+  const result = await new DefaultAgentRuntime(model).run(
+    {
+      maxSteps: 2,
+      timeoutMs: 1000,
+      maxRetries: 0,
+      modelSettings: { maxOutputTokens: 512 },
+      convergenceReserve: { downstreamSteps: 1, downstreamTokens: 500 },
+      executionBudget: {
+        stage: "REPAIR",
+        maxModelCalls: 2,
+        maxToolCalls: 4,
+        maxTotalTokens: 20_000,
+      },
+    },
+    f.context,
+  );
+  expect(result.status).toBe("SUCCEEDED");
+  expect(model.requests).toHaveLength(2);
+});
+it("does not issue a closing refresh decision if the required subsequent finish and Review cannot fit", async () => {
+  const f = fixture();
+  f.context.closingReadPaths = () => ["a.ts"];
+  const model = new FakeLanguageModel([response("readFile")]);
+  const result = await new DefaultAgentRuntime(model).run(
+    {
+      maxSteps: 2,
+      timeoutMs: 1000,
+      maxRetries: 0,
+      modelSettings: { maxOutputTokens: 512 },
+      convergenceReserve: { downstreamSteps: 1, downstreamTokens: 500 },
+      executionBudget: { stage: "REPAIR", maxModelCalls: 2, maxToolCalls: 4, maxTotalTokens: 1000 },
+    },
+    f.context,
+  );
+  expect(model.requests).toHaveLength(0);
+  expect(result.error?.details).toMatchObject({ requestIssued: false });
+});
 it("gives one closing decision instead of killing a repeated-evidence loop before handoff", async () => {
   const f = fixture();
   f.context.executeTool = async () => ({

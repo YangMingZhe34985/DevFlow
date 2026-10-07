@@ -12,6 +12,7 @@ import {
   InMemoryAgentStateStore,
   projectModelMessages,
   type AgentStateStore,
+  type AgentState,
   type ModelMessage,
   type RunContext,
 } from "../src/index.js";
@@ -321,6 +322,249 @@ describe("DefaultAgentRuntime", () => {
 
     expect(result.status).toBe("SUCCEEDED");
     expect(executedNames).toEqual(["readFile", "writeFile", "readFile"]);
+  });
+
+  it("retains failed-edit host observations in checkpoints and the next projected decision", async () => {
+    const store = new InMemoryAgentStateStore();
+    const { context } = createContext(new AbortController().signal, store);
+    const mutation = {
+      status: "REJECTED" as const,
+      executionSucceeded: false,
+      mutationAttempted: true,
+      mutationApplied: false,
+      workspaceChanged: false,
+      reason: "TEXT_MATCH_COUNT",
+      beforeRevision: 0,
+      afterRevision: 0,
+      changedFiles: [],
+      currentHashes: { "src/a.ts": "a".repeat(64) },
+      observationComplete: true,
+      affectedPaths: ["src/a.ts"],
+    };
+    context.executeTool = async (_step, call) =>
+      call.name === "readFile"
+        ? { ok: true, output: { path: "src/a.ts", content: "exact\r\nsource\r\n" }, durationMs: 1 }
+        : {
+            ok: false,
+            error: {
+              code: "CONFLICT",
+              message: "TEXT_MATCH_COUNT: no write was attempted",
+              retryable: false,
+            },
+            mutation,
+            durationMs: 1,
+          };
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [{ id: "r", name: "readFile", input: { path: "src/a.ts" } }],
+      }),
+      fakeModelResponse({
+        toolCalls: [
+          {
+            id: "w",
+            name: "replaceText",
+            input: { path: "src/a.ts", oldText: "exact\nsource", newText: "fixed" },
+          },
+        ],
+      }),
+      async (request) => {
+        expect(
+          request.messages.find((message) => message.role === "TOOL" && message.toolCallId === "r"),
+        ).toMatchObject({ content: { path: "src/a.ts", content: "exact\r\nsource\r\n" } });
+        expect(
+          request.messages.find((message) => message.role === "TOOL" && message.toolCallId === "w"),
+        ).toMatchObject({ isError: true, mutation });
+        const persisted = await store.load(context.runId);
+        expect(
+          persisted?.messages.find(
+            (message) => message.role === "TOOL" && message.toolCallId === "w",
+          ),
+        ).toMatchObject({ mutation });
+        return fakeModelResponse({
+          toolCalls: [],
+          text: "Evidence preserved; report an unresolved edit.",
+        });
+      },
+    ]);
+    const result = await new DefaultAgentRuntime(model).run(
+      { maxSteps: 3, timeoutMs: 2000, maxRetries: 0, deduplicateContext: true },
+      context,
+    );
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe("SUCCEEDED");
+  });
+
+  it("keeps source evidence after a pre-execution scope denial, including checkpoint recovery", async () => {
+    const underlying = new InMemoryAgentStateStore();
+    let afterDenial: AgentState | undefined;
+    const store: AgentStateStore = {
+      load: (runId) => underlying.load(runId),
+      async save(state) {
+        await underlying.save(state);
+        if (
+          state.phase === "CALLING_TOOL" &&
+          state.messages.some(
+            (message) => message.role === "TOOL" && message.toolCallId === "denied",
+          )
+        )
+          afterDenial = await underlying.load(state.runId);
+      },
+    };
+    const { context, events } = createContext(new AbortController().signal, store);
+    let source = "unchanged source\r\n";
+    let writes = 0;
+    context.authorizeTool = (call) =>
+      call.name === "writeFile" ? "APPROVAL_SCOPE: outside approved edit scope" : undefined;
+    context.executeTool = async (_step, call) => {
+      if (call.name === "writeFile") {
+        writes++;
+        source = "unexpected write";
+      }
+      return { ok: true, output: { path: "approved.ts", content: source }, durationMs: 1 };
+    };
+    const verifyEvidence = (messages: readonly ModelMessage[]) => {
+      expect(
+        messages.find((message) => message.role === "TOOL" && message.toolCallId === "read"),
+      ).toMatchObject({ content: { path: "approved.ts", content: "unchanged source\r\n" } });
+      expect(
+        messages.find((message) => message.role === "TOOL" && message.toolCallId === "denied"),
+      ).toMatchObject({
+        isError: true,
+        content: { message: "APPROVAL_SCOPE: outside approved edit scope" },
+        mutation: {
+          status: "REJECTED",
+          executionSucceeded: false,
+          mutationAttempted: false,
+          workspaceChanged: false,
+          observationComplete: true,
+          affectedPaths: ["outside.ts"],
+        },
+      });
+    };
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [{ id: "read", name: "readFile", input: { path: "approved.ts" } }],
+      }),
+      fakeModelResponse({
+        toolCalls: [
+          {
+            id: "denied",
+            name: "writeFile",
+            input: { path: "outside.ts", content: "unauthorized" },
+          },
+        ],
+      }),
+      async (request) => {
+        verifyEvidence(request.messages);
+        return fakeModelResponse({ toolCalls: [], text: "Scope conflict remains unresolved" });
+      },
+    ]);
+    const request = { maxSteps: 4, timeoutMs: 2000, maxRetries: 0, deduplicateContext: true };
+    expect((await new DefaultAgentRuntime(model).run(request, context)).status).toBe("SUCCEEDED");
+    expect(writes).toBe(0);
+    expect(source).toBe("unchanged source\r\n");
+    expect(
+      events.find(
+        (event) =>
+          event.type === "WORKFLOW_CHECKPOINT" && event.payload.toolDecision?.callId === "denied",
+      )?.payload.toolDecision,
+    ).toMatchObject({
+      ok: false,
+      executed: false,
+      mutation: { observationComplete: true, mutationAttempted: false },
+    });
+    expect(afterDenial).toBeDefined();
+    const resumedStore = new InMemoryAgentStateStore();
+    await resumedStore.save(afterDenial!);
+    const resumedModel = new FakeLanguageModel([
+      async (next) => {
+        verifyEvidence(next.messages);
+        return fakeModelResponse({
+          toolCalls: [],
+          text: "Recovered scope conflict with evidence retained",
+        });
+      },
+    ]);
+    const resumed = await new DefaultAgentRuntime(resumedModel).run(request, {
+      ...context,
+      stateStore: resumedStore,
+    });
+    expect(resumed.status).toBe("SUCCEEDED");
+    expect(resumedModel.requests).toHaveLength(1);
+    expect(writes).toBe(0);
+    expect(source).toBe("unchanged source\r\n");
+  });
+
+  it("keeps synthesized snapshots after a complete failed edit and expires only changed paths", () => {
+    const history: ModelMessage[] = [
+      { role: "SYSTEM", content: "Test snapshot projection" },
+      { role: "USER", content: "Task" },
+      {
+        role: "ASSISTANT",
+        content: "",
+        toolCalls: [{ id: "r", name: "batchReadFiles", input: { paths: ["a.ts", "b.ts"] } }],
+      },
+      {
+        role: "TOOL",
+        toolCallId: "r",
+        toolName: "batchReadFiles",
+        isError: false,
+        content: {
+          files: [
+            { path: "a.ts", content: "original-a", fileSha256: "a".repeat(64) },
+            { path: "b.ts", content: "original-b", fileSha256: "b".repeat(64) },
+          ],
+        },
+      },
+      {
+        role: "ASSISTANT",
+        content: "",
+        toolCalls: [{ id: "w", name: "replaceText", input: { path: "a.ts" } }],
+      },
+      {
+        role: "TOOL",
+        toolCallId: "w",
+        toolName: "replaceText",
+        isError: true,
+        content: { code: "CONFLICT" },
+        mutation: {
+          status: "REJECTED",
+          executionSucceeded: false,
+          mutationAttempted: true,
+          mutationApplied: false,
+          workspaceChanged: false,
+          reason: "NO_MATCH",
+          beforeRevision: 1,
+          afterRevision: 1,
+          changedFiles: [],
+          currentHashes: { "a.ts": "a".repeat(64) },
+          observationComplete: true,
+          affectedPaths: ["a.ts"],
+        },
+      },
+    ];
+    const snapshots = (messages: ModelMessage[]) =>
+      projectModelMessages(messages).find(
+        (message) =>
+          message.role === "USER" && message.content.startsWith("Latest relevant file snapshots"),
+      )?.content as string;
+    expect(snapshots(history)).toContain("original-a");
+    expect(snapshots(history)).toContain("original-b");
+    const changed = structuredClone(history);
+    const observation = changed[5];
+    if (observation?.role !== "TOOL" || !observation.mutation)
+      throw new Error("Test observation missing");
+    observation.mutation = {
+      ...observation.mutation,
+      status: "FAILED",
+      mutationApplied: true,
+      workspaceChanged: true,
+      afterRevision: 2,
+      changedFiles: ["a.ts"],
+      currentHashes: { "a.ts": "c".repeat(64) },
+    };
+    expect(snapshots(changed)).not.toContain("original-a");
+    expect(snapshots(changed)).toContain("original-b");
   });
 
   it("executes parallel-safe reads with concurrency four and preserves result order", async () => {

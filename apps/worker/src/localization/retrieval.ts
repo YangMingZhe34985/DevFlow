@@ -598,6 +598,11 @@ export class IssueLocalizer {
     metrics.cacheState =
       metrics.cacheHits === 0 ? "COLD" : metrics.parsedFiles === 0 ? "WARM" : "PARTIAL";
     metrics.filesInspected = read.size;
+    metrics.astParsedFiles = [...read.values()].filter((f) => f.parsed?.status === "PARSED").length;
+    metrics.lexicalFiles = [...read.values()].filter((f) => f.parsed?.status === "LEXICAL").length;
+    metrics.parseErrorFiles = [...read.values()].filter(
+      (f) => f.parsed?.status === "PARSE_ERROR",
+    ).length;
     metrics.estimatedTokens = Buffer.byteLength(JSON.stringify(pack)) + 128;
     metrics.contextMs = performance.now() - contextStarted;
     metrics.wallMs = performance.now() - started;

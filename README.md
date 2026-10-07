@@ -1,4 +1,6 @@
-# DevFlow 2.0
+# DevFlow 2.2
+
+Current release: **v2.2 (2.2.0)**. This release strengthens diagnostic handoff, bounded scope replanning, Repair recovery and host-assisted Review evidence.
 
 [中文](README_CN.md) | [English](README.md)
 
@@ -6,17 +8,20 @@ DevFlow turns repository tasks and GitHub Issues into observable, approval-based
 
 The API persists intent and queues work. The Worker owns execution; agents access repository code through policy-controlled tools in Docker sandboxes. Tasks pin an immutable base commit, and runs retain events, source references, diff artifacts and budgets.
 
-## What changed in 2.0
+## Current capabilities
 
 - A concise proposal Planner: repair direction, intended source files, verification and uncertainty. Human approval defines write scope.
 - Separate model bindings for Localization, Planner, Execute, Repair and Review. The example configuration uses Bailian.
-- Versioned TS/JS dependency/export evidence, available to Execute and Repair through bounded `queryRelations` calls.
+- Versioned TS/JS dependency/export evidence and bounded Python/Java/C++ static navigation, shared across stages. Partial or ambiguous relationships stay explicit.
 - Full-file SHA checks, precise text replacement and protected-file policies before code writes.
-- Tool-free Review with two bounded host evidence rounds and isolated public reproductions; Repair retains diagnostic tasks and checked per-finding answers for independent re-review.
+- Tool-free Review with bounded host evidence and public reproductions; Repair retains diagnostic tasks, SHA-linked evidence records and checked answers, with a shared protocol/edit/output correction credit.
+- Public build/typecheck/lint/test profiles, source-aware diagnostic handoff and one bounded scope replan requiring a new approval.
 - Execute reserves editing correction and completion budgets; repeated source/graph queries cannot earn new progress, while malformed edits receive one bounded correction.
 - Shared request/recovery budgets, complete-output checks and protected write scope throughout the workflow.
 
 The final nine-case cohort passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing validated nine-case coverage to six strict successes. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).
+
+The v2.2 dataset experiments separately validated E09 and E01 in one frozen batch and E08 in a subsequent single-case batch. These records use different versions and are not a combined cohort success rate. See [the current experiment records](docs/new-dataset-validation-20261007.md).
 
 ## Quick start
 

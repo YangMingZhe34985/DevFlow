@@ -1,5 +1,9 @@
 import { createHash } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
+import { repairDiagnosticTasks, sourceEvidenceRecord } from "./repair-tasks.js";
+import { stableFailureStream } from "./repair-convergence.js";
+import { resolveRepairDiagnostics } from "./repair-diagnostics.js";
+export { extractRepairDiagnostics } from "./repair-diagnostics.js";
 import type { WorkingCode } from "@devflow/agent";
 import { graphPathAllowed } from "../localization/relation-graph.js";
 
@@ -23,6 +27,7 @@ export interface DeterministicContext {
   text: string;
   toolExecutions: number;
   toolLatencyMs: number;
+  toolWorkRecorded?: boolean;
 }
 
 export interface RepositoryComplexityProfile {
@@ -50,6 +55,9 @@ interface RepositoryProfileTask {
 }
 
 export interface RepairContext extends DeterministicContext {
+  evidenceRecords?: ReturnType<typeof sourceEvidenceRecord>[];
+  diagnosticTasks?: ReturnType<typeof repairDiagnosticTasks>;
+  diagnosticResolution?: ReturnType<typeof resolveRepairDiagnostics>;
   stableTaskContext: string;
   currentSources: WorkingCode[];
   diffFingerprint: string;
@@ -60,7 +68,12 @@ export interface RepairContext extends DeterministicContext {
 }
 
 export function readRepairEvidence(
-  input: { sha256: string; section: string; startLine: number; endLine: number },
+  input: {
+    sha256: string;
+    section: string;
+    startLine?: number | undefined;
+    endLine?: number | undefined;
+  },
   evidence: RepairContext["evidence"] | undefined,
 ) {
   if (!evidence || sha256(JSON.stringify(evidence)) !== input.sha256)
@@ -69,16 +82,23 @@ export function readRepairEvidence(
     evidence.version !== "repair-evidence-v1" ||
     typeof evidence.sections[input.section] !== "string"
   )
-    throw new Error("Unknown public repair evidence section.");
+    throw new Error(
+      `Unknown public repair evidence section ${input.section}; valid sections: ${Object.keys(evidence.sections).join(", ")}.`,
+    );
+  if ((input.startLine === undefined) !== (input.endLine === undefined))
+    throw new Error(
+      'readEvidenceArtifact.startLine/endLine: supply both positive inclusive bounds (at most 300 lines), or omit both for lines 1..80. Example: {sha256, section:"diff", startLine:1, endLine:80}.',
+    );
   const request = {
     path: input.section,
-    startLine: input.startLine,
-    endLine: input.endLine,
+    startLine: input.startLine ?? 1,
+    endLine: input.endLine ?? 80,
     maxBytes: 8192,
   };
   validateReadFileRequest(request);
   return {
     ...readFileContent(Buffer.from(evidence.sections[input.section]!), request),
+    defaultRange: input.startLine === undefined,
     artifactSha256: input.sha256,
     historical: true,
     note: "Historical public repair evidence; read current workspace source before editing. This grants no permission.",
@@ -229,25 +249,51 @@ export async function buildRepairContext(
   test: CommandResult,
   signal: AbortSignal,
   extra?: string,
-  options: { evidenceRecoveryAvailable?: boolean; workspaceRevision?: number } = {},
+  options: {
+    evidenceRecoveryAvailable?: boolean;
+    workspaceRevision?: number;
+    additionalSources?: readonly { path: string; line?: number | undefined }[];
+    repositoryManifest?: { paths: readonly string[]; complete: boolean };
+    beforeOperation?: () => void;
+  } = {},
 ): Promise<RepairContext> {
   const startedAt = Date.now();
-  const [status, diff] = await Promise.all([
-    git.status(sandbox, signal),
-    git.diff(sandbox, { maxBytes: 80 * 1024 }, signal),
-  ]);
+  options.beforeOperation?.();
+  const status = await git.status(sandbox, signal);
+  options.beforeOperation?.();
+  const diff = await git.diff(sandbox, { maxBytes: 80 * 1024 }, signal);
   let executions = 2;
-  const diagnostics = extractRepairDiagnostics(test.stdout + "\n" + test.stderr);
+  const diagnosticText = test.stdout + "\n" + test.stderr;
   const changedPaths = status.files.map(({ path }) => path.split(" -> ").at(-1) ?? path);
-  for (const diagnostic of diagnostics) {
-    const matches = changedPaths.filter(
-      (path) => path === diagnostic.path || path.endsWith("/" + diagnostic.path),
-    );
-    if (matches.length === 1) diagnostic.path = matches[0]!;
-  }
+  let repositoryPaths = [
+    ...new Set([...(options.repositoryManifest?.paths ?? []), ...changedPaths]),
+  ];
+  let manifestComplete = options.repositoryManifest?.complete ?? false;
+  if (!options.repositoryManifest)
+    try {
+      options.beforeOperation?.();
+      const listing = await sandbox.listFiles(
+        { path: ".", recursive: true, maxEntries: 2000 },
+        signal,
+      );
+      executions++;
+      manifestComplete = !listing.truncated;
+      repositoryPaths = listing.entries
+        .filter((e) => e.kind === "FILE")
+        .map((e) => e.path.replace(/^\.\//u, ""));
+    } catch (error) {
+      if (signal.aborted) throw error;
+    }
+  const diagnosticResolution = resolveRepairDiagnostics(
+    diagnosticText,
+    repositoryPaths,
+    manifestComplete,
+  );
+  const resolvedDiagnostics = diagnosticResolution.resolved;
   const changedFiles = [
     ...new Set([
-      ...diagnostics.map((d) => d.path),
+      ...resolvedDiagnostics.map((d) => d.path),
+      ...(options.additionalSources?.map((source) => source.path) ?? []),
       ...status.files.map(({ path }) => path.split(" -> ").at(-1) ?? path).filter(isUsefulTextPath),
     ]),
   ]
@@ -255,14 +301,21 @@ export async function buildRepairContext(
     .slice(0, RELEVANT_FILE_LIMIT);
   const relevantFiles = await Promise.all(
     changedFiles.map(async (path) => {
+      options.beforeOperation?.();
       try {
         const section = diff.patch.split(`+++ b/${path}`)[1]?.split(/^diff --git /mu)[0] ?? "";
         const changedLine =
-          diagnostics.find((d) => d.path === path)?.line ??
+          resolvedDiagnostics.find((d) => d.path === path)?.line ??
+          options.additionalSources?.find((source) => source.path === path)?.line ??
           Number(section.match(/^@@ [^+]*\+(\d+)/mu)?.[1] ?? 1);
         const startLine = Math.max(1, changedLine - 8);
         const file = await sandbox.readFile(
-          { path, startLine, endLine: startLine + 79, maxBytes: 8192 },
+          {
+            path,
+            startLine,
+            endLine: startLine + 79,
+            maxBytes: Math.min(6000, Math.floor(6400 / Math.max(1, changedFiles.length))),
+          },
           signal,
         );
         return `--- ${file.path}:${file.startLine ?? startLine}..${file.endLine ?? "unknown"} SHA=${file.fileSha256 ?? "unavailable"}${file.truncated ? " (partial)" : ""}\n${file.content}`;
@@ -290,7 +343,7 @@ export async function buildRepairContext(
       : [];
   });
   while (Buffer.byteLength(JSON.stringify(currentSources)) > 8192) currentSources.pop();
-  const testText = compactTestOutput(test);
+  const diagnosticTasks = repairDiagnosticTasks(diagnosticText, diagnosticResolution);
   const stableTestFingerprint = testResultFingerprint(test);
   const evidence = {
     version: "repair-evidence-v1" as const,
@@ -312,7 +365,6 @@ export async function buildRepairContext(
   };
   const text = truncate(
     [
-      excerpt(extra ?? "", 4096),
       "Use the public Issue reproduction as well as existing tests; passing repository tests alone does not establish the reported Issue is fixed. Preserve existing behavior and protected tests.",
       options.evidenceRecoveryAvailable === false
         ? `Public repair evidence SHA=${evidenceSha256}; artifact recovery is disabled by tool policy. Use permitted current source reads. This reference does not grant write permission.`
@@ -320,7 +372,8 @@ export async function buildRepairContext(
       `Changed files: ${changedFiles.length === 0 ? "(none)" : changedFiles.join(", ")}`,
       `Current diff summary: files=${String(diff.filesChanged)} additions=${String(diff.additions ?? "unknown")} deletions=${String(diff.deletions ?? "unknown")} truncated=${String(diff.truncated)}`,
       `Current diff excerpt:\n${excerpt(diff.patch, 4096)}`,
-      `Deterministic test outcome: exitCode=${String(test.exitCode)} timedOut=${String(test.timedOut)} outputTruncated=${String(test.outputTruncated)} fingerprint=${stableTestFingerprint}\n${excerpt(testText, 8192)}`,
+      `Public validation identity: exitCode=${String(test.exitCode)} timedOut=${String(test.timedOut)} outputTruncated=${String(test.outputTruncated)} fingerprint=${stableTestFingerprint}. Unfinished diagnostic tasks are in stable task state.`,
+      `Host source references (use evidenceRefs in finishPhase, or current exact quotes): ${JSON.stringify(currentSources.map((source) => sourceEvidenceRecord(source, evidenceSha256)))}`,
       currentSources.length === 0
         ? undefined
         : `Current host-read source (revision=${options.workspaceRevision ?? 0}; partial ranges do not authorize whole-file replacement):\n${JSON.stringify(currentSources)}`,
@@ -331,15 +384,19 @@ export async function buildRepairContext(
   );
   return {
     text,
+    diagnosticResolution,
+    diagnosticTasks,
+    evidenceRecords: currentSources.map((source) => sourceEvidenceRecord(source, evidenceSha256)),
     stableTaskContext: [
       stableRepairRequirements(extra ?? ""),
       "Unfinished diagnostic requirements (remain tasks after source edits):",
-      JSON.stringify(diagnostics),
-      `Last public test outcome (not automatically cleared by an edit): exitCode=${test.exitCode}\n${excerpt(testText, 8192)}`,
+      JSON.stringify(diagnosticTasks),
+      `Public test outcome (not automatically cleared by an edit): exitCode=${test.exitCode}; full log artifact SHA=${evidenceSha256}.`,
       "Preserve already-passing behavior and host scope. Report every supplied finding ID; source versions are separate evidence. A reply never bypasses Test or independent Review.",
     ].join("\n"),
     currentSources,
     toolExecutions: executions,
+    toolWorkRecorded: options.beforeOperation !== undefined,
     toolLatencyMs: Math.max(0, Date.now() - startedAt),
     changedFiles,
     evidence,
@@ -373,30 +430,6 @@ function stableRepairRequirements(extra: string): string {
     }
   }
   return extra;
-}
-
-export function extractRepairDiagnostics(
-  output: string,
-): { path: string; line: number; diagnostic: string }[] {
-  const rows: { path: string; line: number; diagnostic: string }[] = [];
-  const cleaned = stripVTControlCharacters(output).replaceAll("\\", "/");
-  for (const line of cleaned.split("\n")) {
-    const match = line.match(
-      /(?:^|\s|\()((?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_.-]+\.[cm]?[jt]sx?)(?::(\d+)(?::\d+)?|\((\d+),\d+\))/u,
-    );
-    if (!match) continue;
-    const path = match[1]!.replace(/^workspace\//u, "");
-    const position = Number(match[2] ?? match[3]);
-    if (
-      graphPathAllowed(path) &&
-      Number.isSafeInteger(position) &&
-      position > 0 &&
-      !rows.some((r) => r.path === path && r.line === position)
-    )
-      rows.push({ path, line: position, diagnostic: line.slice(0, 2000) });
-    if (rows.length >= 8) break;
-  }
-  return rows;
 }
 
 // Raw stdout/stderr remain in TEST_RESULT and artifacts. Only prompt presentation changes.
@@ -565,8 +598,9 @@ export function testResultFingerprint(result: CommandResult): string {
       `exitCode=${String(result.exitCode)}`,
       `timedOut=${String(result.timedOut)}`,
       `outputTruncated=${String(result.outputTruncated)}`,
-      result.stdout,
-      result.stderr,
+      `profile=${String((result as CommandResult & { profileSha256?: string }).profileSha256 ?? "legacy")}`,
+      stableFailureStream(result.stdout),
+      stableFailureStream(result.stderr),
     ].join("\n"),
   );
 }

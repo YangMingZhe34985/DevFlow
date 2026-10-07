@@ -1,9 +1,11 @@
+import { staticSourceLanguage } from "./source-units.js";
 import { posix } from "node:path";
 import {
   EntrySchema,
   extractIssueSignals,
   hash,
   issueSearchTerms,
+  tokens,
   sourcePathPriority,
   sourceRole,
   type IndexEntry,
@@ -22,6 +24,9 @@ export interface ImplementationWindow {
   snippet: string;
   reason: string;
   kind: "IMPLEMENTATION" | "REFERENCE";
+  parser?: "AST" | "LEXICAL_STATIC";
+  completeness?: "COMPLETE_UNIT" | "PARTIAL";
+  sourceRole?: "FORWARDER" | "IMPLEMENTATION" | "REFERENCE";
 }
 export interface NavigationResult {
   windows: ImplementationWindow[];
@@ -42,7 +47,8 @@ const matches = (name: string, requested: string) =>
   normal(name) === normal(requested) ||
   (normal(requested).length >= 4 && normal(name).endsWith(normal(requested))) ||
   (normal(requested).length >= 8 && normal(name).includes(normal(requested)));
-const codePath = (path: string) => /\.(?:[cm]?[jt]sx?)$/iu.test(path);
+const codePath = (path: string) =>
+  /\.(?:[cm]?[jt]sx?)$/iu.test(path) || staticSourceLanguage(path) !== undefined;
 // A forwarding filename may also contain real bodies. Role affects ranking;
 // verified AST bodies, rather than the filename alone, establish this evidence kind.
 const implementationKind = (path: string): ImplementationWindow["kind"] =>
@@ -82,6 +88,8 @@ export async function navigateImplementation(input: {
   candidates?: readonly {
     path: string;
     symbol?: string | null | undefined;
+    startLine?: number;
+    endLine?: number;
     reason?: string;
     explanation?: string;
   }[];
@@ -186,8 +194,30 @@ export async function navigateImplementation(input: {
       sourceRole(c.path) === "ENTRY" ||
       focus.some((n) => normal(n).length >= 8 && normal(c.path).includes(normal(n)))
         ? 35
-        : 0;
-    if (entries.has(c.path))
+        : ["IMPLEMENTATION", "ENTRY"].includes(sourceRole(c.path))
+          ? 30
+          : 0;
+    if (entries.has(c.path)) {
+      if (staticSourceLanguage(c.path)) {
+        const peers = [...entries.keys()].filter(
+          (p) =>
+            p !== c.path &&
+            posix.basename(p) === posix.basename(c.path) &&
+            sourceRole(p) === "IMPLEMENTATION",
+        );
+        for (const peer of peers.slice(0, 2))
+          enqueue(
+            peer,
+            names,
+            40,
+            0,
+            "Same filename candidate; no confirmed dependency or call edge",
+          );
+        if (peers.length)
+          result.missing.push(
+            `Same filename alternatives for ${c.path}: ${peers.slice(0, 2).join(", ")}; relationship unverified.`,
+          );
+      }
       enqueue(
         c.path,
         c.symbol ? [c.symbol, ...names] : names,
@@ -195,7 +225,7 @@ export async function navigateImplementation(input: {
         0,
         c.reason ?? c.explanation ?? "Observed candidate",
       );
-    else {
+    } else {
       result.observations.push(
         `Missing candidate ${c.path}; alternatives require a new proposal before writing.`,
       );
@@ -221,7 +251,12 @@ export async function navigateImplementation(input: {
   // Repository-wide path/role recall remains bounded and is never an allowlist.
   if (names.length)
     for (const path of [...entries.keys()]
-      .filter((p) => codePath(p) && sourceRole(p) === "IMPLEMENTATION")
+      .filter(
+        (p) =>
+          codePath(p) &&
+          sourceRole(p) === "IMPLEMENTATION" &&
+          !/(?:^|\/)(?:third_party|third-party|external|deps)(?:\/|$)/u.test(p),
+      )
       .sort((a, b) => basePriority(b) - basePriority(a) || a.localeCompare(b))
       .slice(0, 12))
       enqueue(path, names, 0, 0, "Bounded implementation fallback");
@@ -233,6 +268,8 @@ export async function navigateImplementation(input: {
     symbol: string | null,
     kind: ImplementationWindow["kind"],
     reason: string,
+    parser: "AST" | "LEXICAL_STATIC" = "AST",
+    forwarding = false,
   ) => {
     if (result.windows.length >= limits.windows) return;
     const lines = file.content.split(/\r?\n/u);
@@ -266,11 +303,28 @@ export async function navigateImplementation(input: {
       endLine,
       snippet,
       kind,
+      parser,
+      completeness: startLine <= start && endLine >= end ? "COMPLETE_UNIT" : "PARTIAL",
+      sourceRole: forwarding ? "FORWARDER" : kind,
       reason,
     });
     result.metrics.snippetBytes += Buffer.byteLength(snippet);
+    if (endLine < end)
+      result.missing.push(
+        `Unread definition continuation ${path}:${endLine + 1}-${end}; observed prefix is not a complete behavior implementation.`,
+      );
   };
-  const evidenceTerms = issueSearchTerms(signals).filter(
+  const behaviorSections = [
+    ...input.description.matchAll(
+      /(?:^|\n)#{1,6}\s*(?:Expected|Observed)[^\n]*\n([\s\S]*?)(?=\n#{1,6}\s|$)/giu,
+    ),
+  ]
+    .map((m) => m[1]!)
+    .join("\n");
+  const behaviorTerms = tokens(behaviorSections, 128).filter(
+    (t) => t.length >= 5 && !lexicalCommon.has(t),
+  );
+  const evidenceTerms = [...new Set([...behaviorTerms, ...issueSearchTerms(signals)])].filter(
     (t) => t.length > 3 && !lexicalCommon.has(t),
   );
   for (
@@ -287,6 +341,13 @@ export async function navigateImplementation(input: {
     );
     const priority = (item: (typeof queue)[number]) =>
       item.priority -
+      (staticSourceLanguage(item.path) &&
+      result.windows.filter((w) => w.path === item.path).length >= 3 &&
+      (input.candidates ?? []).some(
+        (c) => c.path !== item.path && entries.has(c.path) && !contentCache.has(c.path),
+      )
+        ? 200
+        : 0) -
       (result.windows.some((w) => w.kind === "IMPLEMENTATION") &&
       missingFocus.length &&
       item.depth &&
@@ -360,6 +421,186 @@ export async function navigateImplementation(input: {
     const node = graph
       .snapshot()
       .files.find((f) => f.path === item.path && f.state === "CURRENT" && f.sha256 === file.digest);
+    if (node?.sourceUnit) {
+      const unit = node.sourceUnit;
+      const wanted = item.names.map((n) => n.split(/\.|::/u).at(-1)!);
+      const hint =
+        item.depth === 0
+          ? input.candidates?.find((c) => c.path === item.path && c.startLine)
+          : undefined;
+      const terms = [...new Set([...behaviorTerms, ...issueSearchTerms(signals)])].filter(
+        (term) => term.length > 3 && !lexicalCommon.has(term),
+      );
+      const lines = file.content.split("\n");
+      const ownerWords = new Set(
+        unit.definitions.filter((d) => d.kind === "CLASS").flatMap((d) => tokens(d.name)),
+      );
+      const score = (d: (typeof unit.definitions)[number]) => {
+        const body = lines
+          .slice(d.startLine - 1, d.endLine)
+          .join("\n")
+          .toLowerCase();
+        const name = normal(d.name);
+        return (
+          (wanted.some((n) => matches(d.name, n)) && d.name !== d.qualifier?.split("::").at(-1)
+            ? 100
+            : wanted.includes(d.qualifier ?? "")
+              ? 8
+              : 0) +
+          behaviorTerms.filter(
+            (t) => name.includes(normal(t)) && (!ownerWords.has(t) || name === normal(t)),
+          ).length *
+            50 +
+          terms.filter((t) => name.includes(normal(t).slice(0, 5))).length * 18 +
+          Math.min(12, terms.filter((t) => body.includes(t)).length) +
+          (hint && d.startLine <= (hint.endLine ?? hint.startLine!) && d.endLine >= hint.startLine!
+            ? 4
+            : 0) -
+          ((/^(?:__init__|to_json|toString|hashCode)$/u.test(d.name) ||
+            d.name === d.qualifier?.split("::").at(-1)) &&
+          !/constructor|construction|initializ/iu.test(input.description.split("\n")[0] ?? "")
+            ? 25
+            : 0)
+        );
+      };
+      let definitions = unit.definitions
+        .filter((d) => d.implementation && score(d) > 0)
+        .sort((a, b) => score(b) - score(a) || a.startLine - b.startLine);
+      if (item.depth > 0) {
+        const exact = unit.definitions.filter(
+          (d) =>
+            d.implementation &&
+            d.name !== d.qualifier?.split("::").at(-1) &&
+            wanted.includes(d.name),
+        );
+        if (exact.length)
+          definitions = exact.sort((a, b) => score(b) - score(a) || a.startLine - b.startLine);
+      }
+      // Reserve window diversity for the remaining candidate branches. A large definition's
+      // critical continuation can still add a second window below.
+      const selectedDefinitions = definitions.slice(0, queue.length ? 1 : 2);
+      const before = result.windows.length;
+      for (const definition of selectedDefinitions) {
+        addWindow(
+          item.path,
+          file,
+          definition.startLine,
+          definition.endLine,
+          definition.name,
+          definition.forwarding ? "REFERENCE" : implementationKind(item.path),
+          `Observed ${unit.language} lexical definition${definition.forwarding ? " forwarding to another call" : ""}; runtime dispatch and root cause unverified.`,
+          "LEXICAL_STATIC",
+          definition.forwarding,
+        );
+        if (definition.endLine - definition.startLine >= limits.lines) {
+          const lines = file.content.split("\n");
+          const hit = lines
+            .map((line, index) => ({
+              line: index + 1,
+              score: evidenceTerms.filter((t) => line.toLowerCase().includes(t)).length,
+            }))
+            .filter(
+              (h) =>
+                h.line > definition.startLine + limits.lines &&
+                h.line <= definition.endLine &&
+                h.score > 0,
+            )
+            .sort((a, b) => b.score - a.score)[0];
+          if (hit)
+            addWindow(
+              item.path,
+              file,
+              Math.max(definition.startLine, hit.line - 12),
+              Math.min(definition.endLine, hit.line + limits.lines - 13),
+              definition.name,
+              implementationKind(item.path),
+              "Behavioral branch within a lexical definition; semantic verification required.",
+              "LEXICAL_STATIC",
+            );
+        }
+      }
+      const observedCalls = selectedDefinitions
+        .flatMap((d) => d.calls)
+        .filter((c) => !/(?:Error|Exception)$/u.test(c.name) || wanted.includes(c.name));
+      for (const dependency of unit.dependencies) {
+        const requested = new Set<string>();
+        for (const binding of dependency.bindings) {
+          if (wanted.includes(binding.local))
+            requested.add(binding.imported === "*" ? binding.local : binding.imported);
+          for (const call of observedCalls) {
+            const receiver = call.receiver
+              ? (unit.receivers[call.receiver] ?? call.receiver)
+              : null;
+            if (
+              (!receiver && call.name === binding.local) ||
+              receiver === binding.local ||
+              receiver?.startsWith(binding.local + ".")
+            ) {
+              requested.add(call.name);
+              if (!receiver && binding.imported !== "*") requested.add(binding.imported);
+            }
+          }
+        }
+        if (unit.language === "C++" && dependency.kind === "IMPORT")
+          observedCalls.forEach((call) => requested.add(call.name));
+        if (dependency.kind === "IMPLEMENTATION_PAIR")
+          wanted.forEach((name) => requested.add(name));
+        if (!requested.size) continue;
+        for (const target of dependency.paths.slice(0, 2))
+          enqueue(
+            target,
+            [...requested],
+            55,
+            item.depth + 1,
+            `Observed symbol forwarding from ${item.path}:${dependency.line}; ${dependency.resolution} ${dependency.provenance}`,
+          );
+        if (dependency.resolution !== "RESOLVED")
+          result.missing.push(
+            `${item.path}:${dependency.line} ${dependency.specifier}: ${dependency.resolution}; candidates=${dependency.paths.join(",")}; no definite runtime call edge.`,
+          );
+      }
+      for (const call of observedCalls.filter(
+        (c) => !c.receiver || c.receiver === "self" || c.receiver === "this",
+      )) {
+        if (
+          unit.definitions.some(
+            (d) => d.implementation && d.name === call.name && !selectedDefinitions.includes(d),
+          )
+        )
+          enqueue(
+            item.path,
+            [call.name],
+            /^\s*return\b/u.test(lines[call.line - 1] ?? "") ? 95 : 65,
+            item.depth + 1,
+            `Observed symbol forwarding through a local call from ${item.path}:${call.line}; overloads remain candidates`,
+          );
+      }
+      const local = unit.definitions.find(
+        (d) =>
+          d.implementation &&
+          !definitions.includes(d) &&
+          observedCalls.some(
+            (c) =>
+              c.name === d.name && (!c.receiver || c.receiver === "self" || c.receiver === "this"),
+          ),
+      );
+      if (local && !queue.length && result.windows.length - before < 2)
+        addWindow(
+          item.path,
+          file,
+          local.startLine,
+          local.endLine,
+          local.name,
+          local.forwarding ? "REFERENCE" : implementationKind(item.path),
+          "Observed local call candidate; lexical resolution only.",
+          "LEXICAL_STATIC",
+          local.forwarding,
+        );
+      result.observations.push(
+        `${item.path}: ${unit.language} ${unit.parser} PARTIAL; ${unit.unknown.slice(0, 2).join(" ")}`,
+      );
+      continue;
+    }
     const parsed = node?.parse;
     if (!parsed || parsed.status !== "PARSED") {
       result.observations.push(
@@ -519,5 +760,6 @@ export async function navigateImplementation(input: {
     result.missing.push("Source manifest incomplete; outside-graph reads remain available.");
   if (queue.length && result.metrics.exitReason === "COMPLETE")
     result.metrics.exitReason = "WINDOW_BUDGET";
+  result.missing = [...new Set(result.missing)].slice(0, 32);
   return result;
 }

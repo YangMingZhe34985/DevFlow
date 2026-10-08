@@ -10,3 +10,4 @@ export * from "./post-patch.js";
 export * from "./pre-patch.js";
 export * from "./stage-context.js";
 export * from "./context-compression.js";
+export * from "./context-projection.js";

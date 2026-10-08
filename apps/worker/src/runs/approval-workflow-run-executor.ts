@@ -5065,6 +5065,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           (this.environment.stageModels?.[
             input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
           ]?.contextTokens ?? 32000) * 3,
+        contextInputTokens:
+          this.environment.stageModels?.[
+            input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
+          ]?.contextTokens ?? 32000,
         ...((this.environment.DEVFLOW_CONTEXT_COMPRESSION_ENABLED ?? true) &&
         this.modelBindings.has(input.model)
           ? {
@@ -5254,6 +5258,35 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       },
       {
         runId: input.run.id,
+        ...(input.codingSession
+          ? {
+              onContextProjection: async (artifact) => {
+                const evidenceContent = JSON.stringify(artifact.evidence);
+                const name = `repair-evidence-${artifact.evidenceSha256}.json`;
+                if (
+                  !(await this.database.artifacts.list(input.run.id)).some((a) => a.name === name)
+                )
+                  await this.database.artifacts.create({
+                    runId: input.run.id,
+                    kind: "OTHER",
+                    name,
+                    mimeType: "application/json",
+                    content: evidenceContent,
+                    sha256: artifact.evidenceSha256,
+                    metadata: { visibility: "PUBLIC_EVIDENCE", version: "context-projection-v1" },
+                  });
+                const { evidence: _evidence, ...audit } = artifact;
+                await this.database.artifacts.create({
+                  runId: input.run.id,
+                  kind: "OTHER",
+                  name: `context-projection-${artifact.inputFingerprint}.json`,
+                  mimeType: "application/json",
+                  content: JSON.stringify(audit),
+                  metadata: { visibility: "HOST_ONLY", version: "context-projection-v1" },
+                });
+              },
+            }
+          : {}),
         task: {
           taskId: input.run.task.id,
           repositoryId: input.run.repository.id,

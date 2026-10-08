@@ -159,6 +159,7 @@ export class EfficiencyTrace {
   }
   model(model: LanguageModelPort): LanguageModelPort {
     return {
+      ...(model.prepareRequest ? { prepareRequest: model.prepareRequest.bind(model) } : {}),
       generate: async (request, options) => {
         const startedAt = Date.now();
         const stage =

@@ -115,6 +115,16 @@ export interface AdaptiveStepBudgetState {
 }
 
 export const AgentStateSchema = z.object({
+  contextProjection: z
+    .object({
+      version: z.literal("context-projection-v1"),
+      evidenceSha256: z.string(),
+      viewSha256: z.string(),
+      inputFingerprint: z.string(),
+      bytes: z.number().nonnegative(),
+      inputTokens: z.number().nonnegative(),
+    })
+    .optional(),
   schemaVersion: z.literal(1),
   runId: z.string().uuid(),
   phase: AgentPhaseSchema,
@@ -190,6 +200,7 @@ export const AgentStateSchema = z.object({
   finalResult: RunResultSchema.optional(),
 });
 export interface AgentState {
+  contextProjection?: z.infer<typeof AgentStateSchema>["contextProjection"];
   hostToolState?: Record<string, unknown>;
   codingContinuations?: z.infer<typeof AgentStateSchema>["codingContinuations"];
   executionConvergence?: z.infer<typeof AgentStateSchema>["executionConvergence"];

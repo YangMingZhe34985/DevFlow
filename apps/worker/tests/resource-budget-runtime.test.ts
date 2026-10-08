@@ -24,6 +24,61 @@ import {
 } from "../src/runs/resource-budget-runtime.js";
 
 const signal = () => new AbortController().signal;
+
+it("quotes and dispatches the identical prepared wire input through the stage wrapper", async () => {
+  const { runtime, events } = await fixture();
+  const { stageLanguageModel } = await import("../src/runs/stage-language-model.js");
+  let wire = "";
+  vi.stubGlobal("fetch", async (_url: unknown, init: { body: string }) => {
+    wire = init.body;
+    return new Response(
+      JSON.stringify({
+        id: "projection-test",
+        model: "glm-5.3",
+        choices: [
+          { index: 0, message: { role: "assistant", content: "done" }, finish_reason: "stop" },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+      }),
+      { headers: { "content-type": "application/json" } },
+    );
+  });
+  try {
+    const raw = createConfiguredLanguageModel({
+      provider: "openai-compatible",
+      providerName: "bailian",
+      model: "glm-5.3",
+      apiKey: "offline-only",
+      baseUrl: "https://provider.invalid/v1",
+      contextMaxBytes: 96000,
+    });
+    const model = stageLanguageModel({
+      model: runtime.model(raw, { stage: "EXECUTE", outputTokens: 8192, timeoutMs: 1000, price }),
+      stage: "EXECUTE",
+      contextTokens: 32000,
+      settings: { maxOutputTokens: 8192, reasoningEffort: "low" },
+      provenance: {},
+    });
+    const prepared = await model.prepareRequest!(
+      { messages: [{ role: "USER", content: "Task and current diff" }], tools: [] },
+      { signal: signal() },
+    );
+    expect(events).toEqual([]);
+    await model.generate(prepared, { signal: signal() });
+    expect(wire).toBe(prepared.inputProjection!.serialized);
+    expect(events).toContainEqual({
+      budgetScheduler: expect.objectContaining({
+        action: "INVOKE",
+        inputFingerprint: prepared.inputProjection!.fingerprint,
+        resources: expect.objectContaining({
+          inputTokens: prepared.inputProjection!.estimatedInputTokens,
+        }),
+      }),
+    });
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});
 const price = { inputMicrosPerMillionTokens: 8_000_000, outputMicrosPerMillionTokens: 28_000_000 };
 const request: ModelRequest = {
   messages: [{ role: "USER", content: "Current code and public failure evidence\n".repeat(30) }],

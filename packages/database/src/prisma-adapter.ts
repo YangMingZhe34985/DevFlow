@@ -45,6 +45,8 @@ import type {
   BenchmarkCaseExecutionRecord,
   BenchmarkExecutionStore,
   BenchmarkSuiteExecutionRecord,
+  BudgetLedgerRecord,
+  BudgetLedgerStore,
   CreateArtifactInput,
   CreateApprovalInput,
   CreateRepositoryInput,
@@ -80,6 +82,7 @@ type RunWithTaskAndRepository = Prisma.RunGetPayload<{
 }>;
 
 export class PrismaDatabaseAdapter implements DatabaseAdapter {
+  readonly budgetLedgers: BudgetLedgerStore;
   readonly repositoryIndexes: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
@@ -91,6 +94,7 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   readonly events: EventStore;
 
   constructor(readonly client: PrismaClient) {
+    this.budgetLedgers = new PrismaBudgetLedgerStore(client);
     this.repositoryIndexes = {
       get: async (scope, key) => {
         const entry = await client.repositoryIndexEntry.findUnique({
@@ -132,6 +136,90 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   async ping(): Promise<void> {
     await this.client.$queryRaw`SELECT 1`;
   }
+}
+
+/** Whole-document CAS preserves unrelated Run metadata as well as ledger revisions. */
+class PrismaBudgetLedgerStore implements BudgetLedgerStore {
+  constructor(private readonly client: PrismaClient) {}
+
+  async get(runId: string): Promise<BudgetLedgerRecord | null> {
+    return await databaseCall(async () => {
+      const run = await this.client.run.findUnique({
+        where: { id: runId },
+        select: { metadata: true },
+      });
+      if (run === null) throw notFound("Run", runId);
+      return readBudgetLedgerMetadata(run.metadata).ledger;
+    });
+  }
+
+  async compareAndSwap(
+    runId: string,
+    expectedRevision: number | null,
+    value: unknown,
+  ): Promise<boolean> {
+    if (
+      expectedRevision !== null &&
+      (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
+    ) {
+      throw new DevflowError({
+        code: "VALIDATION_ERROR",
+        message: "Invalid budget ledger revision.",
+      });
+    }
+    return await databaseCall(async () => {
+      const run = await this.client.run.findUnique({
+        where: { id: runId },
+        select: { metadata: true },
+      });
+      if (run === null) throw notFound("Run", runId);
+      const { metadata, ledger } = readBudgetLedgerMetadata(run.metadata);
+      if ((ledger?.revision ?? null) !== expectedRevision) return false;
+      const changed = await this.client.run.updateMany({
+        where: {
+          id: runId,
+          metadata: { equals: run.metadata === null ? Prisma.AnyNull : run.metadata },
+        },
+        data: {
+          metadata: jsonInput({
+            ...metadata,
+            resourceBudgetLedger: {
+              revision: expectedRevision === null ? 0 : expectedRevision + 1,
+              value,
+            },
+          }),
+        },
+      });
+      return changed.count === 1;
+    });
+  }
+}
+
+function readBudgetLedgerMetadata(value: Prisma.JsonValue | null): {
+  metadata: Record<string, unknown>;
+  ledger: BudgetLedgerRecord | null;
+} {
+  if (value !== null && (typeof value !== "object" || Array.isArray(value))) {
+    throw new DevflowError({ code: "CONFLICT", message: "Run metadata is not a JSON object." });
+  }
+  const metadata = (value ?? {}) as Record<string, unknown>;
+  const entry = metadata.resourceBudgetLedger;
+  if (entry === undefined) return { metadata, ledger: null };
+  if (
+    entry === null ||
+    typeof entry !== "object" ||
+    Array.isArray(entry) ||
+    !("revision" in entry) ||
+    !Number.isSafeInteger(entry.revision) ||
+    (entry.revision as number) < 0 ||
+    !("value" in entry)
+  ) {
+    throw new DevflowError({
+      code: "CONFLICT",
+      message: "Persisted resource budget ledger is corrupt.",
+    });
+  }
+  return { metadata, ledger: { revision: entry.revision as number, value: entry.value } };
 }
 
 class PrismaRepositoryStore implements RepositoryStore {

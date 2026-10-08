@@ -311,6 +311,18 @@ export interface ArtifactStore {
   list(runId: RunId): Promise<readonly ArtifactRecord[]>;
 }
 
+/** A run-scoped, compare-and-swap JSON record. The scheduler owns its schema. */
+export interface BudgetLedgerRecord {
+  revision: number;
+  value: unknown;
+}
+
+export interface BudgetLedgerStore {
+  get(runId: RunId): Promise<BudgetLedgerRecord | null>;
+  /** null creates revision 0; an existing revision may only advance by one. */
+  compareAndSwap(runId: RunId, expectedRevision: number | null, value: unknown): Promise<boolean>;
+}
+
 export interface DatabaseGitHubPublicationStore extends GitHubPublicationStore {
   initialize(
     runId: RunId,
@@ -419,6 +431,8 @@ export interface RunDetailRecord {
 }
 
 export interface DatabaseAdapter extends DatabaseLifecycle {
+  /** Required by the resource scheduler; optional only for legacy adapters. */
+  readonly budgetLedgers?: BudgetLedgerStore;
   /** Immutable, scope-bound localization entries. Optional for legacy/test adapters. */
   readonly repositoryIndexes?: RepositoryIndexStore;
   readonly repositories: RepositoryStore;

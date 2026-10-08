@@ -45,7 +45,7 @@ An operation describes its identity, requirement (`REQUIRED` or `OPTIONAL`), sta
 - Common downstream validation and Review belong in the shared component once. A second validation that actually follows a failed one remains a separate operation.
 - Quoting can remove optional leaves and records their IDs. If required work still does not fit, admission fails with the remaining capacity and shortfall.
 
-The Worker recomputes the relevant path as evidence, changed files and task state evolve. Future estimates describe the current reachable plan, not a promise that arbitrary additional targets can fit. Every actual operation still passes the runtime boundary before dispatch.
+The Worker recomputes the relevant path as evidence, changed files and task state evolve. Future estimates describe the current reachable plan, not a promise that arbitrary additional targets can fit. Operations at the integrated model, Sandbox and source boundaries pass admission before dispatch; the accounting boundaries below describe the remaining coverage limits.
 
 Request estimates use the messages and structured schema that will actually be dispatched, together with the configured output maximum and request deadline. The host does not lower the model's output setting to make a request fit. Reported output usage already includes reasoning where supplied by the provider; it is not charged a second time as a separate reasoning budget.
 
@@ -68,7 +68,9 @@ The PostgreSQL adapter stores a versioned ledger in `Run.metadata.resourceBudget
 
 A returned request uses reported input/output usage for settlement. If a locally invoked provider request ends without reliable usage, `markUncertain` records known invocation/time facts and retains the unresolved token/cost reservation. It does not invent a zero bill or hold a second copy of already elapsed request time. Only a reservation that has not been admitted can be released as unexecuted work.
 
-On resume, the saved start, absolute deadline, consumed usage and reservations remain authoritative. Changing the configured hard limits cannot silently enlarge a persisted ledger. Interrupted in-flight operations remain held rather than being replayed with a fresh allowance. Coding decision identities persist with session checkpoints, so replaying a saved checkpoint does not create another paid decision. Legacy usage that was not measured at an internal IO boundary is not retroactively presented as exact measurement.
+A trusted local adapter error with `requestIssued=false` establishes that no provider request was sent. It settles zero tokens and cost while retaining the local invocation attempt and elapsed time. Before the adapter returns, telemetry records `INVOKE/PENDING`, not a confirmed HTTP dispatch. Unknown transport failures continue to hold their exposure. `modelCalls` counts adapter invocation attempts, so actual HTTP receipts must be reported separately.
+
+On resume, the saved start, absolute deadline, consumed usage and reservations remain authoritative. Changing the configured hard limits cannot silently enlarge a persisted ledger. Interrupted in-flight operations remain held rather than being replayed with a fresh allowance. Coding decision identities prevent duplicate step settlement for the same checkpoint. External HTTP and a Coding checkpoint are not one transaction: the ledger does not promise exactly-once provider execution, and an unknown prior request remains held if recovery attempts another decision. Legacy usage that was not measured at an internal IO boundary is not retroactively presented as exact measurement.
 
 If actual usage exceeds its estimate, settlement records the variance. A real hard-limit violation is recorded and blocks further admission; it is not hidden by clamping the recorded usage to the estimate. Preflight estimates reduce this risk but cannot turn an unreported external bill into a known value.
 
@@ -88,7 +90,7 @@ The ledger separates the following dimensions:
 | `timeMs`                                | Observable operation duration, with Run admission governed by its saved wall-clock deadline and necessary future time.           |
 | `costMicros`                            | Token usage multiplied by configured rates in millionths of one chosen currency. Missing rates remain `UNPRICED`.                |
 
-A Sandbox `exec` is one internal execution; its child process system calls are not individually counted. `readFile` is an execution plus a read; `writeFile` and `applyPatch` are executions plus a write. A file listing is a read operation but does not pretend to have loaded every listed file's content. Database writes for ledger/events/checkpoints are not repository IO. Mandatory Sandbox disposal remains possible after a deadline and grants no editing capacity.
+A Sandbox `exec` is one internal execution; its child process system calls are not individually counted. `readFile` is an execution plus a read; `writeFile` and `applyPatch` are executions plus a write. A file listing is a read operation but does not pretend to have loaded every listed file's content. Initial snapshot acquisition, initial repository-source setup and Sandbox creation occur before these wrappers, so their underlying IO is not itemized in this ledger. Database writes for ledger/events/checkpoints are not repository IO. Mandatory Sandbox disposal remains possible after a deadline and grants no editing capacity. These metrics are not a measurement of all disk or network activity.
 
 Source adapters identify the accounting owner. A verified in-memory snapshot has `resourceIOOwner: MEMORY` and causes no physical read charge. A source backed by the wrapped Sandbox has `resourceIOOwner: SANDBOX`, so the outer adapter does not charge the same operation again. Other external sources are measured at their own adapter boundary. Memory reuse is not new evidence or model progress.
 
@@ -130,6 +132,8 @@ The example configuration leaves rates blank because provider pricing must be su
 
 The current request uses its own model's input/output rates. Necessary downstream token capacity whose future input/output mix is unknown uses the highest configured token rate among the reachable stage models as an explicit conservative bound. That quotation is not billed usage; settlement records only actual provider tokens. Missing any required future model price cannot silently turn that continuation into zero cost. A legacy Run with previous model calls and no trustworthy cost ledger is blocked when initializing a monetary cap, rather than importing its historical cost as zero.
 
+Hard limits, consumption and the deadline are persisted; the price map and currency identity are supplied by runtime configuration, not independently frozen by the ledger. Experiments must freeze those identities separately. Unknown charges are not automatically reconciled with provider invoices or released.
+
 ## Acceptance status
 
 Controlled Docker replay currently covers two complete orchestration paths:
@@ -142,5 +146,7 @@ Controlled Docker replay currently covers two complete orchestration paths:
 These **2/2 controlled passes use no real provider requests**. They verify transitions, restoration and resource integration, not a real-model strict success rate. Replan admission by itself is not a repaired Issue. Real E10 and regression results must be reported separately with frozen code/model/input/scorer identities, public validation, independent acceptance, Review, token/tool usage, cost and exact failure causes. Package promotion remains gated on the real E10 result and engineering checks.
 
 The implementation tests cover operation-plan arithmetic, optional-work omission, admission/settlement idempotency, concurrent ledger updates, uncertain requests, saved deadlines, cache ownership/invalidation, actual-change checkpoints, approval recovery and budget rejection before dispatch. Raw model requests, experiment ledgers, candidates and private scoring materials remain outside the public repository.
+
+The frozen real batch passed **1/4** (E07). E10 dispatched Replan, received a new approval and resumed its Coding Session, but subsequently stalled without a patch. E02 failed after approval recovery, and E08 remained blocked on Review evidence despite independent patch acceptance. The **2.4.0 release gate was not met**; the package stays at **2.3.0**. See the [experiment comparison, accounting correction and unresolved issues](resource-budget-validation-20261008.md).
 
 See [workflow behavior](v2-workflow.md), [stage model configuration](stage-models.md) and [validation boundaries](validation-v2.md).

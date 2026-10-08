@@ -1,6 +1,6 @@
 # DevFlow 2.3
 
-Current development version: **v2.3 (2.3.0)**. Editing and failure repair share one persistent Coding Session. The frozen implementation strictly passed E07, meeting this version's acceptance criterion; E10 still stopped before replanning on host tool-budget reservations. See [the results, regression validation and remaining P0 blockers](docs/unified-coding-loop-20261008.md). The published GitHub release remains v2.2; this local version update does not publish a release.
+Package version: **2.3.0**. Editing and failure repair share one persistent Coding Session. The Resource Budget Scheduler development batch strictly passed **1/4** cases (E07). E10 now dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; the **v2.4 acceptance gate was not met**. See [the scheduler architecture](docs/resource-budget-scheduler.md), [current results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
 
 [中文](README_CN.md) | [English](README.md)
 
@@ -18,9 +18,9 @@ The API persists intent and queues work. The Worker owns execution; agents acces
 - Public build/typecheck/lint/test profiles, source-aware diagnostic handoff and one bounded scope replan requiring a new approval.
 - One Coding Session retains history, checkpoints, tool policy and resource consumption across edits and public test/review failures. Repeated observations cannot earn new progress; edit-format and output correction share one bounded credit.
 - A stable patch remains editable within approval. `finishPhase` yields to Workflow-owned final validation; failures or explicit unfinished work can return to the same session within the remaining limits. Final Review remains independent. See [the current Coding lifecycle](docs/unified-coding-loop-20261008.md).
-- Shared request/recovery budgets, complete-output checks and protected write scope throughout the workflow.
+- A Run-scoped Resource Budget Scheduler with persisted admission/settlement, actual-request estimates and operation-based replan reservations. Logical tools, internal execution and IO have separate accounting; hard limits and protected write scope remain enforced.
 
-The final nine-case cohort passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing validated nine-case coverage to six strict successes. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).
+An earlier nine-case cohort on a different version passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing that historical nine-case coverage to six strict successes. These are not results for the current Scheduler version. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).
 
 The v2.2 dataset experiments separately validated E09 and E01 in one frozen batch and E08 in a subsequent single-case batch. These records use different versions and are not a combined cohort success rate. See [the current experiment records](docs/new-dataset-validation-20261007.md).
 

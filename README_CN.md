@@ -1,6 +1,6 @@
 # DevFlow 2.3
 
-当前开发版本：**v2.3（2.3.0）**。代码编辑与失败修复共用持久化的 Coding Session。冻结实现已严格通过 E07，达到本次版本升级条件；E10 仍在重新规划派发前被宿主工具预算预留阻断。详细结果、回归验收和剩余 P0 见[统一 Coding 验收报告](docs/unified-coding-loop-20261008.md)。GitHub 已发布版本仍为 v2.2；本次本地升级不代表已经发布。
+包版本保持 **2.3.0**。代码编辑与失败修复共用持久化的 Coding Session。Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，**未达到 v2.4 升级条件**。见[资源调度架构](docs/resource-budget-scheduler.md)、[本轮结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
 
 [中文](README_CN.md) | [English](README.md)
 
@@ -18,9 +18,9 @@ API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略
 - 公开 build/typecheck/lint/test 验证 profile、源码诊断交接，以及需要新审批的一次有界范围重新规划。
 - 同一 Coding Session 在编辑、公开测试失败和 Review 反馈之间保留历史、检查点、工具策略及资源消费。重复观察不算新进展；编辑格式错误与输出纠正共享一次有界纠正额度。
 - 稳定补丁仍可在批准范围内继续编辑。`finishPhase` 将候选交给 Workflow 强制执行最终验证；验证失败或明确的未完成事项，在剩余资源允许时返回同一会话。最终 Review 保持独立，见[当前 Coding 生命周期](docs/unified-coding-loop-20261008.md)。
-- 统一请求、恢复和最终输出预算，并在整个流程中保持受保护的写入范围。
+- Run 级 Resource Budget Scheduler：持久化准入与结算，按实际请求和重新规划操作清单估算资源；分别记录逻辑工具、内部执行及 IO，保持硬上限和受保护写入范围。
 
-最终九题单批严格通过 5/9；其中一题因费用阈值中断，单独续测后通过，九题覆盖中共有 6 题获得严格端到端成功证据。该小型数据集证明限定仓库中的实际修复能力，仍不足以代表任意仓库的成功率，见[验证结果与限制](docs/validation-v2.md)。
+此前不同版本的九题单批严格通过 5/9；其中一题因费用阈值中断，单独续测后通过，历史九题覆盖中共有 6 题获得严格端到端成功证据。这些不是当前 Scheduler 版本的成绩。该小型数据集证明限定仓库中的实际修复能力，仍不足以代表任意仓库的成功率，见[验证结果与限制](docs/validation-v2.md)。
 
 v2.2 新数据集实验中，E09、E01 在同一冻结批次获得严格成功，E08 在后续单题批次通过。这些记录来自不同版本，不合并为同一批通过率，见[当前实验记录](docs/new-dataset-validation-20261007.md)。
 

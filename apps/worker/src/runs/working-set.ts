@@ -254,7 +254,11 @@ export class ExplorationBudget {
           code: "PERMISSION_DENIED",
           message:
             "Target is outside the current WorkingSet; bounded relocation requires structured failure evidence.",
-          details: { failureOrigin: "HOST_AUTHORIZATION" },
+          details: {
+            failureOrigin: "HOST_AUTHORIZATION",
+            category: "AUTHORIZATION_DENIED",
+            reasonCode: "OUTSIDE_WORKING_SET",
+          },
         }).toJSON();
       const optional = paths.filter(
         (path) => typeof path !== "string" || !this.necessary.has(path),

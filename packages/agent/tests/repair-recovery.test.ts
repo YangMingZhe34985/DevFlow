@@ -332,8 +332,12 @@ it.each(["EDIT_CORRECTION_REQUIRED: exploration is closed", "APPROVAL_SCOPE: den
         toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "new.py" } }],
       }),
       async (r) => {
-        expect(JSON.stringify(r.messages)).toContain("HOST_AUTHORIZATION");
-        expect(r.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+        const authorizationDenied = reason.startsWith("APPROVAL_SCOPE");
+        expect(JSON.stringify(r.messages)).toContain(
+          authorizationDenied ? "AUTHORIZATION_DENIED" : "EXPLORATION_LIMIT",
+        );
+        if (authorizationDenied) expect(r.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+        else expect(r.tools.map((t) => t.name)).toContain("replaceText");
         expect(saved?.executionRecovery?.used ?? false).toBe(false);
         expect(saved?.executionRecovery?.pending ?? false).toBe(false);
         return finish();

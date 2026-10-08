@@ -75,7 +75,17 @@ describe("DefaultToolExecutor", () => {
 
     const result = await executor.execute({ name: "sample", input: { value: 42 } }, context);
 
-    expect(result).toMatchObject({ ok: false, error: { code: "VALIDATION_ERROR" } });
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "VALIDATION_ERROR",
+        details: {
+          category: "INVALID_ARGUMENT",
+          failureOrigin: "INPUT_VALIDATION",
+          fieldErrors: { value: expect.any(Array) },
+        },
+      },
+    });
     expect(events.map(({ type }) => type)).toEqual(["TOOL_CALL", "TOOL_RESULT"]);
     expect(events[0]?.toolCallId).toBe(events[1]?.toolCallId);
   });
@@ -88,7 +98,13 @@ describe("DefaultToolExecutor", () => {
 
     const result = await executor.execute({ name: "sample", input: { value: "blocked" } }, context);
 
-    expect(result).toMatchObject({ ok: false, error: { code: "PERMISSION_DENIED" } });
+    expect(result).toMatchObject({
+      ok: false,
+      error: {
+        code: "PERMISSION_DENIED",
+        details: { category: "AUTHORIZATION_DENIED", failureOrigin: "HOST_AUTHORIZATION" },
+      },
+    });
     expect(events.map(({ type }) => type)).toEqual(["TOOL_CALL", "TOOL_RESULT"]);
   });
 

@@ -95,6 +95,7 @@ export class DefaultToolExecutor implements ToolExecutor {
       const error = new DevflowError({
         code: decision.decision === "REQUIRE_APPROVAL" ? "APPROVAL_REQUIRED" : "PERMISSION_DENIED",
         message: decision.reason,
+        details: { failureOrigin: "HOST_AUTHORIZATION", category: "AUTHORIZATION_DENIED" },
       });
       if (decision.decision === "REQUIRE_APPROVAL") {
         await context.emit({
@@ -117,7 +118,11 @@ export class DefaultToolExecutor implements ToolExecutor {
         new DevflowError({
           code: "VALIDATION_ERROR",
           message: `Invalid input for tool '${tool.name}'.`,
-          details: parsedInput.error.flatten(),
+          details: {
+            ...parsedInput.error.flatten(),
+            failureOrigin: "INPUT_VALIDATION",
+            category: "INVALID_ARGUMENT",
+          },
         }),
         startedAt,
       );

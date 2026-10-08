@@ -27,6 +27,10 @@ it("gates broad tools, bounds batch reads, and grants recovery only once without
   const budget = new ExplorationBudget(ws, { targetedReads: 2, broadSearches: 1, relocations: 1 });
   expect(budget.available("searchCode")).toBe(false);
   expect(budget.consume("readFile", { path: "other.ts" })).toContain("outside");
+  expect(budget.authorize("readFile", { path: "other.ts" })).toMatchObject({
+    code: "PERMISSION_DENIED",
+    details: { category: "AUTHORIZATION_DENIED", reasonCode: "OUTSIDE_WORKING_SET" },
+  });
   expect(budget.consume("batchReadFiles", { paths: ["a.ts", "a.ts", "a.ts"] })).toContain(
     "exceeded",
   );

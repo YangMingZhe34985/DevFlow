@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { z } from "zod";
 import { prepareStageContext, type ContextStage } from "./stage-context.js";
 import {
   prepareCompressedStageContext,
@@ -265,10 +266,6 @@ export class DefaultAgentRuntime implements AgentRuntime {
     const messages: ModelMessage[] = [...state.messages];
     const execution = createExecutionState(context.tools);
     context.hostToolState?.restore(state.hostToolState, restoredState !== undefined);
-    if (context.hostToolState)
-      execution.checkpointAdmission = async () => {
-        state = await checkpoint(context, state);
-      };
     execution.noProgressStreak = state.executionConvergence?.noProgressStreak ?? 0;
     if (postPatch && state.postPatch) postPatch.restore(state.postPatch);
     if (postPatch)
@@ -302,8 +299,23 @@ export class DefaultAgentRuntime implements AgentRuntime {
     let evidenceRefreshUsed = state.executionRecovery?.evidenceRefreshUsed ?? false;
     let submissionOnly = state.executionRecovery?.submissionOnly ?? false;
     const hostVerificationCalls = new Set<string>();
-    const closingReadAllowed = () =>
-      !correctingEdit && !evidenceRefreshUsed && (context.closingReadPaths?.().length ?? 0) > 0;
+    // Claim the existing refresh only after valid parameters and host admission, before IO.
+    if (context.hostToolState || context.closingReadPaths)
+      execution.checkpointAdmission = async () => {
+        state = await checkpoint(context, {
+          ...state,
+          executionRecovery: {
+            ...state.executionRecovery,
+            pending: execution.editCorrectionPending,
+            used: execution.editCorrectionUsed,
+            explorationClosed,
+            evidenceRefreshUsed,
+          },
+        });
+      };
+    const closingReadEligible = () =>
+      !evidenceRefreshUsed && (context.closingReadPaths?.().length ?? 0) > 0;
+    const closingReadAllowed = () => !correctingEdit && closingReadEligible();
     context = {
       ...context,
       authorizeTool: (call) => {
@@ -337,24 +349,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
           return "CONTINUATION_TOOL_RESERVE: finishPhase with current evidence and remaining gaps; preserve downstream operations.";
         if (authorizationHandoffUsed && call.name !== "finishPhase")
           return "HOST_AUTHORIZATION_HANDOFF: only finishPhase with the remaining gap or scope conflict is available.";
-        if (
-          explorationClosed &&
-          !correctingEdit &&
-          call.name === "readFile" &&
-          closingReadAllowed()
-        ) {
-          const input = objectValue(call.input);
-          if (typeof input?.path !== "string" || !context.closingReadPaths?.().includes(input.path))
-            return "CLOSING_REFRESH_PATH: refresh only the host's missing approved current evidence.";
-          if (Number(input.maxBytes ?? 16 * 1024) > 16 * 1024)
-            return "CLOSING_REFRESH_SIZE: maxBytes must be at most 16384.";
-          input.maxBytes ??= 16 * 1024;
-          const denied = originalAuthorize?.(call);
-          if (denied) return denied;
-          evidenceRefreshUsed = true;
-          return undefined;
-        }
-        if (correctingEdit && execution.correctionReason === "PROTOCOL_INVALID") {
+        const protocolCorrection =
+          correctingEdit && execution.correctionReason === "PROTOCOL_INVALID";
+        if (protocolCorrection) {
           if (call.name !== execution.correctionTool)
             return "PROTOCOL_CORRECTION_REQUIRED: only correct the failed tool call or finishPhase; no new exploration.";
           const before = objectValue(JSON.parse(execution.correctionInput ?? "{}")),
@@ -365,8 +362,32 @@ export class DefaultAgentRuntime implements AgentRuntime {
             )
           )
             return "PROTOCOL_CORRECTION_SCOPE: preserve the original path/artifact; correct its parameters only.";
-          return originalAuthorize?.(call);
         }
+        if (
+          explorationClosed &&
+          (!correctingEdit ||
+            (execution.correctionReason === "PROTOCOL_INVALID" &&
+              execution.correctionTool === "readFile")) &&
+          call.name === "readFile" &&
+          closingReadEligible()
+        ) {
+          const input = objectValue(call.input);
+          const denied = originalAuthorize?.(call);
+          if (denied) return denied;
+          if (typeof input?.path !== "string" || !context.closingReadPaths?.().includes(input.path))
+            return runtimeRejection(
+              "CLOSING_REFRESH_PATH: refresh only the host's missing approved current evidence.",
+              "EXPLORATION_LIMIT",
+            );
+          evidenceRefreshUsed = true;
+          return undefined;
+        }
+        if (explorationClosed && call.name === "readFile")
+          return runtimeRejection(
+            "CLOSING_REFRESH_EXHAUSTED: the single current-evidence refresh is unavailable; approved edits remain subject to current evidence.",
+            "EXPLORATION_LIMIT",
+          );
+        if (protocolCorrection) return originalAuthorize?.(call);
         return (correctingEdit || explorationClosed) &&
           postPatch?.active !== true &&
           !(
@@ -867,6 +888,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
                   ...(closingReadAllowed() ? ["readFile"] : []),
                 ].includes(t.name),
               );
+              availableTools = availableTools.map((tool) =>
+                tool.name === "readFile"
+                  ? closingReadDescriptor(tool, context.closingReadPaths?.() ?? [])
+                  : tool,
+              );
               projectedMessages = [
                 ...projectedMessages,
                 {
@@ -978,6 +1004,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
                   ...(!submissionOnly && closingReadAllowed() ? ["readFile"] : []),
                 ].includes(t.name),
               );
+              availableTools = availableTools.map((tool) =>
+                tool.name === "readFile"
+                  ? closingReadDescriptor(tool, context.closingReadPaths?.() ?? [])
+                  : tool,
+              );
               projectedMessages = [
                 ...projectedMessages,
                 {
@@ -1062,6 +1093,27 @@ export class DefaultAgentRuntime implements AgentRuntime {
               },
             });
           }
+          // This exact contract is advertised and enforced for the current decision only.
+          // The registry's ordinary prefix/range read contract remains unchanged.
+          if (explorationClosed)
+            availableTools = availableTools.filter((tool) =>
+              [
+                "replaceText",
+                "applyPatch",
+                "writeFile",
+                "finishPhase",
+                ...(correctingEdit && execution.correctionReason === "PROTOCOL_INVALID"
+                  ? [execution.correctionTool!]
+                  : []),
+                ...(!submissionOnly && closingReadAllowed() ? ["readFile"] : []),
+              ].includes(tool.name),
+            );
+          availableTools = availableTools.map((tool) =>
+            explorationClosed && tool.name === "readFile"
+              ? closingReadDescriptor(tool, context.closingReadPaths?.() ?? [])
+              : tool,
+          );
+          execution.effectiveTools = new Map(availableTools.map((tool) => [tool.name, tool]));
           if (correctingEdit && request.executionBudget) {
             const estimated =
               estimateModelInput(projectedMessages, availableTools) +
@@ -1373,9 +1425,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             handoffPending: closingDecisionPending,
             authorizationHandoffUsed,
             submissionOnly,
-            evidenceRefreshUsed:
-              evidenceRefreshUsed ||
-              (explorationClosed && calls.some((c) => c.name === "readFile")),
+            evidenceRefreshUsed,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -1544,8 +1594,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 !["HOST_AUTHORIZATION", "HOST_EXPLORATION"].includes(
                   String(objectValue(result.error.details)?.failureOrigin),
                 ) &&
-                ((call.name === "finishPhase" &&
-                  /finishPhase|findingId|evidenceRefs/u.test(result.error.message)) ||
+                (objectValue(result.error.details)?.category === "INVALID_ARGUMENT" ||
+                  (call.name === "finishPhase" &&
+                    /finishPhase|findingId|evidenceRefs/u.test(result.error.message)) ||
                   (["readFile", "batchReadFiles", "readEvidenceArtifact"].includes(call.name) &&
                     (result.error.code === "VALIDATION_ERROR" ||
                       /READ_INVALID_RANGE|startLine|endLine|Unknown public repair evidence section/u.test(
@@ -1880,6 +1931,7 @@ interface RuntimeExecutionState {
   editCorrectionUsed: boolean;
   evidenceDiscoveries: number;
   readonly tools: ReadonlyMap<string, ModelToolDescriptor>;
+  effectiveTools?: ReadonlyMap<string, ModelToolDescriptor>;
   readonly cache: Map<string, ToolExecutionResult>;
   readonly inFlight: Map<string, Promise<ToolExecutionResult>>;
   workspaceRevision: number;
@@ -2206,6 +2258,29 @@ async function executeOneToolInner(
   signal: AbortSignal,
   state: RuntimeExecutionState,
 ): Promise<ExecutedToolCall> {
+  const descriptor = state.effectiveTools?.get(call.name);
+  if (descriptor && descriptor !== state.tools.get(call.name)) {
+    const parsed = descriptor.inputSchema.safeParse(call.input);
+    if (!parsed.success)
+      return {
+        call,
+        result: controlFailure({
+          code: "VALIDATION_ERROR",
+          message: `Invalid input for the current '${call.name}' contract.`,
+          retryable: false,
+          details: {
+            failureOrigin: "INPUT_VALIDATION",
+            category: "INVALID_ARGUMENT",
+            ...parsed.error.flatten(),
+          },
+        }),
+        metadata,
+        cached: false,
+        executed: false,
+        control: false,
+      };
+    call = { ...call, input: parsed.data };
+  }
   const denied = context.authorizeTool?.({
     callId: call.id,
     name: call.name,
@@ -2213,7 +2288,7 @@ async function executeOneToolInner(
   });
   await state.checkpointAdmission?.();
   if (denied) {
-    let result = controlFailure(denied, "HOST_AUTHORIZATION");
+    let result = controlFailure(normalizeHostRejection(denied), "HOST_AUTHORIZATION");
     if (metadata.mutatesWorkspace) {
       const revision = context.postPatch?.revision ?? state.workspaceRevision;
       result = {
@@ -2336,18 +2411,107 @@ function controlFailure(
   message: string | DevflowErrorShape,
   failureOrigin: "INPUT_VALIDATION" | "HOST_AUTHORIZATION" = "INPUT_VALIDATION",
 ): ToolExecutionResult {
+  const category =
+    failureOrigin === "INPUT_VALIDATION" ? "INVALID_ARGUMENT" : "AUTHORIZATION_DENIED";
   return {
     ok: false,
     durationMs: 0,
     error:
       typeof message !== "string"
-        ? message
+        ? {
+            ...message,
+            details: {
+              failureOrigin,
+              category,
+              ...(objectValue(message.details) ?? {}),
+            },
+          }
         : new DevflowError({
             code: "VALIDATION_ERROR",
             message,
-            details: { failureOrigin },
+            details: { failureOrigin, category },
           }).toJSON(),
   };
+}
+
+const CLOSING_READ_MAX_BYTES = 16 * 1024;
+
+/** Project the registry schema for the existing, bounded final evidence refresh. */
+function closingReadDescriptor(
+  tool: ModelToolDescriptor,
+  paths: readonly string[],
+): ModelToolDescriptor {
+  const originalObject = tool.inputSchema instanceof z.ZodObject ? tool.inputSchema : undefined;
+  const originalMaxBytes: z.ZodType | undefined = originalObject?.shape.maxBytes;
+  const originalJson = originalMaxBytes
+    ? (z.toJSONSchema(originalMaxBytes, { unrepresentable: "any" }) as {
+        maximum?: number;
+        default?: number;
+      })
+    : undefined;
+  const maximum = Math.min(CLOSING_READ_MAX_BYTES, originalJson?.maximum ?? CLOSING_READ_MAX_BYTES);
+  const defaultBytes = Math.min(maximum, originalJson?.default ?? maximum);
+  const fields = {
+    maxBytes: z
+      .number()
+      .int()
+      .positive()
+      .max(maximum)
+      .refine(
+        (value) => originalMaxBytes?.safeParse(value).success !== false,
+        "maxBytes must also satisfy the registered tool contract.",
+      )
+      .default(defaultBytes),
+  };
+  return {
+    ...tool,
+    description:
+      tool.description.split("\nCurrent decision contract:")[0] +
+      `\nCurrent decision contract: one approved current-evidence refresh; maxBytes defaults to ${defaultBytes} and cannot exceed ${maximum}. Eligible paths: ${JSON.stringify(paths)}. Approval and budget checks still apply.`,
+    inputSchema: originalObject
+      ? originalObject.safeExtend(fields)
+      : z.intersection(tool.inputSchema, z.object(fields).passthrough()),
+  };
+}
+
+type RuntimeRejectionCategory = "INVALID_ARGUMENT" | "EXPLORATION_LIMIT" | "AUTHORIZATION_DENIED";
+
+function runtimeRejection(message: string, category: RuntimeRejectionCategory): DevflowErrorShape {
+  return new DevflowError({
+    code: category === "INVALID_ARGUMENT" ? "VALIDATION_ERROR" : "PERMISSION_DENIED",
+    message,
+    details: {
+      category,
+      failureOrigin:
+        category === "INVALID_ARGUMENT"
+          ? "INPUT_VALIDATION"
+          : category === "EXPLORATION_LIMIT"
+            ? "HOST_EXPLORATION"
+            : "HOST_AUTHORIZATION",
+    },
+  }).toJSON();
+}
+
+/** Classify only known legacy resource gates; unknown host denials remain conservative. */
+function normalizeHostRejection(rejection: string | DevflowErrorShape): DevflowErrorShape {
+  if (typeof rejection !== "string") return rejection;
+  const reasonCode = rejection.split(":", 1)[0];
+  const explorationGates = new Set([
+    "HOST_SUBMISSION_RESERVE",
+    "CONTINUATION_TOOL_RESERVE",
+    "EDIT_CORRECTION_REQUIRED",
+    "PROTOCOL_CORRECTION_REQUIRED",
+    "PROTOCOL_CORRECTION_SCOPE",
+    "PRE_PATCH_CORRECTION_REQUIRED",
+    "PRE_PATCH_CAPABILITY_UNAVAILABLE",
+    "PRE_PATCH_READ_BUDGET_EXHAUSTED",
+    "PRE_PATCH_SEARCH_BUDGET_EXHAUSTED",
+    "PRE_PATCH_SOURCE_BUDGET_EXHAUSTED",
+  ]);
+  const exploration =
+    explorationGates.has(reasonCode ?? "") ||
+    (reasonCode === "POST_PATCH_GATE" && rejection.includes("broad exploration is closed"));
+  return runtimeRejection(rejection, exploration ? "EXPLORATION_LIMIT" : "AUTHORIZATION_DENIED");
 }
 
 function finishSummary(call: ModelToolCall): string {

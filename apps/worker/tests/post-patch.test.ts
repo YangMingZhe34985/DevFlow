@@ -146,15 +146,17 @@ it("distinguishes complete unchanged failures from partial or unknown mutation o
       .observationComplete,
   ).toBe(false);
 });
-it("requires every planned target, a current untruncated diff and no unresolved failures", () => {
+it("requires an explicit submission of a current diff, not edits to every approved target", () => {
   const c = new PostPatchController(["a", "b"], 5);
   c.observeMutation(normalizeMutation(ok, { a: "old" }, { a: "new" }, ["a"], 5), ["a"]);
   c.observeDiff("diff", ["a"], true);
   expect(c.state).toBe("PATCH_STABLE");
   expect(c.ready).toBe(false);
+  expect(c.canSubmit).toBe(true);
+  expect(c.authorize("writeFile", ["a"])).toBeUndefined();
   c.observeMutation(normalizeMutation(ok, { b: "old" }, { b: "new" }, ["b"], 6), ["b"]);
   c.observeDiff("diff", ["a", "b"], true);
-  expect(c.ready).toBe(true);
+  expect(c.submit()).toBe(true);
   expect(c.authorize("searchCode", [])).toContain("POST_PATCH_GATE");
   expect(c.authorize("writeFile", ["a"])).toContain("POST_PATCH_GATE");
   expect(c.authorize("readFile", ["other"])).toContain("POST_PATCH_GATE");
@@ -269,7 +271,7 @@ it("a filtered diff view cannot erase current completion evidence without a revi
     signal: new AbortController().signal,
     execute: async () => ({ ...ok, output: { patch: "a partial view", truncated: true } }),
   });
-  expect(c.ready).toBe(true);
+  expect(c.canSubmit).toBe(true);
   expect(c.diff).toBe("authoritative global diff");
 });
 
@@ -327,7 +329,7 @@ it("evidence candidates and rejected capabilities do not become unfulfilled edit
     "a.ts",
   ]);
   c.observeDiff("valid", ["a.ts"], true);
-  expect(c.ready).toBe(true);
+  expect(c.canSubmit).toBe(true);
   expect(
     plannedTargetScope({ summary: "Edit a.ts and preserve a.ts", steps: [] }, ["a.ts"]).blockers,
   ).toEqual(["CONFLICTING_PLAN_TARGET:a.ts"]);
@@ -454,6 +456,11 @@ it.each([
             id: "edit",
             name: "writeFile",
             input: { path: "a.ts", content: "export const value = 2;\n" },
+          },
+          {
+            id: "finish",
+            name: "finishPhase",
+            input: { summary: "Candidate ready", outcome: "CHANGED" },
           },
         ],
       }),
@@ -620,6 +627,15 @@ it.each([false, true])(
             name: "writeFile",
             input: { path: "a.ts", content: `export const value = ${n};\n` },
           },
+          ...(n === 1 || skip
+            ? [
+                {
+                  id: randomUUID(),
+                  name: "finishPhase",
+                  input: { summary: "Candidate ready", outcome: "CHANGED" },
+                },
+              ]
+            : []),
         ],
       });
     const model = new FakeLanguageModel(

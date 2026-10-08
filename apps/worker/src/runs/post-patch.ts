@@ -215,6 +215,10 @@ export async function observePostPatchTool(input: {
   const paths = requestPaths(request);
   const mutation = ["writeFile", "replaceText", "applyPatch", "runCommand"].includes(request.name);
   const started = Date.now();
+  const observedReads = new Map<
+    string,
+    { content: string; truncated: boolean; fileSha256: string }
+  >();
   const readHashes = async (targets: readonly string[]): Promise<Record<string, string>> => {
     const hashes: Record<string, string> = {};
     for (const path of targets.slice(0, 16)) {
@@ -223,6 +227,12 @@ export async function observePostPatchTool(input: {
         const file = await sandbox.readFile({ path, maxBytes: 65536 }, signal);
         if (file.fileSha256) hashes[path] = file.fileSha256;
         else if (!file.truncated) hashes[path] = contentHash(file.content);
+        if (hashes[path])
+          observedReads.set(path, {
+            content: file.content,
+            truncated: file.truncated,
+            fileSha256: hashes[path]!,
+          });
       } catch (error) {
         if (signal.aborted) throw error;
         // Only an explicit missing-file result establishes absence. Permission/IO failures do not.
@@ -254,8 +264,12 @@ export async function observePostPatchTool(input: {
         controller.targets.includes(file.path)
       )
         controller.currentReads.set(file.path, {
-          content: file.content.slice(0, 4096),
-          truncated: !!file.truncated || file.content.length > 4096,
+          content: file.content,
+          truncated: !!file.truncated,
+          ...(typeof file.fileSha256 === "string" ? { fileSha256: file.fileSha256 } : {}),
+          ...(typeof file.startLine === "number" ? { startLine: file.startLine } : {}),
+          ...(typeof file.endLine === "number" ? { endLine: file.endLine } : {}),
+          workspaceRevision: controller.revision,
         });
     }
   }
@@ -263,6 +277,15 @@ export async function observePostPatchTool(input: {
     const after = await readHashes(paths);
     const normalized = normalizeMutation(result, before, after, paths, controller.revision);
     controller.observeMutation(normalized, paths);
+    for (const path of normalized.changedFiles) {
+      const current = observedReads.get(path);
+      if (current && current.fileSha256 === normalized.currentHashes[path])
+        controller.currentReads.set(path, {
+          ...current,
+          startLine: 1,
+          workspaceRevision: normalized.afterRevision,
+        });
+    }
     result = { ...result, mutation: normalized, durationMs: Date.now() - started };
   }
   if (request.name === "gitDiff" && controller.active) {

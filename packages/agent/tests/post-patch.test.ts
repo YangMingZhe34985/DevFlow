@@ -43,13 +43,11 @@ async function run(
       if (i > 0 && c.active) {
         const text = JSON.stringify(request.messages);
         expect(text).toContain("POST_PATCH_COMPLETION");
-        expect(text).not.toContain("STALE_WORKING_SET");
-        expect(text).not.toContain("EXPLORATION_HISTORY");
+        expect(text).toContain("Approved plan (follow this plan)");
+        expect(text).toContain("Task:");
         expect(request.tools.map((t) => t.name)).not.toContain("searchCode");
-        if (c.ready) {
-          expect(request.tools.map((t) => t.name)).toEqual(["finishPhase"]);
-          expect(text).toContain("test/review steps belong to the external workflow");
-        }
+        expect(c.ready).toBe(false);
+        expect(request.tools.map((t) => t.name)).toContain("writeFile");
       }
       return fakeModelResponse({
         toolCalls,
@@ -148,9 +146,9 @@ it("closing model exploration preserves the authoritative post-write diff probe 
   expect(result.executeCompletion?.outcome).toBe("PATCH_READY");
   expect(result.executeCompletion?.metrics.postPatchGitDiffCalls).toBe(1);
 });
-it("auto mode completes only the phase and remains within tool budget", async () => {
+it("legacy auto mode cannot complete without an explicit finish decision", async () => {
   expect((await run({ auto: true, calls: [[write]] })).result.executeCompletion?.outcome).toBe(
-    "PATCH_READY",
+    "NEEDS_MORE_WORK",
   );
   const { result, c } = await run({ auto: true, calls: [[write]], maxTools: 1 });
   expect(result.executeCompletion?.failure).toBe("BUDGET_EXHAUSTED_BEFORE_PATCH");
@@ -165,14 +163,43 @@ it("no-op writes and real nonprogress never become a candidate", async () => {
     metrics: { PostPatchConvergenceMs: null, postPatchModelCalls: null },
   });
 });
-it("classifies an uncooperative ready candidate separately from real no-progress", async () => {
+it("does not confuse a stable candidate with an explicit completion", async () => {
   const { result } = await run({ calls: [[write], [read], [read], [read]] });
   expect(result.status).toBe("FAILED");
-  expect(result.executeCompletion?.failure).toBe("PATCH_READY_BUT_NOT_FINISHED");
+  expect(result.executeCompletion?.failure).toBe("REAL_NO_PROGRESS");
 });
 it("STOP without a valid mutation cannot claim completion", async () => {
   const { result } = await run({ calls: [[]] });
   expect(result.status).toBe("FAILED");
   expect(result.executeCompletion?.state).toBe("NO_PATCH");
   expect(result.executeCompletion?.failure).toBe("NO_VALID_PATCH");
+});
+it("continues approved edits after a stable diff, then submits without an extra confirmation", async () => {
+  const second = { ...write, id: "w2", input: { path: "a.ts", content: "complete" } };
+  const { result, model } = await run({ calls: [[write], [second], [finish]] });
+  expect(result.status).toBe("SUCCEEDED");
+  expect(model.requests).toHaveLength(3);
+  expect(result.executeCompletion?.metrics.postPatchMutationAttempts).toBe(1);
+});
+it("does not require a stable patch's other approved candidate to be modified", () => {
+  const c = new PostPatchController(["a.ts", "b.ts"]);
+  c.observeMutation(
+    {
+      status: "APPLIED",
+      executionSucceeded: true,
+      mutationAttempted: true,
+      mutationApplied: true,
+      workspaceChanged: true,
+      reason: "changed",
+      beforeRevision: 0,
+      afterRevision: 1,
+      changedFiles: ["a.ts"],
+      currentHashes: { "a.ts": "new" },
+    },
+    ["a.ts"],
+  );
+  c.observeDiff("candidate", ["a.ts"], true);
+  expect(c.canSubmit).toBe(true);
+  expect(c.ready).toBe(false);
+  expect(c.submit()).toBe(true);
 });

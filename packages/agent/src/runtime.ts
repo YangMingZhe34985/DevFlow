@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ContextStage } from "./stage-context.js";
+import { prepareStageContext, type ContextStage } from "./stage-context.js";
 import {
   prepareCompressedStageContext,
   type ContextCompressionOptions,
@@ -651,7 +651,14 @@ export class DefaultAgentRuntime implements AgentRuntime {
               execution.workspaceRevision,
             );
           if (postPatch?.active)
-            projectedMessages = projectModelMessages(postPatch.messages(request.approvedPlan));
+            projectedMessages = request.contextStage
+              ? prepareStageContext({
+                  stage: request.contextStage,
+                  history: [...projectedMessages, ...postPatch.messages()],
+                  maxBytes: request.contextMaxBytes ?? 96000,
+                  workspaceRevision: execution.workspaceRevision,
+                }).view
+              : projectModelMessages([...projectedMessages, ...postPatch.messages()]);
           let availableTools = (context.availableTools?.() ?? context.tools).filter(
             (t) =>
               postPatch?.allowed(t.name) !== false &&
@@ -1046,14 +1053,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
               "PRE_PATCH_EXPLORATION_STALLED",
               "Model stopped before a real APPLIED candidate mutation.",
             );
-          if (postPatch && !postPatch.ready)
+          if (postPatch)
             throw new DevflowError({
               code: "AGENT_STALLED",
-              message: "NO_VALID_PATCH: completion requires a current, stable candidate patch.",
+              message:
+                "NO_VALID_PATCH: Execute must explicitly submit finishPhase; a stable diff alone is not a completion decision.",
             });
-          const summary = postPatch
-            ? CANDIDATE_SUMMARY
-            : response.text?.trim() || "Agent completed without a text summary.";
+          const summary = response.text?.trim() || "Agent completed without a text summary.";
           messages.push({ role: "ASSISTANT", content: response.text ?? "" });
           await context.emit({
             runId: context.runId,
@@ -1070,7 +1076,6 @@ export class DefaultAgentRuntime implements AgentRuntime {
               ...runMetrics(state),
               ...(request.prePatch ? { prePatch: request.prePatch.metrics() } : {}),
             },
-            ...(postPatch ? { executeCompletion: postPatch.result(true) } : {}),
           };
           state = await checkpoint(context, {
             ...state,
@@ -1478,7 +1483,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
 
         request.prePatch?.endDecision();
         const finishCall = executedCalls.find(({ control }) => control);
-        if (finishCall?.result.ok === true || (postPatch?.ready && postPatch.autoFinish)) {
+        if (finishCall?.result.ok === true) {
           throwIfAborted(signal, context.signal, deadlineSignal);
           const summary = postPatch ? CANDIDATE_SUMMARY : finishSummary(finishCall!.call);
           const result: RunResult = {
@@ -1799,7 +1804,7 @@ async function executeToolBatch(
     context.postPatch?.toolStarted("finishPhase");
     const error =
       context.postPatch &&
-      !context.postPatch.ready &&
+      !context.postPatch.canSubmit &&
       !["INSUFFICIENT_EVIDENCE", "SCOPE_CONFLICT"].includes(
         PhaseCompletionSchema.safeParse(call.input).data?.outcome ?? "",
       )
@@ -1813,6 +1818,14 @@ async function executeToolBatch(
               : !priorSucceeded
                 ? "finishPhase was ignored because an earlier tool call failed."
                 : undefined;
+    if (
+      error === undefined &&
+      context.postPatch &&
+      !["INSUFFICIENT_EVIDENCE", "SCOPE_CONFLICT"].includes(
+        PhaseCompletionSchema.safeParse(call.input).data?.outcome ?? "",
+      )
+    )
+      context.postPatch.submit();
     results[index] = {
       call,
       result:

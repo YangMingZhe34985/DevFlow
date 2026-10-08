@@ -56,3 +56,5 @@ flowchart LR
 免费验收包含全仓 976 PASS、31 SKIP，lint、typecheck、格式及公开文件检查，以及必要信息、长会话、引用伪造、源码失效、完整交互、审批恢复、实际指纹及预算一致性回归。真实结果单独冻结记录；失败不重复付费尝试，版本不升级。
 
 原始请求、不可变 evidence、完整账本和私有材料继续排除在 Git 外。SDK 请求拦截使用 [AI SDK 官方接口](https://github.com/vercel/ai/blob/main/content/cookbook/05-node/70-intercept-fetch-requests.mdx)；实验回放中的 JSON Schema 重建仅用于隔离脚本，不作为生产审批或 Schema 替换策略。
+
+冻结后的唯一一次 E02 真实实验严格 FAIL，停在工具参数错误与两轮无进展，未进入审批恢复。两次实际 Coding 请求的物化/报价/派发指纹一致，但不能替代原失败位置的真实验收。见[实验、资源与保留问题](context-projection-e02-live-20261009.md)。

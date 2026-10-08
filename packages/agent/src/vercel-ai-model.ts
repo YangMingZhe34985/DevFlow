@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { inputHash, preparedInput, serializeModelRequest } from "./model-budget.js";
 import { DevflowError } from "@devflow/shared";
 
 import { createOpenAI } from "@ai-sdk/openai";
@@ -54,6 +56,7 @@ export interface VercelAiModelParameters {
 }
 
 export interface VercelAiModelAdapterOptions {
+  captureWireInput?: boolean;
   maxInputBytes?: number;
   /** Private, instance-local tool continuation; never passed to another stage or logged. */
   preserveToolReasoning?: boolean;
@@ -65,6 +68,43 @@ export interface VercelAiModelAdapterOptions {
   supportsReasoningEffort?: boolean;
 }
 
+const requestBodyScope = new AsyncLocalStorage<{
+  capture?: boolean;
+  body?: string;
+  expected?: string;
+  maxBytes?: number;
+  failure?: DevflowError;
+}>();
+const projectionFetch: typeof fetch = async (url, init) => {
+  const scope = requestBodyScope.getStore();
+  const body = typeof init?.body === "string" ? init.body : undefined;
+  if (scope?.capture && body !== undefined) {
+    scope.body = body;
+    throw new Error("HOST_REQUEST_BODY_CAPTURE: HTTP deliberately not issued");
+  }
+  if (scope) {
+    const bytes = body === undefined ? Number.POSITIVE_INFINITY : Buffer.byteLength(body);
+    if (
+      body === undefined ||
+      (scope.expected && inputHash(body) !== scope.expected) ||
+      (scope.maxBytes !== undefined && bytes > scope.maxBytes)
+    ) {
+      const failure = new DevflowError({
+        code: "VALIDATION_ERROR",
+        message: "PROVIDER_INPUT_MISMATCH_OR_LIMIT: final serialized request cannot be dispatched.",
+        details: {
+          requestIssued: false,
+          requiredBytes: Number.isFinite(bytes) ? bytes : null,
+          maxBytes: scope.maxBytes ?? null,
+        },
+      });
+      scope.failure = failure;
+      throw failure;
+    }
+  }
+  return globalThis.fetch(url, init);
+};
+
 export class VercelAiLanguageModel implements LanguageModelPort {
   private readonly toolReasoning = new Map<string, string>();
   constructor(
@@ -73,8 +113,7 @@ export class VercelAiLanguageModel implements LanguageModelPort {
     private readonly adapterOptions: VercelAiModelAdapterOptions = {},
   ) {}
 
-  async generate(request: ModelRequest, options: { signal: AbortSignal }): Promise<ModelResponse> {
-    const startedAt = Date.now();
+  private commonRequest(request: ModelRequest, options: { signal: AbortSignal }) {
     const commonRequest = {
       model: this.model,
       messages: [
@@ -125,16 +164,105 @@ export class VercelAiLanguageModel implements LanguageModelPort {
       maxRetries: 0,
       abortSignal: options.signal,
     };
-    const inputBytes = Buffer.byteLength(
-      JSON.stringify({
-        messages: commonRequest.messages,
-        tools: request.tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          schema: z.toJSONSchema(t.inputSchema),
-        })),
-      }),
-    );
+    return commonRequest;
+  }
+
+  async prepareRequest(
+    request: ModelRequest,
+    options: { signal: AbortSignal },
+  ): Promise<ModelRequest> {
+    options.signal.throwIfAborted();
+    const common = this.commonRequest(request, options);
+    const guardSerialized = JSON.stringify({
+      messages: common.messages,
+      tools: request.tools.map((t) => ({
+        name: t.name,
+        description: t.description,
+        schema: z.toJSONSchema(t.inputSchema),
+      })),
+    });
+    const existing = preparedInput(request);
+    if (existing) {
+      if (existing.guardSerialized !== guardSerialized)
+        throw new DevflowError({
+          code: "CONFLICT",
+          message: "INPUT_PROJECTION_STALE: provider continuation changed; no request issued.",
+          details: { requestIssued: false },
+        });
+      return request;
+    }
+    let serialized: string;
+    if (this.adapterOptions.captureWireInput) {
+      const scope: NonNullable<ReturnType<typeof requestBodyScope.getStore>> = { capture: true };
+      try {
+        await requestBodyScope.run(scope, () =>
+          generateText({
+            ...common,
+            ...(request.output
+              ? {
+                  output: Output.object({
+                    schema: request.output.schema,
+                    name: request.output.name ?? "devflow_output",
+                    ...(request.output.description === undefined
+                      ? {}
+                      : { description: request.output.description }),
+                  }),
+                }
+              : {}),
+          }),
+        );
+      } catch (error) {
+        if (!scope.body) throw error;
+      }
+      if (!scope.body)
+        throw new DevflowError({
+          code: "VALIDATION_ERROR",
+          message: "Provider body capture did not produce an input; no request issued.",
+          details: { requestIssued: false },
+        });
+      serialized = scope.body;
+    } else {
+      serialized = guardSerialized;
+    }
+    const wireBytes = Buffer.byteLength(serialized);
+    const serializedBytes = Math.max(wireBytes, Buffer.byteLength(guardSerialized));
+    return {
+      ...request,
+      inputProjection: {
+        requestFingerprint: inputHash(serializeModelRequest(request)),
+        serialized,
+        guardSerialized,
+        fingerprint: inputHash(serialized),
+        serializedBytes,
+        wireBytes,
+        estimatedInputTokens: Math.ceil(serializedBytes / 3),
+      },
+    };
+  }
+
+  async generate(request: ModelRequest, options: { signal: AbortSignal }): Promise<ModelResponse> {
+    request = await this.prepareRequest(request, options);
+    const scope: NonNullable<ReturnType<typeof requestBodyScope.getStore>> = {
+      expected: request.inputProjection!.fingerprint,
+      ...(this.adapterOptions.maxInputBytes === undefined
+        ? {}
+        : { maxBytes: this.adapterOptions.maxInputBytes }),
+    };
+    try {
+      return await requestBodyScope.run(scope, () => this.generatePrepared(request, options));
+    } catch (error) {
+      if (scope.failure) throw scope.failure;
+      throw error;
+    }
+  }
+
+  private async generatePrepared(
+    request: ModelRequest,
+    options: { signal: AbortSignal },
+  ): Promise<ModelResponse> {
+    const startedAt = Date.now();
+    const commonRequest = this.commonRequest(request, options);
+    const inputBytes = preparedInput(request)!.serializedBytes;
     if (
       this.adapterOptions.maxInputBytes !== undefined &&
       inputBytes > this.adapterOptions.maxInputBytes
@@ -200,10 +328,12 @@ export function createConfiguredLanguageModel(config: VercelAiModelConfig): Lang
   if (config.provider === "openai") {
     const provider = createOpenAI({
       apiKey: config.apiKey,
+      fetch: projectionFetch,
       ...(config.baseUrl === undefined ? {} : { baseURL: config.baseUrl }),
     });
     return new VercelAiLanguageModel(provider(config.model), config.parameters, {
       providerOptionsName: "openai",
+      captureWireInput: true,
       ...(config.contextMaxBytes === undefined ? {} : { maxInputBytes: config.contextMaxBytes }),
       supportsReasoningEffort: /^(?:o\d|gpt-[56])(?:[.-]|$)/iu.test(config.model.trim()),
     });
@@ -218,6 +348,7 @@ export function createConfiguredLanguageModel(config: VercelAiModelConfig): Lang
   const provider = createOpenAICompatible({
     name: providerName,
     apiKey: config.apiKey,
+    fetch: projectionFetch,
     baseURL: config.baseUrl,
     supportsStructuredOutputs: structuredOutputMode === "json-schema",
     ...(isBailian
@@ -228,6 +359,7 @@ export function createConfiguredLanguageModel(config: VercelAiModelConfig): Lang
       : {}),
   });
   return new VercelAiLanguageModel(provider.chatModel(config.model), config.parameters, {
+    captureWireInput: true,
     structuredOutputMode,
     ...(config.contextMaxBytes === undefined ? {} : { maxInputBytes: config.contextMaxBytes }),
     providerOptionsName: providerName,

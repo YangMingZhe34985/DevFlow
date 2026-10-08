@@ -51,6 +51,17 @@ export interface ModelRequest {
   tools: readonly ModelToolDescriptor[];
   output?: ModelStructuredOutputRequest;
   settings?: ModelGenerationSettings;
+  /** Host-only frozen serialized input. Never a model-authored budget claim. */
+  inputProjection?: {
+    requestFingerprint: string;
+    serialized: string;
+    /** Preserve the original adapter-envelope hard cap as well as the HTTP body cap. */
+    guardSerialized: string;
+    fingerprint: string;
+    serializedBytes: number;
+    wireBytes: number;
+    estimatedInputTokens: number;
+  };
   /** Host-only continuation capacity; never serialized into a provider prompt or schema. */
   resourceContinuation?: {
     tokens?: number;
@@ -106,5 +117,7 @@ export interface ModelResponse {
 }
 
 export interface LanguageModelPort {
+  /** Materialize the provider's exact request body without issuing HTTP. */
+  prepareRequest?(request: ModelRequest, options: { signal: AbortSignal }): Promise<ModelRequest>;
   generate(request: ModelRequest, options: { signal: AbortSignal }): Promise<ModelResponse>;
 }

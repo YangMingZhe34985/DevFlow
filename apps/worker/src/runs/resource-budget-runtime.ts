@@ -157,9 +157,14 @@ export class ResourceBudgetRuntime {
     },
   ): LanguageModelPort {
     return {
+      ...(model.prepareRequest ? { prepareRequest: model.prepareRequest.bind(model) } : {}),
       generate: async (request, requestOptions) => {
         await this.flush();
         requestOptions.signal.throwIfAborted();
+        request =
+          request.inputProjection || !model.prepareRequest
+            ? request
+            : await model.prepareRequest(request, requestOptions);
         // This wrapper is inside stage projection: these are the actual dispatched messages/schema.
         const inputTokens = estimatePlanRequest(request).estimatedInputTokens;
         const outputTokens = request.settings?.maxOutputTokens ?? options.outputTokens;

@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-import type { ModelRequest } from "@devflow/agent";
-import { z } from "zod";
+import { preparedInput, serializeModelRequest, type ModelRequest } from "@devflow/agent";
 import type { EvidenceItem, EvidencePack } from "../localization/contracts.js";
 import type { IssueLocalizationResult } from "../localization/issue-localization-agent.js";
 import { normalizeTargetPath } from "./execution-packet.js";
@@ -56,38 +55,24 @@ export interface PlanRequestEstimate {
 
 /** Measure the complete provider-independent request, including both schema envelopes. */
 export function serializePlanRequest(request: ModelRequest): string {
-  return JSON.stringify({
-    messages: request.messages,
-    tools: request.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: z.toJSONSchema(tool.inputSchema),
-    })),
-    output:
-      request.output === undefined
-        ? null
-        : {
-            name: request.output.name ?? "devflow_output",
-            description: request.output.description ?? null,
-            schema: z.toJSONSchema(request.output.schema),
-          },
-    settings: request.settings ?? null,
-  });
+  return serializeModelRequest(request);
 }
 
 export function estimatePlanRequest(request: ModelRequest): PlanRequestEstimate {
   const serialized = serializePlanRequest(request);
+  const projection = preparedInput(request);
   const shape = JSON.parse(serialized) as Record<string, unknown>;
   const size = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
   return {
     estimator: "ESTIMATED_SERIALIZED_UTF8_BYTES_DIV_3",
-    serializedBytes: Buffer.byteLength(serialized),
-    estimatedInputTokens: Math.ceil(Buffer.byteLength(serialized) / 3),
+    serializedBytes: projection?.serializedBytes ?? Buffer.byteLength(serialized),
+    estimatedInputTokens:
+      projection?.estimatedInputTokens ?? Math.ceil(Buffer.byteLength(serialized) / 3),
     messagesBytes: size(shape.messages),
     toolsBytes: size(shape.tools),
     outputSchemaBytes: size(shape.output),
     settingsBytes: size(shape.settings),
-    fingerprint: planHash(serialized),
+    fingerprint: projection?.fingerprint ?? planHash(serialized),
   };
 }
 

@@ -32,6 +32,8 @@ export class PostPatchController {
   unfinishedWork: string[] = [];
   /** Host feedback can reopen bounded diagnostic reads, never new write authority. */
   diagnosticReadOnly = false;
+  /** Exact read-only targets from the host's approved Plan; never expands write scope. */
+  necessaryReadPaths: readonly string[] = [];
   calls = { model: 0, tool: 0, input: 0, output: 0, mutation: 0, reads: 0, diff: 0 };
   constructor(
     readonly targets: readonly string[],
@@ -154,7 +156,13 @@ export class PostPatchController {
     if (
       (["writeFile", "replaceText", "applyPatch"].includes(name) ||
         (!this.diagnosticReadOnly && ["readFile", "batchReadFiles"].includes(name))) &&
-      (!paths.length || paths.some((p) => !this.targets.includes(p)))
+      (!paths.length ||
+        paths.some(
+          (p) =>
+            !this.targets.includes(p) &&
+            (!this.necessaryReadPaths.includes(p) ||
+              !["readFile", "batchReadFiles"].includes(name)),
+        ))
     )
       return "POST_PATCH_GATE: only planned targets may be read/corrected.";
     return undefined;

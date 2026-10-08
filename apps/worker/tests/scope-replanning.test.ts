@@ -6,6 +6,7 @@ import { ContinuationTools } from "../src/runs/continuation-tools.js";
 import { repairSourceIdentity } from "../src/runs/repair-convergence.js";
 import {
   captureReplanCandidate,
+  projectCandidateChange,
   restoreReplanCandidate,
   ScopeReplanStateSchema,
   verifiedReplanPaths,
@@ -53,6 +54,38 @@ function fixture(current: Record<string, string>, baseline: Record<string, strin
   };
 }
 describe("scope replanning authority and recoverable candidate", () => {
+  it("projects actual changed lines from already-read checkpoint sources without inventing a full-file diff", async () => {
+    const head =
+      Array.from({ length: 90 }, (_, i) => `const unchanged${i} = ${i};`).join("\n") + "\n";
+    const tail = "\n" + Array.from({ length: 90 }, (_, i) => `const tail${i} = ${i};`).join("\n");
+    const before = head + "return false;" + tail,
+      after = head + "return true;" + tail;
+    const projection = projectCandidateChange(before, after);
+    expect(projection).toMatchObject({ startLine: 88, baselineEndLine: 94, currentEndLine: 94 });
+    expect(projection.before).toContain("return false;");
+    expect(projection.after).toContain("return true;");
+    expect(projection.before).not.toContain("unchanged0");
+    const current = fixture({ "state.ts": after }, { "state.ts": before });
+    let io = 0;
+    const checkpoint = await captureReplanCandidate({
+      sandbox: current.sandbox,
+      paths: ["state.ts"],
+      baseCommitSha: "a".repeat(40),
+      signal: new AbortController().signal,
+      beforeRead: () => {
+        io++;
+      },
+    });
+    expect(io).toBe(4);
+    expect(checkpoint.changeEvidence?.[0]).toEqual({
+      path: "state.ts",
+      baselineSha256: sha(before),
+      currentSha256: sha(after),
+      ...projection,
+    });
+    expect(projectCandidateChange("", "new\r\n").after).toBe("new\r\n");
+    expect(projectCandidateChange("old\r\n", "").before).toBe("old\r\n");
+  });
   it("requires a new implementation path independently confirmed by public diagnostics", () => {
     const log = "src/wrapper.py:12: in run\nsrc/registry.py:115: in lookup_execution";
     expect(

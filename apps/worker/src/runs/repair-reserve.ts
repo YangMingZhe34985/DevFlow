@@ -6,8 +6,8 @@ export function repairContinuationReserve(input: {
   description: string;
   plan: unknown;
   diagnostics: unknown;
-  source: string;
-  patch?: string;
+  source: unknown;
+  patch?: unknown;
   repairOutput: number;
   reviewOutput: number;
   includeRepair: boolean;

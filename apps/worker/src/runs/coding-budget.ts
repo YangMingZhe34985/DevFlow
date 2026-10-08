@@ -173,8 +173,8 @@ export function codingContinuationReserve(input: {
   description: string;
   plan: unknown;
   diagnostics: unknown;
-  source: string;
-  patch?: string;
+  source: unknown;
+  patch?: unknown;
   codingOutput: number;
   reviewOutput: number;
   resumeCoding: boolean;
@@ -207,6 +207,8 @@ export function codingPlannerTokenLease(input: {
   remainingTokens: number;
   downstreamTokens: number;
   configuredMaximumTokens: number;
+  /** Already consumed by this same planning attempt; a projection is not a fresh lease. */
+  consumedTokens?: number;
   /** Includes the Planner request and its still-available recovery. */
   requiredRequestTokens?: number;
 }) {
@@ -217,19 +219,22 @@ export function codingPlannerTokenLease(input: {
     "configuredMaximumTokens",
     1,
   );
+  const consumedTokens = integer(input.consumedTokens ?? 0, "consumedTokens");
   const availableTokens = Math.max(0, remainingTokens - downstreamTokens);
-  const maxTotalTokens = Math.min(configuredMaximumTokens, availableTokens);
+  const remainingPhaseTokens = Math.max(0, configuredMaximumTokens - consumedTokens);
+  const maxTotalTokens = consumedTokens + Math.min(remainingPhaseTokens, availableTokens);
   const requiredRequestTokens = integer(input.requiredRequestTokens ?? 0, "requiredRequestTokens");
   const missingTokens = Math.max(
     0,
     downstreamTokens + requiredRequestTokens - remainingTokens,
-    requiredRequestTokens - configuredMaximumTokens,
+    requiredRequestTokens - remainingPhaseTokens,
   );
   return {
     remainingTokens,
     downstreamTokens,
     availableTokens,
     configuredMaximumTokens,
+    consumedTokens,
     maxTotalTokens,
     requiredRequestTokens,
     missingTokens,

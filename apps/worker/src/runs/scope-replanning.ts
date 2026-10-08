@@ -93,6 +93,21 @@ export const ScopeReplanStateSchema = z.object({
     )
     .max(16),
   patchSha256: z.string().optional(),
+  /** In-memory projection from the same baseline/current reads used by the checkpoint. */
+  changeEvidence: z
+    .array(
+      z.object({
+        path: z.string(),
+        baselineSha256: Identity,
+        currentSha256: Identity,
+        startLine: z.number().int().positive(),
+        baselineEndLine: z.number().int().nonnegative(),
+        currentEndLine: z.number().int().nonnegative(),
+        before: z.string(),
+        after: z.string(),
+      }),
+    )
+    .optional(),
 });
 export type ScopeReplanState = z.infer<typeof ScopeReplanStateSchema>;
 export const approvedPlanIdentity = (plan: AgentPlan) => sha256(canonicalJson(plan));
@@ -126,7 +141,7 @@ export async function captureReplanCandidate(input: {
   baseCommitSha: string;
   signal: AbortSignal;
   beforeRead: () => void;
-}): Promise<Pick<ScopeReplanState, "files" | "patchSha256">> {
+}): Promise<Pick<ScopeReplanState, "files" | "patchSha256" | "changeEvidence">> {
   const git = new SandboxGitService();
   input.beforeRead();
   if ((await git.head(input.sandbox, input.signal)) !== input.baseCommitSha)
@@ -157,6 +172,7 @@ export async function captureReplanCandidate(input: {
     }
   }
   const files: ScopeReplanState["files"] = [];
+  const changeEvidence: NonNullable<ScopeReplanState["changeEvidence"]> = [];
   let bytes = 0;
   for (const path of changedPaths) {
     if (!graphPathAllowed(path)) throw new Error("REPLAN_INVALID_CANDIDATE_PATH");
@@ -193,12 +209,49 @@ export async function captureReplanCandidate(input: {
     bytes += Buffer.byteLength(content ?? "");
     if (bytes > 1024 * 1024) throw new Error("REPLAN_CHECKPOINT_TOO_LARGE");
     files.push({ path, baselineSha256, currentSha256, content });
+    changeEvidence.push({
+      path,
+      baselineSha256,
+      currentSha256,
+      ...projectCandidateChange(baseline.exitCode === 0 ? baseline.stdout : "", content ?? ""),
+    });
   }
   return {
     files,
+    changeEvidence,
     patchSha256: sha256(
       canonicalJson(files.map((f) => [f.path, f.baselineSha256, f.currentSha256])),
     ),
+  };
+}
+
+/** Retain every changed line plus context; never substitute a whole current file for a diff. */
+export function projectCandidateChange(before: string, after: string) {
+  const oldLines = before.split("\n"),
+    newLines = after.split("\n");
+  let prefix = 0;
+  while (
+    prefix < oldLines.length &&
+    prefix < newLines.length &&
+    oldLines[prefix] === newLines[prefix]
+  )
+    prefix++;
+  let suffix = 0;
+  while (
+    suffix < oldLines.length - prefix &&
+    suffix < newLines.length - prefix &&
+    oldLines[oldLines.length - suffix - 1] === newLines[newLines.length - suffix - 1]
+  )
+    suffix++;
+  const start = Math.max(0, prefix - 3);
+  const oldEnd = Math.min(oldLines.length, oldLines.length - suffix + 3);
+  const newEnd = Math.min(newLines.length, newLines.length - suffix + 3);
+  return {
+    startLine: start + 1,
+    baselineEndLine: oldEnd,
+    currentEndLine: newEnd,
+    before: oldLines.slice(start, oldEnd).join("\n"),
+    after: newLines.slice(start, newEnd).join("\n"),
   };
 }
 

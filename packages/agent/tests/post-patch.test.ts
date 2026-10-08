@@ -24,6 +24,15 @@ const finish: ModelToolCall = {
   input: { summary: "The issue is fixed!", outcome: "CHANGED" },
 };
 const read: ModelToolCall = { id: "r", name: "readFile", input: { path: "a.ts" } };
+
+it("retains approved Plan inspect reads after a mutation without adding them to write scope", () => {
+  const controller = new PostPatchController(["a.ts"]);
+  controller.necessaryReadPaths = ["a.ts", "interface.ts"];
+  controller.firstMutationEndedAt = Date.now();
+  expect(controller.authorize("readFile", ["interface.ts"])).toBeUndefined();
+  expect(controller.authorize("writeFile", ["interface.ts"])).toContain("only planned targets");
+  expect(controller.authorize("readFile", ["unapproved.ts"])).toContain("only planned targets");
+});
 async function run(
   options: {
     reserve?: boolean;

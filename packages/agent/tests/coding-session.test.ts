@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { z } from "zod";
-import { PhaseCompletionSchema, AgentPlanSchema, type MutationResult } from "@devflow/shared";
+import {
+  PhaseCompletionSchema,
+  AgentPlanSchema,
+  DevflowError,
+  type MutationResult,
+} from "@devflow/shared";
 import {
   DefaultAgentRuntime,
   FakeLanguageModel,
@@ -667,4 +672,103 @@ it("selects submission before an optional time branch would reject a current sta
   expect(result.status).toBe("SUCCEEDED");
   expect(f.model.requests).toHaveLength(2);
   expect(f.model.requests[1]!.tools.map((tool) => tool.name)).toEqual(["finishPhase"]);
+});
+
+const optionalReadDenied = () =>
+  new DevflowError({
+    code: "PERMISSION_DENIED",
+    message: "Four optional reads have been consumed; approved edits remain available.",
+    details: {
+      failureOrigin: "HOST_EXPLORATION",
+      category: "EXPLORATION_LIMIT",
+      reasonCode: "OPTIONAL_READ_LIMIT",
+    },
+  }).toJSON();
+
+it("does not convert an optional read limit into authorization handoff or parameter correction", async () => {
+  const f = fixture([
+    fakeModelResponse({
+      toolCalls: [{ id: "fifth-read", name: "readFile", input: { path: "optional.ts" } }],
+    }),
+    async (request) => {
+      expect(request.tools.map((tool) => tool.name)).toContain("writeFile");
+      expect(JSON.stringify(request.messages)).not.toContain("HOST_AUTHORIZATION_HANDOFF");
+      return decision("COMPLETE_CANDIDATE");
+    },
+  ]);
+  const authorize = f.context.authorizeTool;
+  f.context.authorizeTool = (call) =>
+    call.name === "readFile" ? optionalReadDenied() : authorize?.(call);
+  const result = await f.run();
+  expect(result.status).toBe("SUCCEEDED");
+  expect(f.content()).toBe("COMPLETE_CANDIDATE");
+  expect((await f.stateStore.load(f.context.runId))!.executionRecovery).toMatchObject({
+    used: false,
+    authorizationHandoffUsed: false,
+  });
+});
+
+it("allows same-batch approved edit and submission after only a read exploration limit", async () => {
+  const edit = decision("COMPLETE_CANDIDATE");
+  const f = fixture([
+    fakeModelResponse({
+      toolCalls: [
+        { id: "optional-read", name: "readFile", input: { path: "optional.ts" } },
+        ...edit.toolCalls,
+      ],
+    }),
+  ]);
+  const authorize = f.context.authorizeTool;
+  f.context.authorizeTool = (call) =>
+    call.name === "readFile" ? optionalReadDenied() : authorize?.(call);
+  expect((await f.run()).status).toBe("SUCCEEDED");
+  expect(f.model.requests).toHaveLength(1);
+  expect(f.content()).toBe("COMPLETE_CANDIDATE");
+  expect((await f.stateStore.load(f.context.runId))!.executionRecovery?.used).toBe(false);
+});
+
+it("stops repeated denied exploration after two decisions without granting a correction", async () => {
+  const deniedRead = () =>
+    fakeModelResponse({
+      toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "optional.ts" } }],
+    });
+  const f = fixture([deniedRead(), deniedRead(), decision("MUST_NOT_RUN")]);
+  f.context.authorizeTool = () => optionalReadDenied();
+  const result = await f.run();
+  expect(result.error?.code).toBe("AGENT_STALLED");
+  expect(f.model.requests).toHaveLength(2);
+  expect((await f.stateStore.load(f.context.runId))!.executionRecovery?.used).toBe(false);
+});
+
+it("persists host admission before IO and restores it through the same session continuation", async () => {
+  const read = () =>
+    fakeModelResponse({
+      toolCalls: [{ id: randomUUID(), name: "readFile", input: { path: "src/a.ts" } }],
+    });
+  const f = fixture([read(), decision("PARTIAL"), read(), completed()]);
+  let admitted = 0;
+  f.context.hostToolState = {
+    restore: (value) => {
+      if (value) admitted = Number(value.admitted);
+    },
+    snapshot: () => ({ admitted }),
+  };
+  const authorize = f.context.authorizeTool;
+  f.context.authorizeTool = (call) => {
+    if (call.name === "readFile") admitted++;
+    return authorize?.(call);
+  };
+  const execute = f.context.executeTool;
+  f.context.executeTool = async (...args) => {
+    if (args[1].name === "readFile")
+      expect((await f.stateStore.load(f.context.runId))!.hostToolState?.admitted).toBe(admitted);
+    return execute(...args);
+  };
+  expect((await f.run()).status).toBe("SUCCEEDED");
+  admitted = 0;
+  expect((await f.run({ hostContinuation: feedback })).status).toBe("SUCCEEDED");
+  expect(admitted).toBe(2);
+  expect((await f.stateStore.load(f.context.runId))!.hostToolState?.admitted).toBe(2);
+  expect((await f.run()).status).toBe("SUCCEEDED");
+  expect(admitted).toBe(2);
 });

@@ -2353,10 +2353,19 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         };
         const repairOutput = this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192;
         const reviewOutput = this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048;
-        const compactDiagnostic = repairDiagnosticTasks(
-          diagnostic,
-          resolveRepairDiagnostics(diagnostic, replanRepositoryPaths, !!localSnapshot),
-        );
+        const compactDiagnostic = {
+          ...repairDiagnosticTasks(
+            diagnostic,
+            resolveRepairDiagnostics(diagnostic, replanRepositoryPaths, !!localSnapshot),
+          ),
+          rawEvidence: {
+            artifact: "scope-replan-v1.json",
+            section: "diagnostic",
+            sha256: createHash("sha256").update(diagnostic).digest("hex"),
+            timedOut: scopeReplan.testResult?.timedOut ?? null,
+            outputTruncated: scopeReplan.testResult?.outputTruncated ?? null,
+          },
+        };
         // Before source preparation only enforce a known lower bound. The complete projection is
         // computed from the checkpoint/current evidence before constructing any Planner request.
         let reserve = codingContinuationReserve({
@@ -2639,12 +2648,21 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         );
         for (const file of scopeReplan.files) {
           if (file.currentSha256 === "ABSENT") currentEntries.delete(file.path);
-          else
+          else {
             currentEntries.set(file.path, {
               path: file.path,
               kind: "FILE",
               sizeBytes: Buffer.byteLength(file.content ?? ""),
             });
+            // Capture already verified these complete bytes after admission. Reuse that
+            // observation for old-target validation instead of spending optional read quota.
+            evidenceReader.files.set(file.path, {
+              path: file.path,
+              content: file.content!,
+              contentHash: file.currentSha256,
+              sizeBytes: Buffer.byteLength(file.content!),
+            });
+          }
         }
         for (const file of evidenceReader.files.values())
           currentEntries.set(file.path, {
@@ -2677,51 +2695,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               (scopeReplan!.preparation!.metadataCacheHits ?? 0) + 1;
           },
         });
-        const sourceProjection = [...evidenceReader.files.values()].map((file) => ({
-          path: file.path,
-          sha256: file.contentHash,
-          snippet: file.content
-            .split("\n")
-            .slice(
-              Math.max(0, (admission.records.find((r) => r.path === file.path)?.line ?? 1) - 1),
-              (admission.records.find((r) => r.path === file.path)?.line ?? 1) + 79,
-            )
-            .join("\n"),
-        }));
-        reserve = codingContinuationReserve({
-          title: run.task.title,
-          description: run.task.description,
-          plan: plan.proposal ?? plan,
-          diagnostics: compactDiagnostic,
-          source: JSON.stringify(sourceProjection),
-          patch: candidate.files
-            .map((f) => f.content ?? "")
-            .join("\n")
-            .slice(0, 8192),
-          codingOutput: repairOutput,
-          reviewOutput,
-          resumeCoding: true,
-          reviewRecoveryAvailable: await remainingReviewRecovery(),
-        });
-        downstreamTokens = reserve.total;
-        const plannerLease = codingPlannerTokenLease({
-          configuredMaximumTokens: this.environment.DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS ?? 12000,
-          remainingTokens: budget.remainingTotalTokens(metrics),
-          downstreamTokens,
-        });
-        const plannerTokens = plannerLease.maxTotalTokens;
-        await this.database.events.append({
-          runId: run.id,
-          type: "WORKFLOW_CHECKPOINT",
-          occurredAt: new Date().toISOString(),
-          payload: asJson({
-            purpose: "SCOPE_REPLAN",
-            reservation: reserve,
-            remainingTokens: budget.remainingTotalTokens(metrics),
-            plannerTokens,
-            requestIssued: false,
-          }),
-        });
         const replan = await new PlanAgent().run({
           title: run.task.title,
           description: run.task.description,
@@ -2737,6 +2710,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               "Sources and failure provenance verified; causal relationships remain hypotheses for Planner.",
             publicFailure: compactDiagnostic,
             candidateIdentity: candidate.patchSha256,
+            cumulativeChanges: candidate.changeEvidence,
           },
           repositoryId: run.repository.id,
           baseCommitSha: run.task.baseCommitSha ?? localSnapshot?.sourceHead ?? base,
@@ -2768,12 +2742,75 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             maxSourceBytes: 1024 * 1024,
             maxSnippetBytes: 16 * 1024,
             maxModelCalls: 2,
-            maxTotalTokens: plannerTokens,
+            maxTotalTokens: this.environment.DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS ?? 12000,
             timeoutMs: Math.min(
               this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
               budget.remainingTimeMs -
                 (requiredTimeMs - (this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000)),
             ),
+          },
+          onPreparedProjection: async ({ stage, evidence, preflight }) => {
+            // These are the same complete records entering this Planner request. Host cache
+            // contents and checkpoint whole files are not additional visible prompt text.
+            const sourceProjection = evidence.map(
+              ({ path, contentHash, startLine, endLine, snippet }) => ({
+                path,
+                sha256: contentHash,
+                startLine,
+                endLine,
+                snippet,
+              }),
+            );
+            reserve = codingContinuationReserve({
+              title: run.task.title,
+              description: run.task.description,
+              plan: plan.proposal ?? plan,
+              diagnostics: compactDiagnostic,
+              source: sourceProjection,
+              patch: candidate.changeEvidence,
+              codingOutput: repairOutput,
+              reviewOutput,
+              resumeCoding: true,
+              reviewRecoveryAvailable: await remainingReviewRecovery(),
+            });
+            downstreamTokens = reserve.total;
+            const lease = codingPlannerTokenLease({
+              configuredMaximumTokens:
+                this.environment.DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS ?? 12000,
+              consumedTokens: preflight.consumedTokens,
+              remainingTokens: budget.remainingTotalTokens(metrics),
+              downstreamTokens,
+              requiredRequestTokens: preflight.requiredTokens,
+            });
+            await this.database.events.append({
+              runId: run.id,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: asJson({
+                purpose: "SCOPE_REPLAN",
+                projectionStage: stage,
+                reservation: reserve,
+                lease,
+                remainingTokens: budget.remainingTotalTokens(metrics),
+                plannerTokens: lease.maxTotalTokens,
+                requestFingerprint: preflight.estimate.fingerprint,
+                inputTokens: preflight.estimate.estimatedInputTokens,
+                outputTokens: preflight.outputTokens,
+                recoveryTokens: preflight.repairReserveTokens,
+                evidence: evidence.map(({ path, contentHash, startLine, endLine, truncated }) => ({
+                  path,
+                  contentHash,
+                  startLine,
+                  endLine,
+                  truncated,
+                })),
+                requestIssued: false,
+              }),
+            });
+            return {
+              maxTotalTokens: lease.maxTotalTokens,
+              allowOptionalNavigation: lease.permitted,
+            };
           },
           onRequest: async ({ purpose, formatRepair, preflight }) => {
             budget.requireAgentSteps("PLAN");
@@ -4556,6 +4593,18 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         : undefined);
     if (trace && workingSet) trace.workspaceRevision = workingSet.workspaceRevision;
     const actionEnabled = this.environment.DEVFLOW_EVIDENCE_ACTION_ENABLED === true;
+    const necessaryReadPaths =
+      input.codingSession && input.plan.proposalVersion
+        ? [
+            ...new Set([
+              ...targetScope.targets,
+              ...(input.plan.proposal?.candidateFiles
+                .filter((file) => file.intent === "INSPECT")
+                .map((file) => file.path) ?? []),
+            ]),
+          ]
+        : [];
+    if (postPatch) postPatch.necessaryReadPaths = necessaryReadPaths;
     const exploration =
       workingSet && (!input.executionPacket || input.plan.proposalVersion)
         ? new ExplorationBudget(
@@ -4566,6 +4615,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               relocations: this.environment.DEVFLOW_EXPLORATION_RELOCATIONS ?? 1,
             },
             input.plan.proposalVersion === "plan-proposal-v1",
+            necessaryReadPaths,
           )
         : undefined;
     const wholeFileWrite =
@@ -4905,6 +4955,17 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         ...(exploration
           ? {
               availableTools: () => phaseTools.filter((t) => exploration.available(t.name)),
+              ...(input.codingSession
+                ? {
+                    hostToolState: {
+                      restore: (value: Record<string, unknown> | undefined, resumed: boolean) => {
+                        exploration.restore(value?.exploration, resumed);
+                        if (resumed) exploration.invalidate([], true);
+                      },
+                      snapshot: () => ({ exploration: exploration.snapshot() }),
+                    },
+                  }
+                : {}),
             }
           : {}),
         ...(actionEnabled || postPatch || prePatch || input.plan.proposalVersion
@@ -4916,7 +4977,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                     proposalMutationDenial(input.plan, request.name, requestPaths(request)) ??
                     postPatch?.authorize(request.name, requestPaths(request)) ??
                     prePatch?.authorize(request) ??
-                    exploration?.consume(request.name, request.input)),
+                    exploration?.authorize(request.name, request.input)),
             }
           : {}),
         emit: async (event) => {
@@ -5295,6 +5356,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               })
             : await execute();
           input.onToolObservation?.(request.name, result);
+          exploration?.observe(request.name, result);
           const isMutation = ["writeFile", "replaceText", "applyPatch", "runCommand"].includes(
             request.name,
           );
@@ -5327,6 +5389,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               }),
             });
           }
+          if (isMutation && !effect.unchanged)
+            exploration?.invalidate(effect.paths, effect.unknownScope);
           return result;
         },
       },

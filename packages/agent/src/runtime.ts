@@ -21,6 +21,7 @@ import {
   toDevflowError,
   PhaseCompletionSchema,
   type AgentPlan,
+  type DevflowErrorShape,
   type JsonValue,
 } from "@devflow/shared";
 
@@ -165,7 +166,12 @@ export interface RunContext {
   /** Host-approved files whose current edit evidence is missing. At most one closing refresh. */
   closingReadPaths?(): readonly string[];
   validateFinishPhase?(input: unknown): string | undefined;
-  authorizeTool?(request: ToolExecutionRequest): string | undefined;
+  authorizeTool?(request: ToolExecutionRequest): string | DevflowErrorShape | undefined;
+  /** Checkpoint host admission before tools run; older checkpoints must not imply unused quota. */
+  hostToolState?: {
+    restore(value: Record<string, unknown> | undefined, resumed: boolean): void;
+    snapshot(): Record<string, unknown>;
+  };
   stateStore?: AgentStateStore;
   emit(event: NewAgentEvent): Promise<void>;
   executeTool(
@@ -256,6 +262,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
       state = { ...state, executionRecovery: structuredClone(request.executionRecovery) };
     const messages: ModelMessage[] = [...state.messages];
     const execution = createExecutionState(context.tools);
+    context.hostToolState?.restore(state.hostToolState, restoredState !== undefined);
+    if (context.hostToolState)
+      execution.checkpointAdmission = async () => {
+        state = await checkpoint(context, state);
+      };
     execution.noProgressStreak = state.executionConvergence?.noProgressStreak ?? 0;
     if (postPatch && state.postPatch) postPatch.restore(state.postPatch);
     if (postPatch)
@@ -1515,7 +1526,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
               ({ call, result }) =>
                 !result.ok &&
                 !["APPROVAL_REQUIRED", "CONFLICT"].includes(result.error.code) &&
-                objectValue(result.error.details)?.failureOrigin !== "HOST_AUTHORIZATION" &&
+                !["HOST_AUTHORIZATION", "HOST_EXPLORATION"].includes(
+                  String(objectValue(result.error.details)?.failureOrigin),
+                ) &&
                 ((call.name === "finishPhase" &&
                   /finishPhase|findingId|evidenceRefs/u.test(result.error.message)) ||
                   (["readFile", "batchReadFiles", "readEvidenceArtifact"].includes(call.name) &&
@@ -1844,6 +1857,7 @@ interface ToolExecutionMetadata {
 }
 
 interface RuntimeExecutionState {
+  checkpointAdmission?: () => Promise<void>;
   correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
   correctionTool?: string;
   correctionInput?: string;
@@ -2003,7 +2017,9 @@ async function executeToolBatch(
       continue;
     }
     const metadata = toolMetadata(call.name, state.tools.get(call.name));
-    if (metadata.readOnly && metadata.parallelSafe) {
+    // Admission state is persisted before each operation. Serialize this small
+    // group when a host ledger is attached, avoiding out-of-order quota saves.
+    if (metadata.readOnly && metadata.parallelSafe && !state.checkpointAdmission) {
       const batch: {
         call: ModelToolCall;
         index: number;
@@ -2042,7 +2058,16 @@ async function executeToolBatch(
     const call = calls[index];
     if (call?.name !== "finishPhase") continue;
     const summary = finishSummary(call);
-    const priorSucceeded = results.slice(0, index).every((result) => result?.result.ok === true);
+    const priorSucceeded = results
+      .slice(0, index)
+      .every(
+        (result) =>
+          result?.result.ok === true ||
+          (result?.metadata.readOnly === true &&
+            !result.result.ok &&
+            objectValue(result.result.error.details)?.failureOrigin === "HOST_EXPLORATION" &&
+            objectValue(result.result.error.details)?.category === "EXPLORATION_LIMIT"),
+      );
     const isLast = index === calls.length - 1;
     const schemaError =
       finishSchemaError(call, state.tools.get("finishPhase")) ??
@@ -2169,6 +2194,7 @@ async function executeOneToolInner(
     name: call.name,
     input: call.input,
   });
+  await state.checkpointAdmission?.();
   if (denied) {
     let result = controlFailure(denied, "HOST_AUTHORIZATION");
     if (metadata.mutatesWorkspace) {
@@ -2181,7 +2207,7 @@ async function executeOneToolInner(
           mutationAttempted: false,
           mutationApplied: false,
           workspaceChanged: false,
-          reason: denied,
+          reason: typeof denied === "string" ? denied : denied.message,
           beforeRevision: revision,
           afterRevision: revision,
           changedFiles: [],
@@ -2290,17 +2316,20 @@ function toolMetadata(
 }
 
 function controlFailure(
-  message: string,
+  message: string | DevflowErrorShape,
   failureOrigin: "INPUT_VALIDATION" | "HOST_AUTHORIZATION" = "INPUT_VALIDATION",
 ): ToolExecutionResult {
   return {
     ok: false,
     durationMs: 0,
-    error: new DevflowError({
-      code: "VALIDATION_ERROR",
-      message,
-      details: { failureOrigin },
-    }).toJSON(),
+    error:
+      typeof message !== "string"
+        ? message
+        : new DevflowError({
+            code: "VALIDATION_ERROR",
+            message,
+            details: { failureOrigin },
+          }).toJSON(),
   };
 }
 
@@ -2776,6 +2805,7 @@ async function checkpoint(context: RunContext, state: AgentState): Promise<Agent
     ...state,
     updatedAt: new Date().toISOString(),
     ...(context.postPatch ? { postPatch: context.postPatch.snapshot() } : {}),
+    ...(context.hostToolState ? { hostToolState: context.hostToolState.snapshot() } : {}),
   };
   await context.stateStore?.save(updated);
   return updated;

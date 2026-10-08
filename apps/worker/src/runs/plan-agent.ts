@@ -169,6 +169,13 @@ export interface PlanReadObservation {
   workspaceRevision: number;
 }
 export interface PlanAgentHooks {
+  /** Host capacity reconciliation over the exact serialized request, before any model dispatch. */
+  onPreparedProjection?(input: {
+    stage: "BEFORE_OPTIONAL_NAVIGATION" | "FINAL";
+    request: ModelRequest;
+    evidence: readonly PlanEvidenceRow[];
+    preflight: PlanPreflight;
+  }): Promise<{ maxTotalTokens: number; allowOptionalNavigation?: boolean }>;
   onRequest?(input: {
     purpose: string;
     formatRepair: boolean;
@@ -316,6 +323,7 @@ class PlanSession {
   private manifestIncomplete = false;
   private readonly seenReads = new Set<string>();
   private readonly hooks: PlanAgentHooks;
+  private requiredRows: PlanEvidenceRow[] | undefined;
 
   private readonly verifiedFiles = new Map<
     string,
@@ -486,8 +494,18 @@ class PlanSession {
         this.readFeedback(error, request.path);
       }
     }
+    this.requiredRows = this.hooks.onPreparedProjection
+      ? this.rows.map((row) => ({ ...row }))
+      : undefined;
+    const navigationProjection = await this.reconcileProjection("BEFORE_OPTIONAL_NAVIGATION");
     try {
-      await this.discoverCandidates();
+      if (navigationProjection?.allowOptionalNavigation !== false) await this.discoverCandidates();
+      else
+        this.diagnostic(
+          "PLAN_OPTIONAL_NAVIGATION_BUDGET_STOP",
+          "Current required evidence and downstream work leave no optional navigation capacity.",
+          { requestIssued: false, readIssued: false },
+        );
     } catch (error) {
       this.check();
       const verifiedCandidate = this.rows.some(
@@ -508,7 +526,7 @@ class PlanSession {
         "Optional navigation stopped at the shared source allowance. Only supplied current SHA-verified source was observed; missing relationships are unknown, not absent. No additional read allowance or write authority is granted.",
       );
     }
-    this.buildFinal();
+    await this.buildFinal();
   }
   private readFeedback(error: unknown, path: string): void {
     // Recover only local candidate errors. Cancellation, byte exhaustion and
@@ -646,22 +664,72 @@ class PlanSession {
         remainingModelCalls >= 1 + reserveCalls,
     };
   }
-  buildFinal(): void {
+  private createFinalRequest(): ModelRequest {
+    return this.outputRequest([
+      { role: "SYSTEM", content: PROPOSAL_PROMPT },
+      { role: "USER", content: this.contextText() },
+    ]);
+  }
+  private async reconcileProjection(stage: "BEFORE_OPTIONAL_NAVIGATION" | "FINAL") {
+    if (!this.hooks.onPreparedProjection) return undefined;
+    const request = this.createFinalRequest();
+    const result = await this.hooks.onPreparedProjection({
+      stage,
+      request,
+      evidence: this.contextRows(),
+      preflight: this.preflight(request, this.repairReserve(), this.recoveryCalls()),
+    });
+    // The host may redistribute unconsumed capacity; never enlarge or reset this attempt's cap.
+    const maximum = this.input.limits?.maxTotalTokens ?? PLAN_AGENT_DEFAULTS.maxTotalTokens;
+    if (
+      !Number.isSafeInteger(result.maxTotalTokens) ||
+      result.maxTotalTokens < this.attempt.metrics.totalTokens ||
+      result.maxTotalTokens > maximum
+    )
+      throw new Blocked(
+        "PLAN_INVALID_HOST_LEASE",
+        "Prepared projection returned an invalid planning lease.",
+      );
+    this.limits.maxTotalTokens = result.maxTotalTokens;
+    return result;
+  }
+  async buildFinal(): Promise<void> {
     this.check();
-    const create = () =>
-      this.outputRequest([
-        {
-          role: "SYSTEM",
-          content: PROPOSAL_PROMPT,
-        },
-        {
-          role: "USER",
-          content: this.contextText(),
-        },
-      ]);
+    const create = () => this.createFinalRequest();
+    await this.reconcileProjection("FINAL");
     let request = create(),
       preflight = this.preflight(request, this.repairReserve(), this.recoveryCalls());
+    if (
+      !preflight.permitted &&
+      this.requiredRows &&
+      JSON.stringify(this.rows) !== JSON.stringify(this.requiredRows)
+    ) {
+      const omitted = this.rows.filter(
+        (row) => !this.requiredRows!.some((required) => required.id === row.id),
+      );
+      this.rows = this.requiredRows.map((row) => ({ ...row }));
+      this.diagnostic(
+        "PLAN_OPTIONAL_EVIDENCE_BUDGET_STOP",
+        "Optional evidence omitted as complete records to retain required current-source evidence and downstream capacity.",
+        {
+          omittedRecords: omitted.length,
+          omittedEvidence: JSON.stringify(
+            omitted.map(({ path, contentHash, startLine, endLine }) => ({
+              path,
+              contentHash,
+              startLine,
+              endLine,
+            })),
+          ),
+          requestIssued: false,
+        },
+      );
+      await this.reconcileProjection("FINAL");
+      request = create();
+      preflight = this.preflight(request, this.repairReserve(), this.recoveryCalls());
+    }
     while (
+      !this.hooks.onPreparedProjection &&
       !preflight.permitted &&
       this.contextRows().some((row) => Buffer.byteLength(row.snippet) > 256)
     ) {
@@ -710,7 +778,7 @@ class PlanSession {
   }
   async generateProposal(model: AgentModel): Promise<PlanAgentPlan | undefined> {
     this.attempt.phase = "FINAL";
-    this.buildFinal();
+    await this.buildFinal();
     let response = await this.generate(
       model,
       this.finalRequest!,

@@ -188,6 +188,48 @@ it("leases Planner from the selected global frontier and reports exact insuffici
   ).toMatchObject({ maxTotalTokens: 0, missingTokens: 52934, permitted: false });
 });
 
+it("keeps structured source records unescaped and retains both Review source sides and recovery", () => {
+  const source = [
+    {
+      path: "src/state.ts",
+      sha256: "a".repeat(64),
+      snippet: 'export const value = "pending";\n'.repeat(80),
+    },
+  ];
+  const structured = codingContinuationReserve({ ...continuation, source, resumeCoding: true });
+  const nested = codingContinuationReserve({
+    ...continuation,
+    source: JSON.stringify(source),
+    resumeCoding: true,
+  });
+  expect(structured.total).toBeLessThan(nested.total);
+  expect(structured.reviewInput).toBeGreaterThan(structured.recoveryInput);
+  expect(structured.configuredCodingOutput).toBe(8192);
+  expect(structured.configuredReviewOutput).toBe(16384);
+  expect(structured.recovery).toBe(structured.recoveryInput + 16384);
+});
+
+it("reconciles a prepared lease without refunding the same attempt's consumed tokens", () => {
+  expect(
+    codingPlannerTokenLease({
+      remainingTokens: 80000,
+      downstreamTokens: 30000,
+      configuredMaximumTokens: 60000,
+      consumedTokens: 20000,
+      requiredRequestTokens: 41000,
+    }),
+  ).toMatchObject({ maxTotalTokens: 60000, missingTokens: 1000, permitted: false });
+  expect(
+    codingPlannerTokenLease({
+      remainingTokens: 50000,
+      downstreamTokens: 30000,
+      configuredMaximumTokens: 60000,
+      consumedTokens: 20000,
+      requiredRequestTokens: 20000,
+    }),
+  ).toMatchObject({ maxTotalTokens: 40000, missingTokens: 0, permitted: true });
+});
+
 it("keeps final Review capacity and monotonic hard ceilings over test and approval resumptions", () => {
   const budget = planAdaptiveBudget({
     complexity: "COMPLEX",

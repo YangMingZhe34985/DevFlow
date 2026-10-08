@@ -128,6 +128,8 @@ export const AgentStateSchema = z.object({
   adaptiveStepBudget: AdaptiveStepBudgetStateSchema.optional(),
   plan: AgentPlanSchema.optional(),
   contextCompression: ContextCompressionStateSchema.optional(),
+  /** Host-owned admission accounting; never supplied by model tool arguments. */
+  hostToolState: z.record(z.string(), z.unknown()).optional(),
   codingContinuations: z
     .array(
       z.object({
@@ -188,6 +190,7 @@ export const AgentStateSchema = z.object({
   finalResult: RunResultSchema.optional(),
 });
 export interface AgentState {
+  hostToolState?: Record<string, unknown>;
   codingContinuations?: z.infer<typeof AgentStateSchema>["codingContinuations"];
   executionConvergence?: z.infer<typeof AgentStateSchema>["executionConvergence"];
   postPatch?: z.infer<typeof AgentStateSchema>["postPatch"];

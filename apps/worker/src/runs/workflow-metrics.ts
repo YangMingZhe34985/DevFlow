@@ -1,4 +1,8 @@
 import type { ModelResponse } from "@devflow/agent";
+import {
+  recordDecisionResourceWork,
+  recordLogicalResourceWork,
+} from "./resource-budget-runtime.js";
 import type {
   RunControlMetrics,
   RunMetricStage,
@@ -32,6 +36,7 @@ export function recordStageAttempt(metrics: RunMetrics, stage: RunMetricStage): 
 /** Records one logical model decision against the run-wide step budget. */
 export function recordStageStep(metrics: RunMetrics, stage: RunMetricStage, count = 1): void {
   const steps = nonnegativeInteger(count);
+  recordDecisionResourceWork(steps);
   metrics.steps += steps;
   stageMetrics(metrics, stage).steps += steps;
   syncBudgetStageSteps(metrics);
@@ -88,9 +93,16 @@ export function recordFormatRepair(metrics: RunMetrics, stage: RunMetricStage): 
 export function recordToolWork(
   metrics: RunMetrics,
   stage: RunMetricStage,
-  input: { calls?: number; executions?: number; cacheHits?: number; latencyMs?: number },
+  input: {
+    calls?: number;
+    executions?: number;
+    cacheHits?: number;
+    latencyMs?: number;
+    alreadyAccounted?: boolean;
+  },
 ): void {
   const calls = nonnegativeInteger(input.calls ?? 0);
+  if (!input.alreadyAccounted) recordLogicalResourceWork(calls);
   const executions = nonnegativeInteger(input.executions ?? calls);
   const cacheHits = nonnegativeInteger(input.cacheHits ?? 0);
   const latencyMs = nonnegativeInteger(input.latencyMs ?? 0);

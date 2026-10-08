@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { randomUUID } from "node:crypto";
 import { afterEach, expect, it, vi } from "vitest";
 import {
@@ -27,6 +28,7 @@ afterEach(() => vi.restoreAllMocks());
 it("does not issue Review when input plus configured output exceeds the remaining budget", async () => {
   const events: NewAgentEvent[] = [];
   const db = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     runs: { transition: async () => ({}) },
     events: {
       append: async (e: NewAgentEvent) => {
@@ -407,6 +409,7 @@ it("runs public diagnostics on a stalled stable candidate without converting it 
     steps: [{ id: "edit", title: "Edit", description: "Update a.ts" }],
   };
   const db = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     approvals: { list: async () => [{ kind: "PLAN", status: "APPROVED", request: { plan } }] },
     events: { list: async () => [], append: async () => {} },
     artifacts: {
@@ -516,6 +519,7 @@ it.each([
       steps: [{ id: "edit", title: "Edit", description: "Fix a.ts" }],
     };
     const db = {
+      budgetLedgers: new InMemoryBudgetLedgerStore(),
       approvals: { list: async () => [{ kind: "PLAN", status: "APPROVED", request: { plan } }] },
       events: {
         list: async () => [],
@@ -686,6 +690,7 @@ it.each([false, true])(
       steps: [{ id: "edit", title: "Edit", description: "Implement a.ts value" }],
     };
     const db = {
+      budgetLedgers: new InMemoryBudgetLedgerStore(),
       approvals: { list: async () => [{ kind: "PLAN", status: "APPROVED", request: { plan } }] },
       events: {
         list: async () => [],

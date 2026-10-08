@@ -4,6 +4,7 @@ import { DevflowError, type RunResult } from "@devflow/shared";
 import type { CommandResult, SandboxSession } from "@devflow/sandbox";
 import type { DiagnosticResolution } from "./repair-diagnostics.js";
 import { graphPathAllowed } from "../localization/relation-graph.js";
+import type { CurrentSourceCache } from "./current-source-cache.js";
 
 export interface ReplanReadState {
   reads: number;
@@ -47,6 +48,7 @@ export class ReplanEvidenceReader {
     private readonly beforeRead: () => Promise<void>,
     state?: ReplanReadState,
     private readonly afterRead?: (state: ReplanReadState) => Promise<void>,
+    private readonly sourceCache?: CurrentSourceCache,
   ) {
     this.state = state ?? { reads: 0, sourceBytes: 0, cacheHits: 0 };
   }
@@ -56,9 +58,19 @@ export class ReplanEvidenceReader {
   async read(path: string): Promise<ReplanFile> {
     this.signal.throwIfAborted();
     if (!graphPathAllowed(path)) throw new Error("REPLAN_FORBIDDEN_SOURCE");
-    const cached = this.files.get(path);
+    const cached = this.files.get(path) ?? this.sourceCache?.source(this.sandbox, path);
     if (cached) {
+      if (
+        Buffer.byteLength(cached.content) > 512 * 1024 ||
+        sha256(cached.content) !== cached.contentHash
+      )
+        throw new DevflowError({
+          code: "VALIDATION_ERROR",
+          message: "REPLAN_SOURCE_IDENTITY_UNVERIFIED",
+          details: { path },
+        });
       this.state.cacheHits++;
+      this.files.set(path, cached);
       return cached;
     }
     if (
@@ -93,6 +105,7 @@ export class ReplanEvidenceReader {
       sizeBytes: Buffer.byteLength(file.content),
     };
     this.files.set(path, observed);
+    this.sourceCache?.remember(this.sandbox, observed);
     return observed;
   }
 }

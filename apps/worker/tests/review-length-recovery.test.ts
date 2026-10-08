@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { randomUUID } from "node:crypto";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import type { CommandResult } from "@devflow/sandbox";
@@ -78,6 +79,7 @@ function fixture(
     }),
   );
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     runs: { transition: vi.fn() },
     events: {
       append: async (event: NewAgentEvent) => {

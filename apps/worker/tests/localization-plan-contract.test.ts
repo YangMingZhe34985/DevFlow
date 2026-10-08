@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import type { ModelRequest } from "@devflow/agent";
 import { FreshAgentPlanOutputSchema } from "@devflow/shared";
@@ -182,6 +183,7 @@ it("sends localization and a minimal proposal through the actual provider adapte
     repository: { id: "contract-repo", sourceKind: "LOCAL" },
   } as RunExecutionRecord;
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     artifacts: { list: async () => [], create: async () => ({ id: "evidence" }) },
     approvals: { list: async () => [] },
     events: { list: async () => [], append: async () => undefined },

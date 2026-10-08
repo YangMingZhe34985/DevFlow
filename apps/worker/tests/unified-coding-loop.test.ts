@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { contentHash, FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
@@ -78,6 +79,7 @@ function workerFixture(publicValues = [2]) {
     ],
   };
   const db = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     approvals: {
       list: async () => [
         { id: "original-approval", kind: "PLAN", status: "APPROVED", request: { plan } },

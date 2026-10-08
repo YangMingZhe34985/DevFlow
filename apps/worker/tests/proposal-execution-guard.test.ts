@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { describe, expect, it, vi } from "vitest";
 import { FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
@@ -65,6 +66,7 @@ async function phase(
     });
   }
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     events: {
       append: async (event: NewAgentEvent) => {
         events.push(event);

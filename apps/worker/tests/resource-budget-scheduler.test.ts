@@ -259,6 +259,101 @@ describe("durable Resource Budget Scheduler", () => {
     });
   });
 
+  it("releases elapsed request time while preserving unknown token and fee holds through recovery", async () => {
+    const fixture = setup();
+    const scheduler = await fixture.open();
+    await scheduler.reserve(
+      "transport-error",
+      operation("provider", { tokens: 900, modelCalls: 1, timeMs: 3_000, costMicros: 800 }),
+    );
+    await scheduler.admit("transport-error");
+    fixture.setTime(1_500);
+    await scheduler.markUncertain(
+      "transport-error",
+      { modelCalls: 1, timeMs: 500 },
+      "transport rejected without usage",
+    );
+    const resumed = await fixture.open();
+    expect((await resumed.snapshot()).consumed).toMatchObject({
+      tokens: 0,
+      costMicros: 0,
+      modelCalls: 1,
+      timeMs: 500,
+    });
+    expect(
+      (await resumed.quote(operation("later", { timeMs: 9_500, tokens: 100, costMicros: 200 })))
+        .fits,
+    ).toBe(true);
+    expect((await resumed.quote(operation("overspend", { tokens: 101 }))).shortfalls.tokens).toBe(
+      1,
+    );
+    expect((await resumed.admit("transport-error")).reason).toBe("ALREADY_ADMITTED");
+    await resumed.markUncertain(
+      "transport-error",
+      { modelCalls: 1, timeMs: 500 },
+      "same transport observation",
+    );
+    expect((await resumed.snapshot()).consumed.modelCalls).toBe(1);
+    await resumed.settle("transport-error", {
+      tokens: 350,
+      modelCalls: 1,
+      timeMs: 500,
+      costMicros: 100,
+    });
+    await scheduler.settle("transport-error", {
+      tokens: 350,
+      modelCalls: 1,
+      timeMs: 500,
+      costMicros: 100,
+    });
+    expect((await scheduler.snapshot()).consumed).toMatchObject({
+      tokens: 350,
+      costMicros: 100,
+      modelCalls: 1,
+      timeMs: 500,
+    });
+  });
+
+  it("refuses unknown billing release, rewritten observations and a final settlement below confirmed usage", async () => {
+    const scheduler = await setup().open();
+    await scheduler.reserve(
+      "ended",
+      operation("provider", { tokens: 800, modelCalls: 1, timeMs: 3_000, costMicros: 500 }),
+    );
+    await scheduler.admit("ended");
+    await scheduler.markUncertain("ended", { modelCalls: 1, timeMs: 500 }, "ended");
+    await expect(
+      scheduler.markUncertain("ended", { costMicros: 0 } as never, "guess zero bill"),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    await expect(
+      scheduler.markUncertain("ended", { timeMs: 400 }, "rewrite"),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(
+      scheduler.settle("ended", { tokens: 400, modelCalls: 0, timeMs: 500 }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await expect(scheduler.release("ended", "release all")).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect((await scheduler.quote(operation("over-budget", { tokens: 201 }))).fits).toBe(false);
+  });
+
+  it("merges independently confirmed uncertainty dimensions atomically without double-counting", async () => {
+    const fixture = setup();
+    const a = await fixture.open();
+    const b = await fixture.open();
+    await a.reserve(
+      "provider",
+      operation("request", { tokens: 800, modelCalls: 1, timeMs: 3_000, costMicros: 500 }),
+    );
+    await a.admit("provider");
+    await Promise.all([
+      a.markUncertain("provider", { modelCalls: 1 }, "transport ended"),
+      b.markUncertain("provider", { timeMs: 500 }, "duration observed"),
+      a.markUncertain("provider", { modelCalls: 1 }, "same observation"),
+    ]);
+    expect((await a.snapshot()).consumed).toMatchObject({ modelCalls: 1, timeMs: 500, tokens: 0 });
+  });
+
   it("records quote variance without rejecting safely affordable provider usage", async () => {
     const scheduler = await setup().open();
     await scheduler.reserve("bad-estimate", operation("request", { tokens: 500 }));

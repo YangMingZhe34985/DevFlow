@@ -5,6 +5,12 @@ import {
   type Complexity,
   type RunMetrics,
 } from "@devflow/shared";
+import {
+  normalizeResources,
+  resourceShortfalls,
+  type ResourceLimits,
+  type ResourceVector,
+} from "./resource-budget-scheduler.js";
 
 export type WorkflowMetricStage = "PLAN" | "EXECUTE" | "TEST" | "REPAIR" | "REVIEW";
 
@@ -527,6 +533,7 @@ export function buildAdaptiveBudgetMetrics(
   };
 }
 
+/** Synchronous compatibility view. Persistent admission/settlement belongs to ResourceBudgetScheduler. */
 export class WorkflowBudgetLedger {
   readonly maxAgentSteps: number;
   readonly maxModelCalls: number;
@@ -558,13 +565,24 @@ export class WorkflowBudgetLedger {
       options.initialAgentSteps,
       "initialAgentSteps",
     );
-    if (this.consumedAgentSteps > this.maxAgentSteps) {
+    if (this.shortfalls({ steps: this.consumedAgentSteps }).steps) {
       throw maxStepsExceeded("PLAN", this.maxAgentSteps, this.consumedAgentSteps);
     }
   }
 
   get consumedAgentStepCount(): number {
     return this.consumedAgentSteps;
+  }
+
+  /** The same resource names and hard-limit policy used by the authoritative Scheduler. */
+  get resourceLimits(): ResourceLimits {
+    return {
+      steps: this.maxAgentSteps,
+      modelCalls: this.maxModelCalls,
+      logicalToolCalls: this.maxToolCalls,
+      tokens: this.maxTotalTokens,
+      timeMs: this.timeoutMs,
+    };
   }
 
   get remainingAgentSteps(): number {
@@ -592,7 +610,7 @@ export class WorkflowBudgetLedger {
   restoreAgentSteps(steps: number, stage: WorkflowMetricStage = "PLAN"): void {
     const restored = nonnegativeIntegerStrict(steps, "steps");
     const observed = Math.max(this.consumedAgentSteps, restored);
-    if (observed > this.maxAgentSteps) {
+    if (this.shortfalls({ steps: observed }).steps) {
       throw maxStepsExceeded(stage, this.maxAgentSteps, observed);
     }
     this.consumedAgentSteps = observed;
@@ -604,7 +622,7 @@ export class WorkflowBudgetLedger {
 
   consumeAgentSteps(steps: number, stage: WorkflowMetricStage): void {
     const observed = this.consumedAgentSteps + nonnegativeIntegerStrict(steps, "steps");
-    if (observed > this.maxAgentSteps) {
+    if (this.shortfalls({ steps: observed }).steps) {
       throw maxStepsExceeded(stage, this.maxAgentSteps, observed);
     }
     this.consumedAgentSteps = observed;
@@ -626,7 +644,7 @@ export class WorkflowBudgetLedger {
 
   requireModelCall(stage: WorkflowMetricStage, metrics: RunMetrics): void {
     const observed = metrics.modelCalls + 1;
-    if (observed > this.maxModelCalls) {
+    if (this.shortfalls({ modelCalls: observed }).modelCalls) {
       this.exceeded(stage, "modelCalls", this.maxModelCalls, observed);
     }
   }
@@ -634,7 +652,7 @@ export class WorkflowBudgetLedger {
   requireToolCalls(stage: WorkflowMetricStage, metrics: RunMetrics, calls = 1): void {
     const requested = nonnegativeIntegerStrict(calls, "calls");
     const observed = metrics.toolCalls + requested;
-    if (observed > this.maxToolCalls) {
+    if (this.shortfalls({ logicalToolCalls: observed }).logicalToolCalls) {
       this.exceeded(stage, "toolCalls", this.maxToolCalls, observed);
     }
   }
@@ -662,22 +680,21 @@ export class WorkflowBudgetLedger {
   }
 
   assertWithinLimits(stage: WorkflowMetricStage, metrics: RunMetrics): void {
-    if (metrics.modelCalls > this.maxModelCalls) {
+    const totalTokens =
+      metrics.tokenUsage.totalTokens + (metrics.contextCompressionReservedTokens ?? 0);
+    const missing = this.shortfalls({
+      modelCalls: metrics.modelCalls,
+      logicalToolCalls: metrics.toolCalls,
+      tokens: totalTokens,
+    });
+    if (missing.modelCalls) {
       this.exceeded(stage, "modelCalls", this.maxModelCalls, metrics.modelCalls);
     }
-    if (metrics.toolCalls > this.maxToolCalls) {
+    if (missing.logicalToolCalls) {
       this.exceeded(stage, "toolCalls", this.maxToolCalls, metrics.toolCalls);
     }
-    if (
-      metrics.tokenUsage.totalTokens + (metrics.contextCompressionReservedTokens ?? 0) >
-      this.maxTotalTokens
-    ) {
-      this.exceeded(
-        stage,
-        "totalTokens",
-        this.maxTotalTokens,
-        metrics.tokenUsage.totalTokens + (metrics.contextCompressionReservedTokens ?? 0),
-      );
+    if (missing.tokens) {
+      this.exceeded(stage, "totalTokens", this.maxTotalTokens, totalTokens);
     }
     const now = Date.now();
     if (now >= this.deadlineAt) {
@@ -695,6 +712,10 @@ export class WorkflowBudgetLedger {
 
   get remainingTimeMs(): number {
     return Math.max(0, this.deadlineAt - Date.now());
+  }
+
+  private shortfalls(required: Partial<ResourceVector>) {
+    return resourceShortfalls(normalizeResources(required), this.resourceLimits);
   }
 
   private exceeded(

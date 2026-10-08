@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { contentHash, FakeLanguageModel, fakeModelResponse, type WorkingSet } from "@devflow/agent";
@@ -58,6 +59,7 @@ function fixture() {
   };
   const workflow = new ApprovalWorkflowRunExecutor(
     {
+      budgetLedgers: new InMemoryBudgetLedgerStore(),
       events: { append: async () => undefined },
       artifacts: { list: async () => [] },
     } as unknown as DatabaseAdapter,

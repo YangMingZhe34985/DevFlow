@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
-import { repairDiagnosticTasks, sourceEvidenceRecord } from "./repair-tasks.js";
+import {
+  repairContextSourcePaths,
+  repairDiagnosticTasks,
+  sourceEvidenceRecord,
+} from "./repair-tasks.js";
+import type { CurrentSourceCache } from "./current-source-cache.js";
 import { stableFailureStream } from "./repair-convergence.js";
 import { resolveRepairDiagnostics } from "./repair-diagnostics.js";
 export { extractRepairDiagnostics } from "./repair-diagnostics.js";
 import type { WorkingCode } from "@devflow/agent";
-import { graphPathAllowed } from "../localization/relation-graph.js";
+import { DevflowError } from "@devflow/shared";
 
 import type { SandboxGitService } from "@devflow/git";
 import { parseGitHubRepositoryUri, type GitHubProvider } from "@devflow/github";
@@ -20,7 +25,6 @@ const REPOSITORY_CONTEXT_LIMIT = 180 * 1024;
 const REPAIR_CONTEXT_LIMIT = 32 * 1024;
 const PRELOAD_TOTAL_LIMIT = 200 * 1024;
 const PRELOAD_FILE_LIMIT = 20;
-const RELEVANT_FILE_LIMIT = 8;
 const REVIEW_CONTEXT_LIMIT = 176 * 1024;
 
 export interface DeterministicContext {
@@ -255,6 +259,7 @@ export async function buildRepairContext(
     additionalSources?: readonly { path: string; line?: number | undefined }[];
     repositoryManifest?: { paths: readonly string[]; complete: boolean };
     beforeOperation?: () => void;
+    sourceCache?: CurrentSourceCache;
   } = {},
 ): Promise<RepairContext> {
   const startedAt = Date.now();
@@ -283,6 +288,7 @@ export async function buildRepairContext(
         .map((e) => e.path.replace(/^\.\//u, ""));
     } catch (error) {
       if (signal.aborted) throw error;
+      if (error instanceof DevflowError && error.code === "EXECUTION_BUDGET_EXCEEDED") throw error;
     }
   const diagnosticResolution = resolveRepairDiagnostics(
     diagnosticText,
@@ -290,18 +296,13 @@ export async function buildRepairContext(
     manifestComplete,
   );
   const resolvedDiagnostics = diagnosticResolution.resolved;
-  const changedFiles = [
-    ...new Set([
-      ...resolvedDiagnostics.map((d) => d.path),
-      ...(options.additionalSources?.map((source) => source.path) ?? []),
-      ...status.files.map(({ path }) => path.split(" -> ").at(-1) ?? path).filter(isUsefulTextPath),
-    ]),
-  ]
-    .filter(graphPathAllowed)
-    .slice(0, RELEVANT_FILE_LIMIT);
+  const changedFiles = repairContextSourcePaths({
+    resolution: diagnosticResolution,
+    changedPaths,
+    ...(options.additionalSources ? { additionalSources: options.additionalSources } : {}),
+  });
   const relevantFiles = await Promise.all(
     changedFiles.map(async (path) => {
-      options.beforeOperation?.();
       try {
         const section = diff.patch.split(`+++ b/${path}`)[1]?.split(/^diff --git /mu)[0] ?? "";
         const changedLine =
@@ -309,6 +310,24 @@ export async function buildRepairContext(
           options.additionalSources?.find((source) => source.path === path)?.line ??
           Number(section.match(/^@@ [^+]*\+(\d+)/mu)?.[1] ?? 1);
         const startLine = Math.max(1, changedLine - 8);
+        const cached = options.sourceCache?.source(sandbox, path);
+        if (cached) {
+          const lines = cached.content.split("\n");
+          const selected: string[] = [];
+          let bytes = 0;
+          const maxBytes = Math.min(6000, Math.floor(6400 / Math.max(1, changedFiles.length)));
+          for (const line of lines.slice(startLine - 1, startLine + 79)) {
+            const next = Buffer.byteLength(line) + (selected.length ? 1 : 0);
+            if (bytes + next > maxBytes) break;
+            selected.push(line);
+            bytes += next;
+          }
+          const endLine = Math.max(startLine, startLine + selected.length - 1);
+          const partial = startLine > 1 || endLine < lines.length || !selected.length;
+          return `--- ${path}:${startLine}..${endLine} SHA=${cached.contentHash}${partial ? " (partial)" : ""}\n${selected.join("\n")}`;
+        }
+        options.beforeOperation?.();
+        executions++;
         const file = await sandbox.readFile(
           {
             path,
@@ -318,13 +337,18 @@ export async function buildRepairContext(
           },
           signal,
         );
+        if (file.fileSha256) options.sourceCache?.rememberIdentity(sandbox, path, file.fileSha256);
         return `--- ${file.path}:${file.startLine ?? startLine}..${file.endLine ?? "unknown"} SHA=${file.fileSha256 ?? "unavailable"}${file.truncated ? " (partial)" : ""}\n${file.content}`;
       } catch (error) {
+        if (
+          signal.aborted ||
+          (error instanceof DevflowError && error.code === "EXECUTION_BUDGET_EXCEEDED")
+        )
+          throw error;
         return `--- ${path}\n[unreadable: ${errorMessage(error)}]`;
       }
     }),
   );
-  executions += changedFiles.length;
   const currentSources: RepairContext["currentSources"] = relevantFiles.flatMap((text, i) => {
     const match = text.match(/^--- .*?:(\d+)\.\.(\d+) SHA=([a-f0-9]{64})([^\n]*)\n([\s\S]*)$/u);
     return match

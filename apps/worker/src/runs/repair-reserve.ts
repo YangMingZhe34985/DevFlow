@@ -1,4 +1,8 @@
 import { estimateModelInput } from "@devflow/agent";
+import {
+  estimateOperationPlan,
+  type ResourceBudgetOperationPlan,
+} from "./resource-budget-scheduler.js";
 
 /** A projection, not consumption. Actual serialized requests are rechecked at dispatch. */
 export function repairContinuationReserve(input: {
@@ -35,9 +39,44 @@ export function repairContinuationReserve(input: {
     }) + 3072;
   const repairInput =
     estimate({ task, diagnosticTasks: input.diagnostics, currentSource: input.source }) + 3072;
-  const review = reviewInput + input.reviewOutput;
-  const recovery = input.reviewRecoveryAvailable ? recoveryInput + input.reviewOutput : 0;
-  const repair = input.includeRepair ? repairInput + input.repairOutput : 0;
+  const projectedRequest = (
+    id: string,
+    inputTokens: number,
+    outputTokens: number,
+    enabled = true,
+  ): ResourceBudgetOperationPlan => ({
+    kind: "OPERATION",
+    id,
+    requirement: "REQUIRED",
+    state: enabled ? "PENDING" : "COMPLETED",
+    resources: { inputTokens, outputTokens, modelCalls: 1, steps: 1 },
+  });
+  const reviewOperation = projectedRequest(
+    "review:current-projection",
+    reviewInput,
+    input.reviewOutput,
+  );
+  const recoveryOperation = projectedRequest(
+    "review:bounded-recovery",
+    recoveryInput,
+    input.reviewOutput,
+    input.reviewRecoveryAvailable,
+  );
+  // Legacy field names remain readable. This is a decision in the existing Coding Session.
+  const codingOperation = projectedRequest(
+    "coding:resumed-decision",
+    repairInput,
+    input.repairOutput,
+    input.includeRepair,
+  );
+  const operationPlan: ResourceBudgetOperationPlan = {
+    kind: "SEQUENCE",
+    id: "coding:downstream-continuation",
+    operations: [codingOperation, reviewOperation, recoveryOperation],
+  };
+  const review = estimateOperationPlan(reviewOperation).resources.tokens;
+  const recovery = estimateOperationPlan(recoveryOperation).resources.tokens;
+  const repair = estimateOperationPlan(codingOperation).resources.tokens;
   return {
     kind: "DOWNSTREAM_ESTIMATE" as const,
     branch: input.includeRepair ? "REPLAN_THEN_REPAIR" : "CURRENT_REPAIR",
@@ -49,7 +88,8 @@ export function repairContinuationReserve(input: {
     review,
     recovery,
     repair,
-    total: review + recovery + repair,
+    total: estimateOperationPlan(operationPlan).resources.tokens,
+    operationPlan,
     accounting: "RESERVE_ONLY_RECHECK_ACTUAL_REQUEST" as const,
   };
 }

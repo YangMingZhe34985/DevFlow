@@ -83,35 +83,3 @@ export function replanSource(input: {
     },
   };
 }
-
-/** Reservations are capacity checks, not tool consumption. Physical IO is charged once. */
-export function replanOperationReserve(
-  oldPaths: number,
-  publicChecks: number,
-  knownManifest: boolean,
-  actual?: {
-    changedPaths: number;
-    sourceReads: number;
-    candidatePaths: number;
-    cachedReads?: number;
-  },
-) {
-  const changed = actual?.changedPaths ?? oldPaths;
-  const operations = {
-    sourceReads: Math.min(8, Math.max(0, (actual?.sourceReads ?? 8) - (actual?.cachedReads ?? 0))),
-    metadata: knownManifest ? 0 : Math.min(8, actual?.candidatePaths ?? 8),
-    checkpoint: 3 + 2 * changed,
-    checkpointRestore: 2 + 3 * changed,
-    repairContext: 2 + Math.min(8, actual?.candidatePaths ?? oldPaths + 2),
-    editCorrectionFinish: 3,
-    publicChecks: 1 + Math.max(1, publicChecks),
-    reviewReads: 8, // diff, bounded six source reads, final candidate capture
-  };
-  const downstream =
-    operations.checkpointRestore +
-    operations.repairContext +
-    operations.editCorrectionFinish +
-    operations.publicChecks +
-    operations.reviewReads;
-  return { operations, downstream, total: Object.values(operations).reduce((a, b) => a + b, 0) };
-}

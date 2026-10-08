@@ -167,6 +167,8 @@ export interface RunContext {
   closingReadPaths?(): readonly string[];
   validateFinishPhase?(input: unknown): string | undefined;
   authorizeTool?(request: ToolExecutionRequest): string | DevflowErrorShape | undefined;
+  /** Persist logical admission even for cached, denied and control calls; physical IO is separate. */
+  beforeToolCall?(stepId: StepId, call: ModelToolCall): Promise<void>;
   /** Checkpoint host admission before tools run; older checkpoints must not imply unused quota. */
   hostToolState?: {
     restore(value: Record<string, unknown> | undefined, resumed: boolean): void;
@@ -1101,6 +1103,19 @@ export class DefaultAgentRuntime implements AgentRuntime {
               messages: projectedMessages,
               tools: availableTools,
               ...(request.modelSettings === undefined ? {} : { settings: request.modelSettings }),
+              ...(request.continuationReserve
+                ? {
+                    resourceContinuation: (() => {
+                      const next = request.continuationReserve!(budgetOperation());
+                      return {
+                        tokens: next.tokens,
+                        steps: next.steps,
+                        logicalToolCalls: request.continuationTools?.(budgetOperation()) ?? 0,
+                        timeMs: next.timeMs,
+                      };
+                    })(),
+                  }
+                : {}),
             };
             state = await checkpoint(context, {
               ...state,
@@ -2057,6 +2072,7 @@ async function executeToolBatch(
   for (let index = 0; index < calls.length; index += 1) {
     const call = calls[index];
     if (call?.name !== "finishPhase") continue;
+    await context.beforeToolCall?.(stepId, call);
     const summary = finishSummary(call);
     const priorSucceeded = results
       .slice(0, index)
@@ -2148,6 +2164,7 @@ async function executeOneTool(
   observe: (result: ExecutedToolCall) => Promise<void>,
 ): Promise<ExecutedToolCall> {
   const startedAt = Date.now();
+  await context.beforeToolCall?.(stepId, call);
   context.postPatch?.toolStarted(call.name);
   const result = await executeOneToolInner(call, metadata, stepId, context, signal, state);
   await observe(result);

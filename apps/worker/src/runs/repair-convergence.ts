@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { DevflowError, type RunResult } from "@devflow/shared";
 import type { SandboxSession } from "@devflow/sandbox";
+import type { CurrentSourceCache } from "./current-source-cache.js";
 
 /** Only recognized reporter timing fields; behavior, IDs, positions and values stay verbatim. */
 export function stableFailureStream(text: string): string {
@@ -47,19 +48,28 @@ export async function repairSourceIdentity(
   paths: readonly string[],
   signal: AbortSignal,
   beforeRead: () => void,
+  sourceCache?: CurrentSourceCache,
 ) {
   if (!paths.length) return undefined;
   const rows: [string, string][] = [];
   for (const path of [...new Set(paths)].sort()) {
+    const cached = sourceCache?.identity(sandbox, path);
+    if (cached) {
+      rows.push([path, cached]);
+      continue;
+    }
     beforeRead();
     try {
       const file = await sandbox.readFile({ path, maxBytes: 1 }, signal);
       if (!file.fileSha256) return undefined;
       rows.push([path, file.fileSha256]);
+      sourceCache?.rememberIdentity(sandbox, path, file.fileSha256);
     } catch (error) {
       if (signal.aborted) throw error;
-      if (error instanceof DevflowError && error.code === "NOT_FOUND") rows.push([path, "ABSENT"]);
-      else return undefined;
+      if (error instanceof DevflowError && error.code === "NOT_FOUND") {
+        rows.push([path, "ABSENT"]);
+        sourceCache?.rememberIdentity(sandbox, path, "ABSENT");
+      } else return undefined;
     }
   }
   return createHash("sha256").update(JSON.stringify(rows)).digest("hex");

@@ -66,6 +66,29 @@ const WorkerEnvironmentSchema = z.object({
     .default(2048),
   DEVFLOW_MAX_MODEL_CALLS: optionalPositiveInteger,
   DEVFLOW_MAX_TOOL_CALLS: optionalPositiveInteger,
+  DEVFLOW_MAX_TOOL_EXECUTIONS: optionalPositiveInteger,
+  DEVFLOW_MAX_IO_BYTES: optionalPositiveInteger,
+  DEVFLOW_MAX_COST_MICROS: optionalPositiveInteger,
+  DEVFLOW_MODEL_PRICES_JSON: optionalString.refine((value) => {
+    if (!value) return true;
+    try {
+      const parsed: unknown = JSON.parse(value);
+      return (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        Object.values(parsed).every((rate: unknown) => {
+          if (!rate || typeof rate !== "object") return false;
+          const values = rate as Record<string, unknown>;
+          return [values.inputMicrosPerMillionTokens, values.outputMicrosPerMillionTokens].every(
+            (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0,
+          );
+        })
+      );
+    } catch {
+      return false;
+    }
+  }, "Model prices must be a JSON object of nonnegative integer input/output micros per million tokens."),
   DEVFLOW_MAX_TOTAL_TOKENS: z.coerce.number().int().positive().default(250_000),
   DEVFLOW_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(1_500_000),
   DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(240_000),

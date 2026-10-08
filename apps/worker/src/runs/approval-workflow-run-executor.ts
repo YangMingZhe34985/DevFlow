@@ -1,4 +1,10 @@
 import { ContinuationTools } from "./continuation-tools.js";
+import { ResourceBudgetScheduler } from "./resource-budget-scheduler.js";
+import {
+  ResourceBudgetRuntime,
+  resourceBudgetContext,
+  type ModelResourcePrice,
+} from "./resource-budget-runtime.js";
 import { CodingSession, codingMetricDelta } from "./coding-session.js";
 import {
   codingContinuationReserve,
@@ -7,7 +13,8 @@ import {
   codingReplanReserve,
 } from "./coding-budget.js";
 import { repairContinuationReserve } from "./repair-reserve.js";
-import { repairDiagnosticTasks } from "./repair-tasks.js";
+import { repairContextSourcePaths, repairDiagnosticTasks } from "./repair-tasks.js";
+import { CurrentSourceCache } from "./current-source-cache.js";
 import {
   ScopeReplanStateSchema,
   approvedPlanIdentity,
@@ -284,20 +291,93 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
   async execute(run: RunExecutionRecord, signal: AbortSignal): Promise<RunExecutionOutcome> {
     const trace = new EfficiencyTrace();
     const execute = async (): Promise<RunExecutionOutcome> => {
-      try {
-        return await this.executeObserved(run, signal);
-      } finally {
-        if (this.environment.DEVFLOW_EFFICIENCY_TRACE_ENABLED)
-          await this.safeFlush("efficiency-trace", async () =>
-            this.database.artifacts.create({
-              runId: run.id,
-              kind: "OTHER",
-              name: "efficiency-trace.json",
-              mimeType: "application/json",
-              content: JSON.stringify(trace.report()),
-            }),
-          );
-      }
+      if (run.currentStage === "PUSH" || run.currentStage === "CREATE_PR")
+        return this.executeObserved(run, signal);
+      const store = this.database.budgetLedgers;
+      if (!store)
+        throw new DevflowError({
+          code: "CONFLICT",
+          message:
+            "A durable resource budget ledger is required. Test adapters must explicitly provide a budget store.",
+        });
+      const limits = await benchmarkSandboxLimits(this.database, run.id);
+      const timing = await initialWorkflowTiming(
+        this.database,
+        run.id,
+        this.environment.DEVFLOW_TIMEOUT_MS,
+        limits?.timeoutMs,
+      );
+      const prior = await initialWorkflowMetrics(this.database, run);
+      if (
+        this.environment.DEVFLOW_MAX_COST_MICROS !== undefined &&
+        prior.modelCalls > 0 &&
+        !(await store.get(run.id))
+      )
+        throw new DevflowError({
+          code: "CONFLICT",
+          message:
+            "LEGACY_COST_UNCONFIRMED: cannot initialize a cost-limited ledger from historical token metrics without verified historical cost.",
+          details: { requestIssued: false },
+        });
+      const scheduler = await ResourceBudgetScheduler.open({
+        runId: run.id,
+        store,
+        startedAt: timing.startedAt,
+        deadlineAt: timing.deadlineAt,
+        limits: {
+          tokens: this.environment.DEVFLOW_MAX_TOTAL_TOKENS,
+          modelCalls:
+            this.environment.DEVFLOW_MAX_MODEL_CALLS ??
+            run.maxSteps + 2 * (run.maxReviewRetries + 2),
+          logicalToolCalls:
+            this.environment.DEVFLOW_MAX_TOOL_CALLS ?? Math.max(12, 3 * run.maxSteps),
+          steps: run.maxSteps,
+          timeMs: timing.timeoutMs,
+          ...(this.environment.DEVFLOW_MAX_TOOL_EXECUTIONS === undefined
+            ? {}
+            : { toolExecutions: this.environment.DEVFLOW_MAX_TOOL_EXECUTIONS }),
+          ...(this.environment.DEVFLOW_MAX_IO_BYTES === undefined
+            ? {}
+            : { ioBytes: this.environment.DEVFLOW_MAX_IO_BYTES }),
+          ...(this.environment.DEVFLOW_MAX_COST_MICROS === undefined
+            ? {}
+            : { costMicros: this.environment.DEVFLOW_MAX_COST_MICROS }),
+        },
+        initialConsumed: {
+          tokens: prior.tokenUsage.totalTokens,
+          inputTokens: prior.tokenUsage.inputTokens,
+          outputTokens: prior.tokenUsage.outputTokens,
+          modelCalls: prior.modelCalls,
+          logicalToolCalls: prior.toolCalls,
+          toolExecutions: prior.toolExecutions ?? 0,
+          steps: prior.steps,
+        },
+      });
+      const runtime = new ResourceBudgetRuntime(scheduler, async (payload) => {
+        await this.database.events.append({
+          runId: run.id,
+          type: "WORKFLOW_CHECKPOINT",
+          occurredAt: new Date().toISOString(),
+          payload: asJson(payload),
+        });
+      });
+      return resourceBudgetContext.run(runtime, async () => {
+        try {
+          return await this.executeObserved(run, signal);
+        } finally {
+          await runtime.flush();
+          if (this.environment.DEVFLOW_EFFICIENCY_TRACE_ENABLED)
+            await this.safeFlush("efficiency-trace", async () =>
+              this.database.artifacts.create({
+                runId: run.id,
+                kind: "OTHER",
+                name: "efficiency-trace.json",
+                mimeType: "application/json",
+                content: JSON.stringify(trace.report()),
+              }),
+            );
+        }
+      });
     };
     return this.environment.DEVFLOW_EFFICIENCY_TRACE_ENABLED
       ? this.traces.run(trace, execute)
@@ -388,7 +468,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       await ensureLocalRunSnapshot(this.database, run, planSignal);
       const planningSnapshot = await requireLocalRunSnapshot(this.database, run);
       await this.observeSpan(run.id, "snapshot_load_or_capture", snapshotStarted);
-      const planningSource = planningSnapshot
+      const rawPlanningSource = planningSnapshot
         ? planningSnapshotSource(planningSnapshot)
         : await githubRepositorySource(
             {
@@ -398,6 +478,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             },
             planSignal,
           );
+      const planningSource =
+        resourceBudgetContext
+          .getStore()
+          ?.source(rawPlanningSource, planningSnapshot !== undefined) ?? rawPlanningSource;
       const planningBaseCommit = run.task.baseCommitSha ?? planningSnapshot?.sourceHead;
       if (!planningBaseCommit)
         throw new DevflowError({
@@ -573,7 +657,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               signal: querySignal,
               tokenBudget: 6000,
             }),
-          onRequest: async () => {
+          onRequest: async (request) => {
+            request.resourceContinuation = { tokens: localizationBudget.downstream };
             planBudget!.assertWithinLimits("PLAN", metrics);
             // Leave one PLAN, one EXECUTE and one REVIEW decision available.
             if (planBudget!.remainingAgentSteps <= 3)
@@ -662,7 +747,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         GenerateStructuredOutputInput<unknown>,
         "onRequest" | "onResponse" | "onGenerationError"
       > = {
-        onRequest: async ({ purpose, formatRepair }) => {
+        onRequest: async ({ purpose, formatRepair, request }) => {
+          request.resourceContinuation = {
+            tokens: localizationBudget.execute + localizationBudget.continuation.total,
+          };
           planBudget?.assertWithinLimits("PLAN", metrics);
           ensureStructuredStepCapacity(metrics, "PLAN");
           planBudget?.requireAgentSteps("PLAN");
@@ -1064,6 +1152,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       await this.observeSpan(run.id, "checkout_and_sandbox_prepare", prepareStarted);
       const efficiencyTrace = this.traces.getStore();
       if (efficiencyTrace) sandbox = efficiencyTrace.sandbox(sandbox);
+      sandbox = resourceBudgetContext.getStore()?.sandbox(sandbox) ?? sandbox;
       // Only the fixed host source-capture script may use this read-only path.
       // Generic Agent exec still invalidates revisions because it can write files.
       const probeCaptureSandbox = sandbox;
@@ -1084,11 +1173,86 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           benchmark?.configuration.runtime.publicVerificationProfile ??
           this.verificationProfileFactory?.(run),
       };
+      const currentSourceCache = new CurrentSourceCache(activeSandbox);
       const continuation = new ContinuationTools(
         plan.approvalScope?.files.map((f) => f.path) ?? [],
+        currentSourceCache,
+        activeSandbox,
       );
       let scopeReplan: ScopeReplanState | undefined;
       let continuationRecoveryAvailable = true;
+      const publicCheckIds = () =>
+        testCommandCache.profile?.checks.map((check, index) => `${index}:${check.kind}`) ?? [
+          "test",
+        ];
+      const continuationToolCapacity = (
+        operation: CodingBudgetOperation,
+        observeIdentity: boolean,
+        prospectiveEditPaths: readonly string[] = [],
+      ) => {
+        const finalization = continuation.finalization(publicCheckIds().length, {
+          observeIdentity,
+          prospectiveEditPaths,
+          ...(scopeReplan
+            ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
+            : {}),
+        });
+        if (operation === "SUBMIT_CURRENT" || scopeReplan) return finalization.total;
+        // Unknown targets retain only a named minimum investigation branch. At an actual
+        // conflict the concrete diagnostic/source operation list replaces this estimate.
+        const investigation = continuation.operationPlan({
+          sourceReadPaths: ["<unresolved-candidate>", "<public-failure-source>"],
+          metadataPaths: localSnapshot ? [] : ["<unresolved-candidate>"],
+          repairContextPaths: ["<unresolved-candidate>", "<public-failure-source>"],
+          prospectiveEditPaths,
+          publicChecks: publicCheckIds(),
+          publicProfileDiscovered: testCommandCache.profile !== undefined,
+          correctionAvailable: !codingSession.state?.executionRecovery?.used,
+          review: {
+            requiredSourcePaths: continuation.prospectiveChanges(prospectiveEditPaths).after,
+            candidateCaptureRequired: true,
+          },
+        });
+        // Both branches contain mandatory validation/Review once; neither is a second consumption.
+        return Math.max(finalization.total, investigation.requiredToolCalls);
+      };
+      const admitCodingEdit =
+        (observeIdentity: boolean) => (request: ToolExecutionRequest, remainingTools: number) => {
+          if (!["replaceText", "applyPatch", "writeFile"].includes(request.name)) return undefined;
+          const paths = requestPaths(request);
+          const after = continuation.finalization(publicCheckIds().length, {
+            observeIdentity,
+            prospectiveEditPaths: paths,
+            ...(scopeReplan
+              ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
+              : {}),
+          });
+          // Current edit, its host diff check and finish; an unused correction needs its own
+          // edit + diff. The candidate checkpoint includes newly changed files before admission.
+          const required = Math.max(
+            continuationToolCapacity("CODING", observeIdentity, paths),
+            after.total + 3 + (codingSession.state?.executionRecovery?.used ? 0 : 2),
+          );
+          if (remainingTools >= required) return undefined;
+          return new DevflowError({
+            code: "EXECUTION_BUDGET_EXCEEDED",
+            message:
+              "CODING_EDIT_RESERVE_INSUFFICIENT: this edit would leave insufficient capacity for candidate capture, submission and mandatory validation.",
+            details: asJson({
+              requestIssued: false,
+              operation: request.name,
+              paths,
+              prospectiveChanges: continuation.prospectiveChanges(
+                paths,
+                scopeReplan?.files.map((file) => file.path),
+              ),
+              remainingToolCalls: remainingTools,
+              requiredToolCalls: required,
+              missing: required - remainingTools,
+              operations: after.operations,
+            }),
+          }).toJSON();
+        };
       const continuationReserve = (operation: CodingBudgetOperation = "CODING") => {
         const source = JSON.stringify(
           [...continuation.current.values()].map((f) => ({
@@ -1225,6 +1389,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           ],
           signal: executionSignal,
           beforeRead: replanTool,
+          sourceCache: currentSourceCache,
         });
         repairAttempt = scopeReplan.repairAttempts;
         reviewAttempt = scopeReplan.reviewAttempts;
@@ -1821,23 +1986,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           purpose: "IMPLEMENTATION",
           ...(plan.proposalVersion
             ? {
-                continuationTools: (operation) =>
-                  operation === "SUBMIT_CURRENT"
-                    ? continuation.finalization(testCommandCache.profile?.checks.length ?? 1, {
-                        observeIdentity: false,
-                        ...(scopeReplan
-                          ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
-                          : {}),
-                      }).total
-                    : scopeReplan
-                      ? continuation.afterReplan(
-                          testCommandCache.profile?.checks.length ?? 1,
-                          scopeReplan.files.map((file) => file.path),
-                        ).total
-                      : continuation.reserve(
-                          testCommandCache.profile?.checks.length ?? 1,
-                          !!localSnapshot,
-                        ).total,
+                continuationTools: (operation = "CODING") =>
+                  continuationToolCapacity(operation, false),
+                beforeToolAdmission: admitCodingEdit(false),
                 continuationReserve,
                 onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
@@ -1957,6 +2108,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         const testStartedAt = Date.now();
         budget.requireToolCalls("TEST", metrics);
         continuation.current.clear(); // Public commands can invalidate prior source observations.
+        currentSourceCache.invalidate();
         const result = await this.runTests(
           run,
           activeSandbox,
@@ -1968,6 +2120,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             budget.requireToolCalls("TEST", metrics, executions + 1);
             return budget.remainingTimeoutMs("TEST");
           },
+          `test:${repairAttempt}:review:${reviewAttempt}:coding-step:${codingSession.state?.stepCount ?? 0}`,
         );
         verification.test = result.skipped
           ? "SKIPPED"
@@ -1978,6 +2131,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           calls: result.toolExecutions,
           executions: result.toolExecutions,
           latencyMs: result.durationMs,
+          alreadyAccounted: result.logicalWorkAccounted ?? false,
         });
         addStageWallLatency(metrics, "TEST", Date.now() - testStartedAt);
         budget.assertWithinLimits("TEST", metrics);
@@ -2026,6 +2180,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             budget.requireToolCalls("REPAIR", metrics);
             recordToolWork(metrics, "REPAIR", { calls: 1, executions: 1 });
           },
+          currentSourceCache,
         );
       const preventRepeatedFailedVerification = (repair: RunResult, previous: CommandResult) => {
         const ids = repairIdentities.get(repair);
@@ -2065,7 +2220,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             complete: !listing.truncated,
           };
         }
-        return { repositoryManifest: repairManifest, beforeOperation };
+        return {
+          repositoryManifest: repairManifest,
+          beforeOperation,
+          sourceCache: currentSourceCache,
+        };
       };
       const continueCoding = async (
         purpose: "TEST_REPAIR" | "REVIEW_REPAIR",
@@ -2133,23 +2292,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           purpose,
           ...(plan.proposalVersion
             ? {
-                continuationTools: (operation) =>
-                  operation === "SUBMIT_CURRENT"
-                    ? continuation.finalization(testCommandCache.profile?.checks.length ?? 1, {
-                        observeIdentity: true,
-                        ...(scopeReplan
-                          ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
-                          : {}),
-                      }).total
-                    : scopeReplan
-                      ? continuation.afterReplan(
-                          testCommandCache.profile?.checks.length ?? 1,
-                          scopeReplan.files.map((file) => file.path),
-                        ).total
-                      : continuation.reserve(
-                          testCommandCache.profile?.checks.length ?? 1,
-                          !!localSnapshot,
-                        ).total,
+                continuationTools: (operation = "CODING") =>
+                  continuationToolCapacity(operation, true),
+                beforeToolAdmission: admitCodingEdit(true),
                 continuationReserve: (operation) => {
                   const reserve = continuationReserve(operation);
                   return { ...reserve, tokens: Math.max(reserve.tokens, finalReviewTokens) };
@@ -2204,6 +2349,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ],
             baseCommitSha: scopeReplan.baseCommitSha,
             signal: executionSignal,
+            sourceCache: currentSourceCache,
             beforeRead: () => {
               budget.requireToolCalls("REPAIR", metrics);
               recordToolWork(metrics, "REPAIR", { calls: 1, executions: 1 });
@@ -2289,18 +2435,65 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           completion,
         });
         const preparationPaths = preparationPlan.readPaths;
-        const requiredReads = preparationPaths.filter((p) => !continuation.current.has(p)).length;
+        const requiredReads = preparationPaths.filter(
+          (p) => !continuation.current.has(p) && !currentSourceCache.source(activeSandbox, p),
+        ).length;
         if (requiredReads > 8)
           throw new DevflowError({
             code: "EXECUTION_BUDGET_EXCEEDED",
             message: "REPLAN_REQUIRED_READS_EXCEED_SHARED_ALLOWANCE",
             details: { requestIssued: false, requiredReads, availableReads: 8 },
           });
-        const toolReserve = continuation.reserve(
-          testCommandCache.profile?.checks.length ?? 1,
-          !!localSnapshot,
-          preparationPaths,
-        );
+        const changedPaths = continuation.prospectiveChanges([]).after;
+        const repairContextPaths = repairContextSourcePaths({
+          resolution,
+          additionalSources: preparationPlan.candidates.map((path) => ({ path })),
+          changedPaths,
+        });
+        const operationQuote = continuation.operationPlan({
+          sourceReadPaths: preparationPaths,
+          metadataPaths: localSnapshot ? [] : preparationPaths,
+          repairContextPaths,
+          // Only checkpoint contents are restored into a fresh Sandbox and SHA-verified there.
+          cachedRepairContextPaths: repairContextPaths.filter(
+            (path) =>
+              changedPaths.includes(path) &&
+              currentSourceCache.source(activeSandbox, path) !== undefined,
+          ),
+          cachedCheckpointCurrentPaths: changedPaths.filter(
+            (path) =>
+              currentSourceCache.source(activeSandbox, path) ||
+              currentSourceCache.identity(activeSandbox, path) === "ABSENT",
+          ),
+          cachedCheckpointBaselinePaths: changedPaths.filter(
+            (path) =>
+              currentSourceCache.baseline(activeSandbox, scopeReplan!.baseCommitSha, path) !==
+              undefined,
+          ),
+          baseHeadVerified: currentSourceCache.head(activeSandbox) === scopeReplan.baseCommitSha,
+          publicChecks: publicCheckIds(),
+          publicProfileDiscovered: testCommandCache.profile !== undefined,
+          correctionAvailable: !codingSession.state?.executionRecovery?.used,
+          review: {
+            requiredSourcePaths: [...new Set([...oldPaths, ...requestedPaths])].slice(0, 6),
+            candidateCaptureRequired: true,
+          },
+        });
+        await resourceBudgetContext.getStore()?.check(operationQuote.plan, "replan-preparation");
+        const toolReserve = {
+          total: operationQuote.requiredToolCalls,
+          downstream: operationQuote.downstreamToolCalls,
+          operations: {
+            sourceReads: operationQuote.byPhase.evidence ?? 0,
+            metadata: operationQuote.byPhase.metadata ?? 0,
+            checkpoint: operationQuote.byPhase.checkpoint ?? 0,
+            checkpointRestore: operationQuote.byPhase.restore ?? 0,
+            repairContext: operationQuote.byPhase["repair-context"] ?? 0,
+            editCorrectionFinish: operationQuote.byPhase.coding ?? 0,
+            publicChecks: operationQuote.byPhase.validation ?? 0,
+            reviewReads: operationQuote.byPhase.review ?? 0,
+          },
+        };
 
         const remainingTools = budget.remainingToolCalls(metrics);
         const navigationReads = Math.min(
@@ -2328,6 +2521,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               remainingToolCalls: remainingTools,
               requiredToolCalls: toolReserve.total,
               operations: toolReserve.operations,
+              operationPlan: operationQuote.plan,
+              requiredToolExecutions: operationQuote.requiredToolExecutions,
+              repairContextPaths,
               preparationPaths,
               omittedTestPaths: preparationPlan.omittedTestPaths,
               navigationReads,
@@ -2435,6 +2631,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           async () => {
             await saveScopeReplan();
           },
+          currentSourceCache,
         );
         for (const [path, file] of continuation.current) evidenceReader.files.set(path, file);
         const verifyAdmission = () =>
@@ -2610,8 +2807,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         const planner = this.modelFactory
           ? implementationModel
           : this.createModel(run, benchmark?.configuration.modelParameters, "PLANNER");
-        guardedPrepareTool();
-        const base = await git.head(activeSandbox, executionSignal);
+        let base = currentSourceCache.head(activeSandbox);
+        if (!base) {
+          guardedPrepareTool();
+          base = await git.head(activeSandbox, executionSignal);
+          currentSourceCache.rememberHead(activeSandbox, base);
+        }
         scopeReplan.baseCommitSha = base;
         await saveScopeReplan(); // Consume the one workflow allowance before any Planner request.
         await this.database.runs.transition({
@@ -2633,6 +2834,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           baseCommitSha: base,
           signal: executionSignal,
           beforeRead: guardedPrepareTool,
+          sourceCache: currentSourceCache,
         });
         Object.assign(scopeReplan, candidate);
         await saveScopeReplan();
@@ -2812,7 +3014,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               allowOptionalNavigation: lease.permitted,
             };
           },
-          onRequest: async ({ purpose, formatRepair, preflight }) => {
+          onRequest: async ({ purpose, formatRepair, preflight, request }) => {
+            request.resourceContinuation = { tokens: downstreamTokens };
             budget.requireAgentSteps("PLAN");
             budget.requireModelCall("PLAN", metrics);
             if (budget.remainingTotalTokens(metrics) < preflight.requiredTokens + downstreamTokens)
@@ -4438,6 +4641,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     continuationTools?: AgentRunRequest["continuationTools"];
     continuationReserve?: AgentRunRequest["continuationReserve"];
     onToolObservation?: (name: string, result: ToolExecutionResult) => void;
+    beforeToolAdmission?: (
+      request: ToolExecutionRequest,
+      remainingTools: number,
+    ) => ReturnType<DevflowError["toJSON"]> | undefined;
     convergenceReserve?: {
       downstreamSteps: number;
       downstreamTokens: number;
@@ -4461,6 +4668,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     const priorState = input.codingSession?.state;
     const priorMetrics = priorState?.finalResult?.metrics;
     const sessionSteps = priorState?.stepCount ?? 0;
+    let phaseToolExecutions = priorState?.metrics.toolCalls ?? 0;
     const sessionBudget = input.codingSession
       ? {
           ...input.executionBudget,
@@ -4868,6 +5076,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                   for (const path of paths) {
                     const prior = input.currentSources?.find((s) => s.path === path);
                     const startLine = prior?.startLine ?? 1;
+                    await resourceBudgetContext
+                      .getStore()
+                      ?.logicalTool(
+                        `coding-recovery:${input.run.id}:${input.codingSession?.state?.stepCount ?? sessionSteps}:${path}`,
+                      );
                     reads++;
                     const current = await input.sandbox.readFile(
                       { path, startLine, endLine: startLine + 159, maxBytes: 16 * 1024 },
@@ -4912,6 +5125,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
         signal: input.signal,
         tools: phaseTools,
+        beforeToolCall: async (stepId, call) => {
+          await resourceBudgetContext.getStore()?.logicalTool(`${stepId}:${call.id}`);
+        },
         ...(input.purpose === "IMPLEMENTATION"
           ? {}
           : {
@@ -4927,7 +5143,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         closingReadPaths: () =>
           targetScope.targets.filter((path) => !versions.has(path) || stalePaths.has(path)),
         ...(input.codingSession
-          ? { stateStore: input.codingSession }
+          ? {
+              stateStore:
+                resourceBudgetContext.getStore()?.stateStore(input.codingSession) ??
+                input.codingSession,
+            }
           : input.purpose === "IMPLEMENTATION"
             ? {}
             : {
@@ -4975,6 +5195,17 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                   ? "Tool is not available in this phase."
                   : (publicReadDenial(request) ??
                     proposalMutationDenial(input.plan, request.name, requestPaths(request)) ??
+                    input.beforeToolAdmission?.(
+                      request,
+                      Math.max(
+                        0,
+                        sessionBudget.maxToolCalls -
+                          Math.max(
+                            input.codingSession?.state?.metrics.toolCalls ?? 0,
+                            phaseToolExecutions,
+                          ),
+                      ),
+                    ) ??
                     postPatch?.authorize(request.name, requestPaths(request)) ??
                     prePatch?.authorize(request) ??
                     exploration?.authorize(request.name, request.input)),
@@ -5011,6 +5242,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           });
         },
         executeTool: async (stepId, request: ToolExecutionRequest, toolSignal = input.signal) => {
+          phaseToolExecutions =
+            Math.max(phaseToolExecutions, input.codingSession?.state?.metrics.toolCalls ?? 0) + 1;
           if (request.name === "queryRelations" && relationGraph) {
             const parsed = relationTool.inputSchema.safeParse(request.input);
             if (!parsed.success)
@@ -5413,6 +5646,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       () => {
         if (phaseResult.metrics.toolCalls + checks + 1 > input.executionBudget.maxToolCalls)
           throw new Error("REPAIR_EVIDENCE_BUDGET_INSUFFICIENT: current citation read not issued");
+        // Citation verification is a host logical read; the wrapped physical read
+        // drains this persisted admission before accessing the Sandbox.
+        resourceBudgetContext.getStore()?.enqueueLogical(1);
         checks++;
       },
       input.reviewFindingIds,
@@ -5565,7 +5801,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     commandCache: TestCommandCache,
     expectedStage: "EXECUTE" | "FIX",
     beforeCommand?: (executions: number) => number,
+    validationCycleId?: string,
   ): Promise<WorkflowTestResult> {
+    const resourceRuntime = resourceBudgetContext.getStore();
+    // Test repair and Review repair have separate persisted retry counters. A Review
+    // repair may legitimately retest at the same public test-attempt number.
+    const validationOperationId = `host-validation:${run.id}:${attempt}:${expectedStage}:${validationCycleId ?? "legacy"}`;
     await this.database.runs.transition({
       runId: run.id,
       expectedStatus: "RUNNING",
@@ -5583,8 +5824,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     const discoveryStarted = Date.now();
     if (!commandCache.detected) {
       if (!commandCache.profile && !commandCache.command) {
-        beforeCommand?.(0);
-        const discovered = await discoverPublicVerification(sandbox, signal, beforeCommand);
+        const discovered = await discoverPublicVerification(sandbox, signal, async (n) => {
+          beforeCommand?.(n);
+          await resourceRuntime?.logicalTool(`${validationOperationId}:discovery:${n}`);
+        });
         commandCache.profile = discovered.profile;
         detectionExecutions = discovered.toolExecutions;
       }
@@ -5609,9 +5852,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       profile,
       signal,
       timeoutMs: Math.min(this.environment.DEVFLOW_TIMEOUT_MS, 300_000),
-      ...(beforeCommand
-        ? { beforeCommand: (n: number) => beforeCommand(n + detectionExecutions) }
-        : {}),
+      beforeCommand: async (n: number) => {
+        const remaining = beforeCommand?.(n + detectionExecutions) ?? Infinity;
+        await resourceRuntime?.logicalTool(`${validationOperationId}:command:${n}`);
+        return remaining;
+      },
     });
     this.traces.getStore()?.span("TEST_COMMAND", commandStarted, {
       skipped,
@@ -5661,6 +5906,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       command,
       toolExecutions: detectionExecutions + result.toolExecutions,
       publicVerification: result,
+      logicalWorkAccounted: resourceRuntime !== undefined,
     };
   }
 
@@ -5804,6 +6050,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             (!recovery && recoveryUsed < 2
               ? this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS
               : 0);
+          request.resourceContinuation = {
+            tokens: reservedTokens,
+            steps: requiredSteps - 1,
+            modelCalls: requiredSteps - 1,
+            timeMs: reservedTimeMs,
+          };
           const requiredTimeMs = requestTimeoutMs + reservedTimeMs;
           const remainingTimeMs = budget.remainingTimeMs;
           const contextTokens = this.environment.stageModels?.REVIEW?.contextTokens ?? 32000;
@@ -6092,9 +6344,46 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     injected?: LanguageModelPort,
   ): LanguageModelPort {
     const binding = injected ? undefined : resolveStageModel(stage, this.environment, run);
-    const model =
+    const rawModel =
       injected ??
       createConfiguredLanguageModel({ ...binding!.config, ...(parameters ? { parameters } : {}) });
+    const priceKey = `${binding?.provenance.provider ?? "injected"}:${binding?.provenance.model ?? "injected"}`;
+    const prices = this.environment.DEVFLOW_MODEL_PRICES_JSON
+      ? (JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<
+          string,
+          ModelResourcePrice
+        >)
+      : {};
+    const activePrices = injected
+      ? [prices[priceKey]]
+      : (["LOCALIZATION", "PLANNER", "EXECUTE", "REVIEW"] as ModelStage[]).map((activeStage) => {
+          const active = resolveStageModel(activeStage, this.environment, run).provenance;
+          return prices[`${active.provider}:${active.model}`];
+        });
+    const continuationRate = activePrices.every((rate) => rate !== undefined)
+      ? Math.max(
+          ...activePrices.flatMap((rate) => [
+            rate!.inputMicrosPerMillionTokens,
+            rate!.outputMicrosPerMillionTokens,
+          ]),
+        )
+      : undefined;
+    const model =
+      resourceBudgetContext.getStore()?.model(rawModel, {
+        stage,
+        outputTokens: binding?.settings.maxOutputTokens ?? parameters?.maxOutputTokens ?? 8192,
+        timeoutMs:
+          stage === "REVIEW"
+            ? this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS
+            : stage === "PLANNER" || stage === "LOCALIZATION"
+              ? (this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000)
+              : 60000,
+        recoveryTimeoutMs: this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS,
+        ...(prices[priceKey] ? { price: prices[priceKey] } : {}),
+        ...(continuationRate === undefined
+          ? {}
+          : { continuationMicrosPerMillionTokens: continuationRate }),
+      }) ?? rawModel;
     const wrapped = stageLanguageModel({
       model,
       stage,
@@ -6354,6 +6643,7 @@ interface TestCommandCache {
 }
 
 interface WorkflowTestResult extends CommandResult {
+  logicalWorkAccounted?: boolean;
   publicVerification?: PublicVerificationResult;
   skipped: boolean;
   command: TestCommand | undefined;
@@ -6361,6 +6651,15 @@ interface WorkflowTestResult extends CommandResult {
 }
 
 export async function initialWorkflowMetrics(
+  database: DatabaseAdapter,
+  run: RunExecutionRecord,
+): Promise<RunMetrics> {
+  // Replaying durable events hydrates compatibility counters. It must never
+  // re-enqueue the already settled decisions and logical tools into the ledger.
+  return resourceBudgetContext.exit(() => restoreWorkflowMetrics(database, run));
+}
+
+async function restoreWorkflowMetrics(
   database: DatabaseAdapter,
   run: RunExecutionRecord,
 ): Promise<RunMetrics> {

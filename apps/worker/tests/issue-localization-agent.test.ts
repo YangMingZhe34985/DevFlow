@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { randomUUID } from "node:crypto";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import { describe, expect, it, vi } from "vitest";
@@ -900,6 +901,7 @@ it("Worker passes verified localization into PLAN and accounts for its model dec
   ];
   const events: { type: string; payload?: unknown }[] = [];
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     artifacts: {
       list: async () => artifacts,
       create: async (a: { kind: string; name: string; content: string }) => {

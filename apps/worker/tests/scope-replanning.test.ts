@@ -4,6 +4,7 @@ import { DevflowError } from "@devflow/shared";
 import type { SandboxSession } from "@devflow/sandbox";
 import { ContinuationTools } from "../src/runs/continuation-tools.js";
 import { repairSourceIdentity } from "../src/runs/repair-convergence.js";
+import { CurrentSourceCache } from "../src/runs/current-source-cache.js";
 import {
   captureReplanCandidate,
   projectCandidateChange,
@@ -54,6 +55,77 @@ function fixture(current: Record<string, string>, baseline: Record<string, strin
   };
 }
 describe("scope replanning authority and recoverable candidate", () => {
+  it("captures once and reuses verified candidate identities without weakening restoration checks", async () => {
+    const baseline = { "old.ts": "old\r\n", "deleted.ts": "remove\n" };
+    const current = fixture({ "old.ts": "new\r\n", "added.ts": "created\n" }, baseline);
+    const sourceCache = new CurrentSourceCache(current.sandbox);
+    sourceCache.rememberHead(current.sandbox, "a".repeat(40));
+    const beforeRead = vi.fn();
+    const candidate = await captureReplanCandidate({
+      sandbox: current.sandbox,
+      paths: ["old.ts", "added.ts", "deleted.ts"],
+      baseCommitSha: "a".repeat(40),
+      signal: AbortSignal.timeout(1000),
+      beforeRead,
+      sourceCache,
+    });
+    expect(beforeRead).toHaveBeenCalledTimes(7); // status + 3 baseline/current pairs; HEAD already verified.
+    const identityRead = vi.fn();
+    await repairSourceIdentity(
+      current.sandbox,
+      ["old.ts", "added.ts", "deleted.ts"],
+      AbortSignal.timeout(1000),
+      identityRead,
+      sourceCache,
+    );
+    expect(identityRead).not.toHaveBeenCalled();
+    const repeatedRead = vi.fn();
+    expect(
+      await captureReplanCandidate({
+        sandbox: current.sandbox,
+        paths: ["old.ts", "added.ts", "deleted.ts"],
+        baseCommitSha: "a".repeat(40),
+        signal: AbortSignal.timeout(1000),
+        beforeRead: repeatedRead,
+        sourceCache,
+      }),
+    ).toEqual(candidate);
+    expect(repeatedRead).toHaveBeenCalledTimes(1); // status remains necessary even with cached source.
+    const restored = fixture({ ...baseline }, baseline);
+    const restoredCache = new CurrentSourceCache(restored.sandbox);
+    const restoreRead = vi.fn();
+    await restoreReplanCandidate({
+      sandbox: restored.sandbox,
+      oldApprovedPaths: ["old.ts", "added.ts", "deleted.ts"],
+      signal: AbortSignal.timeout(1000),
+      beforeRead: restoreRead,
+      sourceCache: restoredCache,
+      state: ScopeReplanStateSchema.parse({
+        version: 1,
+        used: 1,
+        status: "WAITING_APPROVAL",
+        previousApprovalId: "approved",
+        baseCommitSha: "a".repeat(40),
+        repairAttempts: 1,
+        reviewAttempts: 0,
+        reason: "scope",
+        diagnostic: "public failure",
+        candidatePaths: [],
+        ...candidate,
+      }),
+    });
+    expect(restoreRead).toHaveBeenCalledTimes(11); // HEAD/status + baseline/read/write verification for all three records.
+    const restoredIdentityRead = vi.fn();
+    await repairSourceIdentity(
+      restored.sandbox,
+      ["old.ts", "added.ts", "deleted.ts"],
+      AbortSignal.timeout(1000),
+      restoredIdentityRead,
+      restoredCache,
+    );
+    expect(restoredIdentityRead).not.toHaveBeenCalled();
+    expect(restored.current).toEqual(current.current);
+  });
   it("projects actual changed lines from already-read checkpoint sources without inventing a full-file diff", async () => {
     const head =
       Array.from({ length: 90 }, (_, i) => `const unchanged${i} = ${i};`).join("\n") + "\n";
@@ -168,7 +240,7 @@ describe("scope replanning authority and recoverable candidate", () => {
     });
     expect(checkpointReads).toBe(reserve.operations.checkpoint);
     expect(identityReads).toBe(reserve.operations.sourceIdentity);
-    expect(reserve.total - checkpointReads - identityReads).toBe(2 + 8);
+    expect(reserve.total - checkpointReads - identityReads).toBe(2); // Review IO is internal execution, not logical tool calls.
     expect(reserve.operations).not.toHaveProperty("checkpointRestore");
     expect(reserve.operations).not.toHaveProperty("repairContext");
   });

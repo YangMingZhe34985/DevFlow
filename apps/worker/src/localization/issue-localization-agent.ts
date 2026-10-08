@@ -176,7 +176,7 @@ export class IssueLocalizationAgent {
       source: IndexSource,
       signal: AbortSignal,
     ): Promise<EvidencePack | undefined>;
-    onRequest?(): Promise<void>;
+    onRequest?(request: ModelRequest): Promise<void>;
     onResponse?(response: ModelResponse): Promise<void>;
     onGenerationError?(latencyMs: number, error: unknown): Promise<void>;
     onSearch?(): Promise<void>;
@@ -462,7 +462,7 @@ export class IssueLocalizationAgent {
           evidence: request.messages,
           progressKeys: [...progressKeys],
         });
-        await input.onRequest?.();
+        await input.onRequest?.(request);
         const started = Date.now();
         let response: ModelResponse;
         try {

@@ -6,6 +6,7 @@ import { z } from "zod";
 import { graphPathAllowed } from "../localization/relation-graph.js";
 import { extractRepairDiagnostics } from "./workflow-context.js";
 import { resolveRepairDiagnostics } from "./repair-diagnostics.js";
+import type { CurrentSourceCache } from "./current-source-cache.js";
 
 const Identity = z.union([z.string().regex(/^[a-f0-9]{64}$/u), z.literal("ABSENT")]);
 export const ScopeReplanStateSchema = z.object({
@@ -141,11 +142,16 @@ export async function captureReplanCandidate(input: {
   baseCommitSha: string;
   signal: AbortSignal;
   beforeRead: () => void;
+  sourceCache?: CurrentSourceCache;
 }): Promise<Pick<ScopeReplanState, "files" | "patchSha256" | "changeEvidence">> {
   const git = new SandboxGitService();
-  input.beforeRead();
-  if ((await git.head(input.sandbox, input.signal)) !== input.baseCommitSha)
-    throw new Error("REPLAN_BASE_IDENTITY_CHANGED");
+  let head = input.sourceCache?.head(input.sandbox);
+  if (!head) {
+    input.beforeRead();
+    head = await git.head(input.sandbox, input.signal);
+    input.sourceCache?.rememberHead(input.sandbox, head);
+  }
+  if (head !== input.baseCommitSha) throw new Error("REPLAN_BASE_IDENTITY_CHANGED");
   input.beforeRead();
   const status = await input.sandbox.exec(
     {
@@ -176,35 +182,63 @@ export async function captureReplanCandidate(input: {
   let bytes = 0;
   for (const path of changedPaths) {
     if (!graphPathAllowed(path)) throw new Error("REPLAN_INVALID_CANDIDATE_PATH");
-    input.beforeRead();
-    const baseline = await input.sandbox.exec(
-      {
-        program: "git",
-        args: ["show", `${input.baseCommitSha}:${path}`],
-        timeoutMs: 20_000,
-        maxOutputBytes: 512 * 1024,
-      },
-      input.signal,
-    );
-    if (baseline.timedOut || baseline.outputTruncated)
+    let baselineContent = input.sourceCache?.baseline(input.sandbox, input.baseCommitSha, path);
+    if (baselineContent === undefined) {
+      input.beforeRead();
+      const baseline = await input.sandbox.exec(
+        {
+          program: "git",
+          args: ["show", `${input.baseCommitSha}:${path}`],
+          timeoutMs: 20_000,
+          maxOutputBytes: 512 * 1024,
+        },
+        input.signal,
+      );
+      if (baseline.timedOut || baseline.outputTruncated)
+        throw new Error("REPLAN_BASE_SOURCE_INCOMPLETE");
+      if (
+        baseline.exitCode !== 0 &&
+        !/does not exist|exists on disk, but not in/u.test(baseline.stderr)
+      )
+        throw new Error("REPLAN_BASE_SOURCE_UNAVAILABLE");
+      baselineContent = baseline.exitCode === 0 ? baseline.stdout : null;
+      input.sourceCache?.rememberBaseline(
+        input.sandbox,
+        input.baseCommitSha,
+        path,
+        baselineContent,
+      );
+    }
+    if (baselineContent !== null && Buffer.byteLength(baselineContent) > 512 * 1024)
       throw new Error("REPLAN_BASE_SOURCE_INCOMPLETE");
-    const baselineSha256 = baseline.exitCode === 0 ? sha256(baseline.stdout) : "ABSENT";
-    if (
-      baseline.exitCode !== 0 &&
-      !/does not exist|exists on disk, but not in/u.test(baseline.stderr)
-    )
-      throw new Error("REPLAN_BASE_SOURCE_UNAVAILABLE");
-    input.beforeRead();
+    const baselineSha256 = baselineContent === null ? "ABSENT" : sha256(baselineContent);
     let content: string | null = null,
       currentSha256: string = "ABSENT";
     try {
-      const source = await input.sandbox.readFile({ path, maxBytes: 512 * 1024 }, input.signal);
-      if (source.truncated || !source.fileSha256 || sha256(source.content) !== source.fileSha256)
-        throw new Error("REPLAN_CURRENT_SOURCE_INCOMPLETE");
-      content = source.content;
-      currentSha256 = source.fileSha256;
+      const cached = input.sourceCache?.source(input.sandbox, path);
+      if (input.sourceCache?.identity(input.sandbox, path) === "ABSENT") {
+        content = null;
+      } else if (cached) {
+        if (cached.sizeBytes > 512 * 1024) throw new Error("REPLAN_CURRENT_SOURCE_INCOMPLETE");
+        content = cached.content;
+        currentSha256 = cached.contentHash;
+      } else {
+        input.beforeRead();
+        const source = await input.sandbox.readFile({ path, maxBytes: 512 * 1024 }, input.signal);
+        if (source.truncated || !source.fileSha256 || sha256(source.content) !== source.fileSha256)
+          throw new Error("REPLAN_CURRENT_SOURCE_INCOMPLETE");
+        content = source.content;
+        currentSha256 = source.fileSha256;
+        input.sourceCache?.remember(input.sandbox, {
+          path,
+          content,
+          contentHash: currentSha256,
+          sizeBytes: Buffer.byteLength(content),
+        });
+      }
     } catch (error) {
       if (!(error instanceof DevflowError && error.code === "NOT_FOUND")) throw error;
+      input.sourceCache?.rememberIdentity(input.sandbox, path, "ABSENT");
     }
     bytes += Buffer.byteLength(content ?? "");
     if (bytes > 1024 * 1024) throw new Error("REPLAN_CHECKPOINT_TOO_LARGE");
@@ -213,7 +247,7 @@ export async function captureReplanCandidate(input: {
       path,
       baselineSha256,
       currentSha256,
-      ...projectCandidateChange(baseline.exitCode === 0 ? baseline.stdout : "", content ?? ""),
+      ...projectCandidateChange(baselineContent ?? "", content ?? ""),
     });
   }
   return {
@@ -261,6 +295,7 @@ export async function restoreReplanCandidate(input: {
   oldApprovedPaths: readonly string[];
   signal: AbortSignal;
   beforeRead: () => void;
+  sourceCache?: CurrentSourceCache;
 }) {
   const { state, sandbox, signal } = input;
   const git = new SandboxGitService();
@@ -279,6 +314,8 @@ export async function restoreReplanCandidate(input: {
   );
   if (clean.exitCode !== 0 || clean.timedOut || clean.outputTruncated || clean.stdout.trim())
     throw new Error("REPLAN_RESTORE_WORKSPACE_NOT_CLEAN");
+  input.sourceCache?.invalidate();
+  input.sourceCache?.rememberHead(sandbox, state.baseCommitSha);
   if (
     state.patchSha256 !==
     sha256(canonicalJson(state.files.map((f) => [f.path, f.baselineSha256, f.currentSha256])))
@@ -338,6 +375,13 @@ export async function restoreReplanCandidate(input: {
       const source = await sandbox.readFile({ path: file.path, maxBytes: 1 }, signal);
       if (source.fileSha256 !== file.currentSha256)
         throw new Error("REPLAN_RESTORED_SOURCE_MISMATCH");
+      if (file.content !== null)
+        input.sourceCache?.remember(sandbox, {
+          path: file.path,
+          content: file.content,
+          contentHash: file.currentSha256,
+          sizeBytes: Buffer.byteLength(file.content),
+        });
     } catch (error) {
       if (!(
         error instanceof DevflowError &&
@@ -345,6 +389,7 @@ export async function restoreReplanCandidate(input: {
         file.currentSha256 === "ABSENT"
       ))
         throw error;
+      input.sourceCache?.rememberIdentity(sandbox, file.path, "ABSENT");
     }
   }
 }

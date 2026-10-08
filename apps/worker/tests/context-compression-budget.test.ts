@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { describe, expect, it } from "vitest";
 import { WorkflowBudgetLedger } from "../src/runs/workflow-budget.js";
 import { createWorkflowMetrics, mergeAgentPhaseMetrics } from "../src/runs/workflow-metrics.js";
@@ -32,7 +33,10 @@ describe("summary reservations share the Run budget", () => {
         },
       },
     ];
-    const db = { events: { list: async () => events } } as unknown as DatabaseAdapter;
+    const db = {
+      budgetLedgers: new InMemoryBudgetLedgerStore(),
+      events: { list: async () => events },
+    } as unknown as DatabaseAdapter;
     const worker = new ApprovalWorkflowRunExecutor(
       db,
       loadWorkerEnvironment({ DATABASE_URL: "unused" }),

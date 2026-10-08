@@ -51,6 +51,16 @@ export interface ModelRequest {
   tools: readonly ModelToolDescriptor[];
   output?: ModelStructuredOutputRequest;
   settings?: ModelGenerationSettings;
+  /** Host-only continuation capacity; never serialized into a provider prompt or schema. */
+  resourceContinuation?: {
+    tokens?: number;
+    steps?: number;
+    modelCalls?: number;
+    logicalToolCalls?: number;
+    toolExecutions?: number;
+    timeMs?: number;
+    costMicros?: number;
+  };
 }
 
 export interface ModelToolCall {

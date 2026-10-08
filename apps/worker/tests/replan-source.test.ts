@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { sha256 } from "@devflow/eval";
 import { DevflowError } from "@devflow/shared";
 import type { SandboxSession } from "@devflow/sandbox";
-import { replanSource, replanOperationReserve } from "../src/runs/replan-source.js";
+import { replanSource } from "../src/runs/replan-source.js";
 import { ReplanEvidenceReader } from "../src/runs/replan-evidence.js";
 
 function fixture(complete = true) {
@@ -83,11 +83,5 @@ describe("versioned bounded replanning preparation", () => {
     });
     await next.lookup!("missing.py", f.signal);
     expect(f.listFiles).toHaveBeenCalledTimes(2);
-  });
-  it("reserves one shared read allowance and leaves capacity checks uncharged", () => {
-    const reserve = replanOperationReserve(1, 4, true);
-    expect(reserve.operations.sourceReads).toBe(8);
-    expect(reserve.downstream).toBe(26);
-    expect(reserve.total).toBe(39);
   });
 });

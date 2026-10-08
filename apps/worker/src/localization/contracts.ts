@@ -39,6 +39,8 @@ export const EntrySchema = z.object({
 });
 export type IndexEntry = z.infer<typeof EntrySchema>;
 export interface IndexSource {
+  /** Declares the physical accounting boundary; Sandbox-backed adapters must not charge IO twice. */
+  resourceIOOwner?: "SOURCE" | "SANDBOX" | "MEMORY";
   /** Validated immutable identity prepared at capture, not computed during queries. */
   identity?: string;
   fileCount?: number;

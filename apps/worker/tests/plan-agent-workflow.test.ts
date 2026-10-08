@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { createHash, randomUUID } from "node:crypto";
 
 import { FakeLanguageModel, fakeModelResponse, type ModelRequest } from "@devflow/agent";
@@ -489,6 +490,7 @@ function fixture(
   };
   const benchmark = options.benchmark ? benchmarkExecution(run, timestamp) : null;
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     artifacts: {
       list: async () => artifacts,
       create: async (input: CreateArtifactInput) => {

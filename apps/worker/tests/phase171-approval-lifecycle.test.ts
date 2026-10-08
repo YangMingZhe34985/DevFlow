@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { createHash, randomUUID } from "node:crypto";
 import { afterEach, expect, it, vi } from "vitest";
 import { FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
@@ -59,6 +60,7 @@ it("PLAN waits without a container; approved and recovered EXECUTE create fresh 
     repository: { id: randomUUID(), sourceKind: "LOCAL", sourceUri: process.cwd() },
   } as RunExecutionRecord;
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     artifacts: { list: async () => artifacts, create: async () => ({ id: randomUUID() }) },
     approvals: { list: async () => approvals },
     events: {

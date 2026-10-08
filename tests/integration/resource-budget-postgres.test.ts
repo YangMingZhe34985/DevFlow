@@ -64,6 +64,11 @@ describe.skipIf(!enabled)("PostgreSQL resource ledger", () => {
       });
       await scheduler.reserve("unknown-provider-request", operation("provider", 700));
       await scheduler.admit("unknown-provider-request");
+      await scheduler.markUncertain(
+        "unknown-provider-request",
+        { timeMs: 100 },
+        "local transport ended; provider usage unknown",
+      );
       const paused = await a.runs.pauseForApproval(run.id, owner, {
         summary: "Extend the approved implementation scope",
         steps: [
@@ -92,7 +97,7 @@ describe.skipIf(!enabled)("PostgreSQL resource ledger", () => {
       expect((await resumed.quote(operation("too-large", 201))).fits).toBe(false);
       expect((await resumed.admit("unknown-provider-request")).reason).toBe("ALREADY_ADMITTED");
       await resumed.settle("unknown-provider-request", { tokens: 300 });
-      expect((await scheduler.snapshot()).consumed.tokens).toBe(400);
+      expect((await scheduler.snapshot()).consumed).toMatchObject({ tokens: 400, timeMs: 100 });
     });
   });
 });

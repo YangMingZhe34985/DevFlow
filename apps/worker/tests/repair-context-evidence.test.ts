@@ -5,8 +5,61 @@ import { buildRepairContext, readRepairEvidence } from "../src/runs/workflow-con
 import { hash } from "../src/localization/contracts.js";
 import { prepareStageContext } from "@devflow/agent";
 import { createTools } from "../src/runs/approval-workflow-run-executor.js";
+import { CurrentSourceCache } from "../src/runs/current-source-cache.js";
+import { repairContextSourcePaths } from "../src/runs/repair-tasks.js";
 
 describe("bounded Repair input with recoverable public evidence", () => {
+  it("uses the same diagnostic path selection as quotation and cached full source avoids physical rereads", async () => {
+    const readFile = vi.fn();
+    const sandbox = { readFile } as unknown as SandboxSession;
+    const sourceCache = new CurrentSourceCache(sandbox);
+    const paths = Array.from({ length: 8 }, (_, index) => `src/source${index}.ts`);
+    for (const path of paths)
+      sourceCache.remember(sandbox, {
+        path,
+        content: "return observed;",
+        contentHash: hash("return observed;"),
+        sizeBytes: 16,
+      });
+    const git = {
+      status: async () => ({ files: [{ path: "src/changed.ts" }] }),
+      diff: async () => ({ patch: "", filesChanged: 1, truncated: false }),
+    } as unknown as SandboxGitService;
+    const operations = vi.fn();
+    const context = await buildRepairContext(
+      git,
+      sandbox,
+      {
+        exitCode: 1,
+        stdout: paths.map((path) => `${path}(1,1): error TS2322: invalid assignment`).join("\n"),
+        stderr: "",
+        durationMs: 1,
+        timedOut: false,
+        outputTruncated: false,
+      },
+      AbortSignal.timeout(1000),
+      undefined,
+      {
+        sourceCache,
+        beforeOperation: operations,
+        repositoryManifest: { paths: [...paths, "src/changed.ts"], complete: true },
+      },
+    );
+    expect(context.changedFiles).toEqual(paths);
+    expect(
+      repairContextSourcePaths({
+        resolution: context.diagnosticResolution!,
+        changedPaths: ["src/changed.ts"],
+      }),
+    ).toEqual(context.changedFiles);
+    expect(context.toolExecutions).toBe(2); // mandatory status/diff only.
+    expect(operations).toHaveBeenCalledTimes(2);
+    expect(readFile).not.toHaveBeenCalled();
+    expect(context.currentSources).toHaveLength(8);
+    expect(
+      context.currentSources.every((source) => source.contentHash === hash("return observed;")),
+    ).toBe(true);
+  });
   it("seeds the innermost Python implementation with a complete SHA even when the diff is empty", async () => {
     const git = {
       status: async () => ({ files: [] }),

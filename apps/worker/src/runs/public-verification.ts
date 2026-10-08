@@ -22,12 +22,12 @@ export async function discoverPublicVerification(
   signal: AbortSignal,
   beforeRead?: (executions: number) => unknown,
 ) {
-  beforeRead?.(0);
+  await beforeRead?.(0);
   const listing = await sandbox.listFiles({ path: ".", recursive: false, maxEntries: 200 }, signal);
   let toolExecutions = 1;
   const checks: PublicVerificationProfile["checks"] = [];
   if (listing.entries.some((e) => e.path.replace(/^\.\//u, "") === "package.json")) {
-    beforeRead?.(toolExecutions);
+    await beforeRead?.(toolExecutions);
     const file = await sandbox.readFile({ path: "package.json", maxBytes: 200_000 }, signal);
     toolExecutions++;
     // A malformed manifest is a failed check, never "no tests" success.
@@ -75,7 +75,7 @@ export async function runPublicVerification(input: {
   profile: PublicVerificationProfile;
   signal: AbortSignal;
   timeoutMs: number;
-  beforeCommand?: (executions: number) => number;
+  beforeCommand?: (executions: number) => number | Promise<number>;
   now?: () => number;
 }): Promise<PublicVerificationResult> {
   const profile = PublicVerificationProfileSchema.parse(input.profile);
@@ -94,7 +94,8 @@ export async function runPublicVerification(input: {
         continue;
       }
       try {
-        const remaining = Math.min(deadline - now(), input.beforeCommand?.(executions) ?? Infinity);
+        const available = await input.beforeCommand?.(executions);
+        const remaining = Math.min(deadline - now(), available ?? Infinity);
         if (remaining <= 0) throw new Error("PUBLIC_VERIFICATION_DEADLINE_EXHAUSTED");
         const result = await input.sandbox.exec(
           {

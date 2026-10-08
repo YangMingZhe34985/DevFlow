@@ -2,8 +2,31 @@ import { createHash } from "node:crypto";
 import { diagnosticTriageText } from "./repair-diagnostics.js";
 import type { DiagnosticResolution } from "./repair-diagnostics.js";
 import type { WorkingCode } from "@devflow/agent";
+import { graphPathAllowed } from "../localization/relation-graph.js";
 
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** Shared selection for resource quotation and the actual Repair-context IO. */
+export function repairContextSourcePaths(input: {
+  resolution: DiagnosticResolution;
+  additionalSources?: readonly { path: string; line?: number | undefined }[];
+  changedPaths: readonly string[];
+}) {
+  const changed = input.changedPaths.filter(
+    (path) =>
+      !/(?:^|\/)(?:\.git|node_modules|dist|build|coverage|\.next|vendor)(?:\/|$)/u.test(path) &&
+      !/\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|woff2?|ttf|lock)$/iu.test(path),
+  );
+  return [
+    ...new Set([
+      ...input.resolution.resolved.map((diagnostic) => diagnostic.path),
+      ...(input.additionalSources?.map((source) => source.path) ?? []),
+      ...changed,
+    ]),
+  ]
+    .filter(graphPathAllowed)
+    .slice(0, 8);
+}
 
 /** Presentation records only: the immutable artifact retains the complete public log. */
 export function repairDiagnosticTasks(output: string, resolution: DiagnosticResolution) {

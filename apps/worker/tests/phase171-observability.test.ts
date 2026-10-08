@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { describe, expect, it, vi } from "vitest";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import { DevflowError } from "@devflow/shared";
@@ -5,10 +6,22 @@ import {
   ApprovalWorkflowRunExecutor,
   initialWorkflowMetrics,
 } from "../src/runs/approval-workflow-run-executor.js";
+import { ResourceBudgetScheduler } from "../src/runs/resource-budget-scheduler.js";
+import {
+  ResourceBudgetRuntime,
+  resourceBudgetContext,
+  recordDecisionResourceWork,
+  recordLogicalResourceWork,
+} from "../src/runs/resource-budget-runtime.js";
 import { loadWorkerEnvironment } from "../src/config/env.js";
 
 describe("Phase 1.7.1 failure observations", () => {
-  const run = { id: "test", retryCount: 0 } as RunExecutionRecord;
+  const run = {
+    id: "test",
+    retryCount: 0,
+    maxSteps: 25,
+    maxReviewRetries: 1,
+  } as RunExecutionRecord;
   const events = [
     {
       type: "LLM_RESPONSE",
@@ -37,7 +50,10 @@ describe("Phase 1.7.1 failure observations", () => {
     },
   ];
   it("recovers partial tool batches and does not double-count completed steps", async () => {
-    const db = { events: { list: async () => events } } as unknown as DatabaseAdapter;
+    const db = {
+      budgetLedgers: new InMemoryBudgetLedgerStore(),
+      events: { list: async () => events },
+    } as unknown as DatabaseAdapter;
     const metrics = await initialWorkflowMetrics(db, run);
     expect(metrics).toMatchObject({
       modelCalls: 1,
@@ -47,8 +63,50 @@ describe("Phase 1.7.1 failure observations", () => {
       tokenUsage: { totalTokens: 50 },
     });
   });
+  it("hydrates durable decisions inside an active dispatch without charging them again", async () => {
+    const store = new InMemoryBudgetLedgerStore();
+    const startedAt = Date.now();
+    const scheduler = await ResourceBudgetScheduler.open({
+      runId: run.id,
+      store,
+      startedAt,
+      deadlineAt: startedAt + 1_500_000,
+      limits: { steps: 25, logicalToolCalls: 75, timeMs: 1_500_000 },
+    });
+    const runtime = new ResourceBudgetRuntime(scheduler, async () => undefined);
+    const savedEvents = [
+      { type: "STEP_STARTED", payload: { purpose: "IMPLEMENTATION", step: 1 } },
+      {
+        type: "STEP_COMPLETED",
+        payload: { purpose: "IMPLEMENTATION", toolCalls: 2, toolExecutions: 2 },
+      },
+    ];
+    const db = {
+      budgetLedgers: store,
+      events: { list: async () => savedEvents },
+    } as unknown as DatabaseAdapter;
+    await resourceBudgetContext.run(runtime, async () => {
+      recordDecisionResourceWork(1);
+      recordLogicalResourceWork(2);
+      await runtime.flush();
+      const before = (await scheduler.snapshot()).consumed;
+      for (let resume = 0; resume < 2; resume++) {
+        expect(await initialWorkflowMetrics(db, run)).toMatchObject({ steps: 1, toolCalls: 2 });
+        await runtime.flush();
+        expect((await scheduler.snapshot()).consumed).toEqual(before);
+      }
+      // Hydration's context exit must not disable admission for the next live decision.
+      recordDecisionResourceWork(1);
+      await runtime.flush();
+      expect((await scheduler.snapshot()).consumed).toMatchObject({
+        steps: 2,
+        logicalToolCalls: 2,
+      });
+    });
+  });
   it("keeps root failure and PLAN metrics when trace artifact flush fails", async () => {
     const db = {
+      budgetLedgers: new InMemoryBudgetLedgerStore(),
       events: { list: async () => events },
       artifacts: {
         create: async () => {

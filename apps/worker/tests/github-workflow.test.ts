@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { randomUUID } from "node:crypto";
 
 import type {
@@ -267,6 +268,7 @@ function fakeDatabase(
     };
   };
   return {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     githubPublications: {
       findByRunId: async (runId) => await store.findByRunId(runId),
       recordPush: async (runId, operationKey, result) => {

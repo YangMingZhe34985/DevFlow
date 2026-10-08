@@ -9,6 +9,13 @@ import { estimatePlanOutputRecoveryReserve } from "./plan-agent.js";
 import { estimatePlanRequest } from "./plan-agent-context.js";
 import { PlanProposalSchema } from "@devflow/shared";
 import { PROPOSAL_PROMPT } from "./plan-proposal.js";
+import {
+  estimateOperationPlan,
+  normalizeResources,
+  resourceShortfalls,
+  type ResourceBudgetOperationPlan,
+  type ResourceVector,
+} from "./resource-budget-scheduler.js";
 
 /** Capacity reserved for a reachable branch, never added to consumed metrics. */
 export interface CodingCapacity {
@@ -41,10 +48,34 @@ export function codingBranchFrontier(input: {
   const selectedBranch = input.operation === "SUBMIT_CURRENT" ? "CONTINUE" : input.selectedBranch;
   const selected =
     selectedBranch === "CONTINUE"
-      ? continuing
+      ? capacityOperation("coding:continue", continuing)
       : selectedBranch === "REPLAN"
-        ? replanning!
-        : maximum(continuing, replanning ?? zero());
+        ? capacityOperation("coding:replan", replanning!)
+        : undefined;
+  const sharedOperation = capacityOperation("coding:final-validation-review", shared);
+  const operationPlan: ResourceBudgetOperationPlan = selected
+    ? {
+        kind: "SEQUENCE",
+        id: "coding:selected-continuation",
+        operations: [sharedOperation, selected],
+      }
+    : {
+        kind: "EXCLUSIVE",
+        id: "coding:continuation-frontier",
+        exclusivityKey: "coding-result:continue-or-scope-replan",
+        shared: sharedOperation,
+        branches: [
+          capacityOperation("coding:continue", continuing),
+          ...(replanning ? [capacityOperation("coding:replan", replanning)] : []),
+        ],
+      };
+  const required = toCapacity(estimateOperationPlan(operationPlan).resources);
+  const selectedCapacity = {
+    tokens: required.tokens - shared.tokens,
+    steps: required.steps - shared.steps,
+    tools: required.tools - shared.tools,
+    timeMs: required.timeMs - shared.timeMs,
+  };
   return {
     accounting: "RESERVE_ONLY_RECHECK_ACTUAL_REQUEST" as const,
     operation: input.operation ?? "CODING",
@@ -52,12 +83,13 @@ export function codingBranchFrontier(input: {
     sharedFinal: shared,
     continuing,
     ...(replanning ? { replanning } : {}),
-    required: add(shared, selected),
+    required,
+    operationPlan,
     released: {
-      tokens: Math.max(0, (replanning?.tokens ?? 0) - selected.tokens),
-      steps: Math.max(0, (replanning?.steps ?? 0) - selected.steps),
-      tools: Math.max(0, (replanning?.tools ?? 0) - selected.tools),
-      timeMs: Math.max(0, (replanning?.timeMs ?? 0) - selected.timeMs),
+      tokens: Math.max(0, (replanning?.tokens ?? 0) - selectedCapacity.tokens),
+      steps: Math.max(0, (replanning?.steps ?? 0) - selectedCapacity.steps),
+      tools: Math.max(0, (replanning?.tools ?? 0) - selectedCapacity.tools),
+      timeMs: Math.max(0, (replanning?.timeMs ?? 0) - selectedCapacity.timeMs),
     },
   };
 }
@@ -74,16 +106,26 @@ export function codingRequestReserve(input: {
   const estimatedInputTokens = estimateModelInput(input.messages, input.tools);
   const configuredOutputTokens = integer(input.maxOutputTokens, "maxOutputTokens", 1);
   const inputGrowthTokens = integer(input.additionalInputTokens ?? 0, "additionalInputTokens");
+  const operationPlan: ResourceBudgetOperationPlan = {
+    kind: "OPERATION",
+    id: "coding:projected-request",
+    requirement: "REQUIRED",
+    state: "PENDING",
+    resources: {
+      inputTokens: estimatedInputTokens + inputGrowthTokens,
+      outputTokens: configuredOutputTokens,
+      steps: 1,
+      modelCalls: 1,
+      timeMs: integer(input.timeoutMs, "timeoutMs", 1),
+    },
+    reason: "Current projected messages and configured output; explicit evidence growth allowance",
+  };
   return {
     estimatedInputTokens,
     configuredOutputTokens,
     inputGrowthTokens,
-    required: {
-      tokens: estimatedInputTokens + configuredOutputTokens + inputGrowthTokens,
-      steps: 1,
-      tools: 0,
-      timeMs: integer(input.timeoutMs, "timeoutMs", 1),
-    },
+    operationPlan,
+    required: toCapacity(estimateOperationPlan(operationPlan).resources),
   };
 }
 
@@ -141,6 +183,30 @@ export function codingReplanReserve(input: {
     timeoutMs: input.codingTimeoutMs,
     additionalInputTokens: input.codingInputGrowthTokens,
   });
+  const operationPlan: ResourceBudgetOperationPlan = {
+    kind: "SEQUENCE",
+    id: "coding:replan-then-resume",
+    operations: [
+      {
+        kind: "OPERATION",
+        id: "planner:current-projection-and-recovery",
+        requirement: "REQUIRED",
+        state: "PENDING",
+        resources: {
+          tokens:
+            plannerInputTokens +
+            plannerInputGrowthTokens +
+            plannerOutputTokens +
+            plannerRecoveryTokens,
+          steps: 2,
+          modelCalls: 2,
+          timeMs: integer(input.plannerTimeoutMs, "plannerTimeoutMs", 1),
+        },
+        reason: "Current Planner projection and one existing recovery share the phase deadline",
+      },
+      coding.operationPlan,
+    ],
+  };
   return {
     kind: "MINIMUM_REPLAN_BRANCH" as const,
     accounting: "RESERVE_ONLY_RECHECK_ACTUAL_REQUEST" as const,
@@ -149,17 +215,8 @@ export function codingReplanReserve(input: {
     plannerOutputTokens,
     plannerRecoveryTokens,
     coding,
-    required: {
-      tokens:
-        plannerInputTokens +
-        plannerInputGrowthTokens +
-        plannerOutputTokens +
-        plannerRecoveryTokens +
-        coding.required.tokens,
-      steps: 3,
-      tools: 0,
-      timeMs: integer(input.plannerTimeoutMs, "plannerTimeoutMs", 1) + coding.required.timeMs,
-    },
+    operationPlan,
+    required: toCapacity(estimateOperationPlan(operationPlan).resources),
   };
 }
 
@@ -198,6 +255,7 @@ export function codingContinuationReserve(input: {
     recovery: legacy.recovery,
     coding: legacy.repair,
     total: legacy.total,
+    operationPlan: legacy.operationPlan,
     accounting: legacy.accounting,
   };
 }
@@ -224,10 +282,29 @@ export function codingPlannerTokenLease(input: {
   const remainingPhaseTokens = Math.max(0, configuredMaximumTokens - consumedTokens);
   const maxTotalTokens = consumedTokens + Math.min(remainingPhaseTokens, availableTokens);
   const requiredRequestTokens = integer(input.requiredRequestTokens ?? 0, "requiredRequestTokens");
+  const sequentialRequirement = estimateOperationPlan({
+    kind: "SEQUENCE",
+    id: "planner:request-and-downstream",
+    operations: [
+      capacityOperation("planner:request", {
+        tokens: requiredRequestTokens,
+        steps: 0,
+        tools: 0,
+        timeMs: 0,
+      }),
+      capacityOperation("planner:downstream", {
+        tokens: downstreamTokens,
+        steps: 0,
+        tools: 0,
+        timeMs: 0,
+      }),
+    ],
+  }).resources;
   const missingTokens = Math.max(
-    0,
-    downstreamTokens + requiredRequestTokens - remainingTokens,
-    requiredRequestTokens - remainingPhaseTokens,
+    resourceShortfalls(sequentialRequirement, { tokens: remainingTokens }).tokens ?? 0,
+    resourceShortfalls(normalizeResources({ tokens: requiredRequestTokens }), {
+      tokens: remainingPhaseTokens,
+    }).tokens ?? 0,
   );
   return {
     remainingTokens,
@@ -259,24 +336,26 @@ function capacity(value: CodingCapacity): CodingCapacity {
   };
 }
 
-function zero(): CodingCapacity {
-  return { tokens: 0, steps: 0, tools: 0, timeMs: 0 };
-}
-
-function maximum(a: CodingCapacity, b: CodingCapacity): CodingCapacity {
+function capacityOperation(id: string, value: CodingCapacity): ResourceBudgetOperationPlan {
   return {
-    tokens: Math.max(a.tokens, b.tokens),
-    steps: Math.max(a.steps, b.steps),
-    tools: Math.max(a.tools, b.tools),
-    timeMs: Math.max(a.timeMs, b.timeMs),
+    kind: "OPERATION",
+    id,
+    requirement: "REQUIRED",
+    state: "PENDING",
+    resources: {
+      tokens: value.tokens,
+      steps: value.steps,
+      logicalToolCalls: value.tools,
+      timeMs: value.timeMs,
+    },
   };
 }
 
-function add(a: CodingCapacity, b: CodingCapacity): CodingCapacity {
-  return capacity({
-    tokens: a.tokens + b.tokens,
-    steps: a.steps + b.steps,
-    tools: a.tools + b.tools,
-    timeMs: a.timeMs + b.timeMs,
-  });
+function toCapacity(value: ResourceVector): CodingCapacity {
+  return {
+    tokens: value.tokens,
+    steps: value.steps,
+    tools: value.logicalToolCalls,
+    timeMs: value.timeMs,
+  };
 }

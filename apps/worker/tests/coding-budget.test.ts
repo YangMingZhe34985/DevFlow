@@ -8,6 +8,7 @@ import {
 } from "../src/runs/coding-budget.js";
 import { allocateCodingBudget, planAdaptiveBudget } from "../src/runs/workflow-budget.js";
 import { PlanAgent } from "../src/runs/plan-agent.js";
+import { estimateOperationPlan } from "../src/runs/resource-budget-scheduler.js";
 
 const continuation = {
   title: "Preserve execution state",
@@ -70,6 +71,29 @@ it("preserves configured output and accounts for constructible input and explici
   expect(larger.required.tokens - reserve.required.tokens).toBe(16384 + 3000);
   expect(reserve.configuredOutputTokens).toBe(16384);
   expect(reserve.required.steps).toBe(1);
+});
+
+it("uses one Scheduler operation frontier and adds sequential work after selecting a branch", () => {
+  const sharedFinal = { tokens: 12000, tools: 4, steps: 2, timeMs: 300000 };
+  const continuing = { tokens: 20000, tools: 8, steps: 3, timeMs: 60000 };
+  const replanning = { tokens: 30000, tools: 5, steps: 4, timeMs: 120000 };
+  const frontier = codingBranchFrontier({ sharedFinal, continuing, replanning });
+  expect(frontier.required).toEqual({ tokens: 42000, tools: 12, steps: 6, timeMs: 420000 });
+  expect(estimateOperationPlan(frontier.operationPlan).resources).toMatchObject({
+    tokens: 42000,
+    logicalToolCalls: 12,
+    steps: 6,
+    timeMs: 420000,
+  });
+  const selected = codingBranchFrontier({
+    sharedFinal,
+    continuing,
+    replanning,
+    selectedBranch: "REPLAN",
+  });
+  expect(selected.operationPlan.kind).toBe("SEQUENCE");
+  expect(selected.required).toEqual({ tokens: 42000, tools: 9, steps: 6, timeMs: 420000 });
+  expect(estimateOperationPlan(selected.operationPlan).operations).toHaveLength(2);
 });
 
 it("admits the E07 submission boundary without promising the unselected replan branch", () => {

@@ -55,6 +55,30 @@ function fixture() {
   };
 }
 describe("read-only scope candidate qualification", () => {
+  it("does not let a cached oversized or forged full file bypass the source-read contract", async () => {
+    const f = fixture();
+    const large = "x".repeat(512 * 1024 + 1);
+    f.reader.files.set("src/large.cpp", {
+      path: "src/large.cpp",
+      content: large,
+      contentHash: sha256(large),
+      sizeBytes: large.length,
+    });
+    await expect(f.reader.read("src/large.cpp")).rejects.toThrow(
+      "REPLAN_SOURCE_IDENTITY_UNVERIFIED",
+    );
+    f.reader.files.set("src/forged.cpp", {
+      path: "src/forged.cpp",
+      content: "different",
+      contentHash: sha256("original"),
+      sizeBytes: 9,
+    });
+    await expect(f.reader.read("src/forged.cpp")).rejects.toThrow(
+      "REPLAN_SOURCE_IDENTITY_UNVERIFIED",
+    );
+    expect(f.readFile).not.toHaveBeenCalled();
+    expect(f.reader.state.cacheHits).toBe(0);
+  });
   it("bounds many failing tests with one auditable operation list, preserving candidate and Planner reads", async () => {
     const f = fixture();
     const sources: Record<string, string> = f.sources;

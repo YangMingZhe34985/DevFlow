@@ -1,3 +1,4 @@
+import { InMemoryBudgetLedgerStore } from "@devflow/database";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
@@ -208,6 +209,7 @@ it("actual Worker PLAN emits the contract before approval; runAgentPhase receive
   ];
   const events: unknown[] = [];
   const database = {
+    budgetLedgers: new InMemoryBudgetLedgerStore(),
     artifacts: { list: async () => artifacts, create: async () => ({ id: randomUUID() }) },
     events: {
       list: async () => events,

@@ -20,6 +20,18 @@ export const RESOURCE_DIMENSIONS = [
 export type ResourceDimension = (typeof RESOURCE_DIMENSIONS)[number];
 export type ResourceVector = Record<ResourceDimension, number>;
 export type ResourceLimits = Partial<ResourceVector>;
+export type KnownUncertainUsage = Partial<
+  Pick<
+    ResourceVector,
+    | "modelCalls"
+    | "logicalToolCalls"
+    | "toolExecutions"
+    | "ioReads"
+    | "ioWrites"
+    | "steps"
+    | "timeMs"
+  >
+>;
 
 export type ResourceBudgetOperationPlan =
   | {
@@ -77,6 +89,10 @@ export interface ResourceBudgetReservation {
   settlementDigest?: string;
   costStatus?: "PRICED" | "UNPRICED";
   releaseReason?: string;
+  /** Confirmed completed dimensions; billing/token dimensions remain reserved. */
+  knownUsage?: KnownUncertainUsage;
+  uncertaintyReason?: string;
+  uncertaintyObservedAt?: number;
 }
 
 export interface ResourceBudgetLedger {
@@ -270,9 +286,17 @@ export class ResourceBudgetScheduler {
     actual: Partial<ResourceVector>,
     options: { costStatus?: "PRICED" | "UNPRICED" } = {},
   ): Promise<ResourceBudgetLedger> {
-    const resources = normalizeResources(actual);
+    normalizeResources(actual);
     return await this.change((ledger) => {
       const reservation = requiredReservation(ledger, operationId);
+      const resources = normalizeResources({ ...reservation.knownUsage, ...actual });
+      const alreadyRecorded = normalizeResources(reservation.knownUsage ?? {});
+      const increment = normalizeResources({});
+      for (const dimension of RESOURCE_DIMENSIONS) {
+        if (resources[dimension] < alreadyRecorded[dimension])
+          throw conflict("Final settlement cannot rewind a confirmed observation.");
+        increment[dimension] = resources[dimension] - alreadyRecorded[dimension];
+      }
       const costStatus =
         options.costStatus ??
         (actual.costMicros === undefined && reservation.quote.unpricedOperationIds.length > 0
@@ -286,40 +310,49 @@ export class ResourceBudgetScheduler {
       }
       if (reservation.status !== "ADMITTED")
         throw conflict("Only an admitted operation can settle.");
-      for (const dimension of RESOURCE_DIMENSIONS) {
-        if (resources[dimension] > reservation.quote.resources[dimension]) {
-          (ledger.estimateVariances ??= []).push({
-            operationId,
-            dimension,
-            estimated: reservation.quote.resources[dimension],
-            actual: resources[dimension],
-          });
-        }
-      }
-      ledger.consumed = addResources(ledger.consumed, resources);
+      recordEstimateVariances(ledger, reservation, resources);
+      ledger.consumed = addResources(ledger.consumed, increment);
       reservation.status = "SETTLED";
       reservation.actual = resources;
       reservation.costStatus = costStatus;
       reservation.settlementDigest = settlementDigest;
       reservation.settledAt = this.now();
-      const otherHeld = addResources(
-        ...Object.values(ledger.reservations)
-          .filter((entry) => entry.status === "RESERVED" || entry.status === "ADMITTED")
-          .map((entry) => entry.quote.resources),
-      );
-      for (const dimension of RESOURCE_DIMENSIONS) {
-        const limit =
-          dimension === "timeMs" ? ledger.deadlineAt - ledger.startedAt : ledger.limits[dimension];
-        const committed =
-          dimension === "timeMs"
-            ? Math.max(0, this.now() - ledger.startedAt) + otherHeld.timeMs
-            : ledger.consumed[dimension] + otherHeld[dimension];
-        if (limit !== undefined && committed > limit) {
-          ledger.violations.push({ operationId, dimension, estimated: limit, actual: committed });
-        }
-      }
+      recordHardViolations(ledger, operationId, this.now());
       if (costStatus === "UNPRICED" && !ledger.unpricedOperationIds.includes(operationId))
         ledger.unpricedOperationIds.push(operationId);
+      return { value: ledger, changed: true };
+    });
+  }
+
+  /**
+   * Use only after the local invocation has ended. An unknown provider bill does
+   * not keep reserving a second copy of its already elapsed request deadline.
+   * Unknown tokens/cost cannot be marked as known dimensions through this API.
+   */
+  async markUncertain(
+    operationId: string,
+    known: KnownUncertainUsage,
+    reason: string,
+  ): Promise<ResourceBudgetLedger> {
+    validateKnownUsage(known);
+    return await this.change((ledger) => {
+      const reservation = requiredReservation(ledger, operationId);
+      if (reservation.status !== "ADMITTED")
+        throw conflict("Only an inflight operation can record uncertain completion.");
+      const previous = reservation.knownUsage ?? {};
+      const added: KnownUncertainUsage = {};
+      for (const dimension of Object.keys(known) as (keyof KnownUncertainUsage)[]) {
+        if (previous[dimension] !== undefined && previous[dimension] !== known[dimension])
+          throw conflict("A confirmed uncertain observation cannot be rewritten.");
+        if (previous[dimension] === undefined) added[dimension] = known[dimension]!;
+      }
+      if (Object.keys(added).length === 0) return { value: ledger, changed: false };
+      reservation.knownUsage = { ...previous, ...known };
+      reservation.uncertaintyReason = reason;
+      reservation.uncertaintyObservedAt = this.now();
+      ledger.consumed = addResources(ledger.consumed, added);
+      recordEstimateVariances(ledger, reservation, normalizeResources(reservation.knownUsage));
+      recordHardViolations(ledger, operationId, this.now());
       return { value: ledger, changed: true };
     });
   }
@@ -362,7 +395,7 @@ export class ResourceBudgetScheduler {
         )
           continue;
         const inflight = Object.values(ledger.reservations).some(
-          (entry) => entry.status === "ADMITTED" && entry.quote.resources[dimension] > 0,
+          (entry) => entry.status === "ADMITTED" && heldResources(entry)[dimension] > 0,
         );
         if (inflight)
           throw conflict(`Cannot reconcile ${dimension} before covered inflight usage is settled.`);
@@ -554,7 +587,7 @@ function availableResources(
           entry.id !== excludedReservation &&
           (entry.status === "RESERVED" || entry.status === "ADMITTED"),
       )
-      .map((entry) => entry.quote.resources),
+      .map(heldResources),
   );
   const remaining: Partial<ResourceVector> = {};
   for (const dimension of RESOURCE_DIMENSIONS) {
@@ -620,8 +653,77 @@ function validateLedger(value: unknown, runId: string): ResourceBudgetLedger {
     )
       throw conflict("Settled budget reservation has no measured usage.");
     if (reservation.actual !== undefined) validateFullVector(reservation.actual);
+    if (reservation.knownUsage !== undefined) validateKnownUsage(reservation.knownUsage);
   }
   return structuredClone(ledger);
+}
+
+function validateKnownUsage(known: KnownUncertainUsage): void {
+  const allowed = new Set([
+    "modelCalls",
+    "logicalToolCalls",
+    "toolExecutions",
+    "ioReads",
+    "ioWrites",
+    "steps",
+    "timeMs",
+  ]);
+  for (const [dimension, value] of Object.entries(known)) {
+    if (!allowed.has(dimension))
+      throw invalid(`Uncertain completion cannot mark ${dimension} as known.`);
+    integer(value, dimension);
+  }
+}
+
+function heldResources(reservation: ResourceBudgetReservation): ResourceVector {
+  const held = { ...reservation.quote.resources };
+  for (const dimension of Object.keys(reservation.knownUsage ?? {}) as ResourceDimension[])
+    held[dimension] = 0;
+  return held;
+}
+
+function recordEstimateVariances(
+  ledger: ResourceBudgetLedger,
+  reservation: ResourceBudgetReservation,
+  actual: ResourceVector,
+): void {
+  for (const dimension of RESOURCE_DIMENSIONS) {
+    if (actual[dimension] <= reservation.quote.resources[dimension]) continue;
+    const variances = (ledger.estimateVariances ??= []);
+    const previous = variances.find(
+      (entry) => entry.operationId === reservation.id && entry.dimension === dimension,
+    );
+    if (previous) previous.actual = Math.max(previous.actual, actual[dimension]);
+    else
+      variances.push({
+        operationId: reservation.id,
+        dimension,
+        estimated: reservation.quote.resources[dimension],
+        actual: actual[dimension],
+      });
+  }
+}
+
+function recordHardViolations(
+  ledger: ResourceBudgetLedger,
+  operationId: string,
+  now: number,
+): void {
+  const held = addResources(
+    ...Object.values(ledger.reservations)
+      .filter((entry) => entry.status === "RESERVED" || entry.status === "ADMITTED")
+      .map(heldResources),
+  );
+  for (const dimension of RESOURCE_DIMENSIONS) {
+    const limit =
+      dimension === "timeMs" ? ledger.deadlineAt - ledger.startedAt : ledger.limits[dimension];
+    const committed =
+      dimension === "timeMs"
+        ? Math.max(0, now - ledger.startedAt) + held.timeMs
+        : ledger.consumed[dimension] + held[dimension];
+    if (limit !== undefined && committed > limit)
+      ledger.violations.push({ operationId, dimension, estimated: limit, actual: committed });
+  }
 }
 
 function validateFullVector(value: ResourceVector): void {

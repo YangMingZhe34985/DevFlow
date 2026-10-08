@@ -131,6 +131,7 @@ export function gitWorkspaceSource(baseCommit: string, sandbox: SandboxSession):
     };
   };
   const base: IndexSource = {
+    resourceIOOwner: "SANDBOX",
     identity: `git:${baseCommit}`,
     manifest: (signal) => tree(signal),
     async lookup(path, signal) {
@@ -175,6 +176,7 @@ export function snapshotSource(
   };
   return {
     ...(snapshot.manifestHash === undefined ? {} : { identity: snapshot.manifestHash }),
+    resourceIOOwner: "MEMORY",
     fileCount: snapshot.files.length,
     async lookup(path, signal) {
       signal.throwIfAborted();
@@ -218,6 +220,7 @@ export function sandboxSource(
 ): IndexSource {
   const maxFileBytes = Math.min(512 * 1024, options.maxFileBytes ?? INDEX_CONFIG.maxFileBytes);
   return {
+    resourceIOOwner: "SANDBOX",
     async lookup(path, signal) {
       if (exclusionReason(path) !== undefined) return undefined;
       const listing = await sandbox.listFiles({ path, recursive: false, maxEntries: 1 }, signal);

@@ -960,7 +960,20 @@ class PlanSession {
     const started = Date.now();
     let response: ModelResponse;
     try {
-      response = await withSignal(model.generate(request, { signal: this.signal }), this.signal);
+      response = await withSignal(
+        model.generate(
+          {
+            ...request,
+            resourceContinuation: {
+              ...request.resourceContinuation,
+              tokens: (request.resourceContinuation?.tokens ?? 0) + reserveTokens,
+              modelCalls: (request.resourceContinuation?.modelCalls ?? 0) + reserveCalls,
+            },
+          },
+          { signal: this.signal },
+        ),
+        this.signal,
+      );
     } catch (error) {
       this.attempt.metrics.modelLatencyMs += Date.now() - started;
       await this.hooks.onGenerationError?.({

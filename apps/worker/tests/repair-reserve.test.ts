@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 import { repairContinuationReserve } from "../src/runs/repair-reserve.js";
+import { estimateOperationPlan } from "../src/runs/resource-budget-scheduler.js";
 const input = {
   title: "Invalidate policy cache",
   description: "Public invalidation requirement",
@@ -28,4 +29,28 @@ it("uses configured output caps and serialized source size, preserving a separat
     16384,
   );
   expect(250000 - 118568 - initial.total).toBeGreaterThan(45231);
+});
+
+it("retains sequential Coding, Review and bounded recovery rather than taking their maximum", () => {
+  const continuation = repairContinuationReserve(input);
+  const projection = estimateOperationPlan(continuation.operationPlan);
+  expect(projection.resources).toMatchObject({
+    tokens: continuation.total,
+    modelCalls: 3,
+    steps: 3,
+  });
+  const active = repairContinuationReserve({
+    ...input,
+    includeRepair: false,
+    reviewRecoveryAvailable: false,
+  });
+  const activeProjection = estimateOperationPlan(active.operationPlan);
+  expect(activeProjection.resources).toMatchObject({
+    tokens: active.review,
+    modelCalls: 1,
+    steps: 1,
+  });
+  expect(
+    activeProjection.operations.filter((operation) => operation.state === "COMPLETED"),
+  ).toHaveLength(2);
 });

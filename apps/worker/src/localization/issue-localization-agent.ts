@@ -17,17 +17,22 @@ import { parseCandidate } from "./parser.js";
 import { rankIssueCandidates } from "./implementation-anchors.js";
 import { navigateImplementation } from "./implementation-navigation.js";
 import {
+  behaviorEvidence,
+  projectLocalizationEvidence,
+  type EvidenceOmission,
+} from "./evidence-projection.js";
+import {
   RepositoryRelationGraph,
   type IssueGraphReference,
   type RelationGraphArtifact,
 } from "./relation-graph.js";
 
 const DecisionSchema = z.strictObject({
-  summary: z.string().min(1).max(1000),
+  summary: z.string().min(1),
   hypotheses: z
     .array(
       z.strictObject({
-        explanation: z.string().min(1).max(500),
+        explanation: z.string().min(1),
         query: z.string().min(2).max(300),
       }),
     )
@@ -38,7 +43,7 @@ const DecisionSchema = z.strictObject({
         path: z.string().min(1).max(1024),
         startLine: z.number().int().positive(),
         endLine: z.number().int().positive(),
-        reason: z.string().min(1).max(500),
+        reason: z.string().min(1),
       }),
     )
     .max(3),
@@ -46,11 +51,11 @@ const DecisionSchema = z.strictObject({
     .array(
       z.strictObject({
         evidenceId: z.string().min(1).max(100),
-        explanation: z.string().min(1).max(500),
+        explanation: z.string().min(1),
       }),
     )
     .max(4),
-  uncertainty: z.array(z.string().min(1).max(500)).max(8),
+  uncertainty: z.array(z.string().min(1)).max(8),
 });
 
 export interface LocalizationCandidate {
@@ -98,6 +103,14 @@ export interface IssueLocalizationResult {
     }[];
     missingInformation: string[];
     exitReason: string;
+    displayedEvidence?: {
+      id: string;
+      path: string;
+      contentHash: string;
+      startLine: number;
+      endLine: number;
+    }[];
+    omittedEvidence?: EvidenceOmission[];
   };
   uncertainty: string[];
   observations: string[];
@@ -184,6 +197,12 @@ export class IssueLocalizationAgent {
     };
     const observations: string[] = [];
     const catalogue = new Map<string, EvidenceItem>();
+    const anchors = new Set<string>();
+    const latestReads = new Set<string>();
+    let displayedEvidence: NonNullable<
+      NonNullable<IssueLocalizationResult["evidenceState"]>["displayedEvidence"]
+    > = [];
+    let omittedEvidence: EvidenceOmission[] = [];
     const issueSignals = extractIssueSignals(`${input.title}\n${input.description}`);
     const priority = (item: EvidenceItem) =>
       sourcePathPriority(item.path, issueSignals) +
@@ -206,25 +225,25 @@ export class IssueLocalizationAgent {
           0,
           24,
         );
-        if (catalogue.size >= 16 && !catalogue.has(id)) {
-          const pathCounts = new Map<string, number>();
-          for (const row of catalogue.values())
-            pathCounts.set(row.path, (pathCounts.get(row.path) ?? 0) + 1);
-          const diverse = !pathCounts.has(item.path);
-          const replaceable = [...catalogue].filter(
-            ([, row]) => !diverse || (pathCounts.get(row.path) ?? 0) > 1,
-          );
-          const worst = (replaceable.length ? replaceable : [...catalogue]).sort(
-            (a, b) => priority(a[1]) - priority(b[1]),
-          )[0]!;
-          if (
-            priority(item) < priority(worst[1]) &&
-            !(diverse && (pathCounts.get(worst[1].path) ?? 0) > 1)
-          )
-            continue;
-          catalogue.delete(worst[0]);
+        // Separate bounded host history from its projected model view. All
+        // records still share the existing source IO/search/read allowances.
+        for (const [oldId, old] of catalogue) {
+          if (old.path === item.path && old.contentHash !== item.contentHash) {
+            catalogue.delete(oldId);
+            anchors.delete(oldId);
+            latestReads.delete(oldId);
+          }
         }
+        if (catalogue.size >= 33 && !catalogue.has(id))
+          throw new DevflowError({
+            code: "INSUFFICIENT_EVIDENCE",
+            message: "Localization evidence archive exceeds its bounded retrieval/read capacity.",
+          });
         catalogue.set(id, item);
+        if (item.retrievalSource.includes("agent-directed-read")) {
+          latestReads.add(id);
+          anchors.add(id);
+        }
         if (
           ["IMPLEMENTATION", "ENTRY"].includes(sourceRole(item.path)) &&
           /^[a-f0-9]{64}$/u.test(item.contentHash)
@@ -457,9 +476,32 @@ export class IssueLocalizationAgent {
         }
         metrics.totalTokens += response.usage.totalTokens;
         await input.onResponse?.(response);
+        const submitted = JSON.parse(
+          String(request.messages.find((message) => message.role === "USER")?.content ?? "{}"),
+        );
+        if (Array.isArray(submitted.evidence)) {
+          displayedEvidence = submitted.evidence.map(
+            ({
+              id,
+              path,
+              contentHash,
+              startLine,
+              endLine,
+            }: {
+              id: string;
+              path: string;
+              contentHash: string;
+              startLine: number;
+              endLine: number;
+            }) => ({ id, path, contentHash, startLine, endLine }),
+          );
+          omittedEvidence = submitted.omittedEvidenceDetails ?? [];
+        }
         await input.onCheckpoint?.({
           status: "RESPONSE",
           ...metrics,
+          displayedEvidence,
+          omittedEvidence,
           reservedTokens: 0,
           requestIssued: true,
         });
@@ -467,6 +509,23 @@ export class IssueLocalizationAgent {
           throw new DevflowError({
             code: "INSUFFICIENT_EVIDENCE",
             message: "Localization returned usage exceeded its token budget.",
+          });
+        const outputMaxBytes = configuredOutputTokens * 8;
+        const outputBytes = Math.max(
+          Buffer.byteLength(response.text ?? ""),
+          Buffer.byteLength(JSON.stringify(response.output ?? null)),
+        );
+        if (outputBytes > outputMaxBytes)
+          throw new DevflowError({
+            code: "MODEL_OUTPUT_INVALID",
+            message:
+              "Localization decision exceeds the shared output envelope; no lossless shortening was attempted.",
+            details: {
+              stopReason: "LOCALIZATION_OUTPUT_TOO_LARGE",
+              outputBytes,
+              outputMaxBytes,
+              requestIssued: true,
+            },
           });
         return response;
       },
@@ -508,7 +567,7 @@ export class IssueLocalizationAgent {
             : finalOnly
               ? "READ_LIMITS"
               : "MODEL_FINAL";
-      const state = {
+      const baseState = {
         issue: { title: input.title.slice(0, 1000), description: input.description.slice(0, 8000) },
         round,
         mode: finalOnly ? "FINAL" : "EXPLORE",
@@ -527,31 +586,30 @@ export class IssueLocalizationAgent {
           modelCalls: 4 - metrics.modelCalls,
           tokens: Math.max(0, input.maxTokens - metrics.totalTokens),
         },
-        evidence: [...catalogue]
-          .sort((a, b) => priority(b[1]) - priority(a[1]))
-          .map(([id, item]) => ({
-            id,
-            path: item.path,
-            symbol: item.symbol,
-            startLine: item.startLine,
-            endLine: item.endLine,
-            contentHash: item.contentHash,
-            snippet: item.snippet,
-            truncated: item.truncated,
-            directImports: item.directImports.slice(0, 4),
-            fileType: item.fileType,
-            parseStatus: item.parseStatus,
-            role: sourceRole(item.path),
-            observation: item.truncated
-              ? "PARTIAL_SOURCE_ROOT_CAUSE_UNVERIFIED"
-              : "SOURCE_OBSERVED_ROOT_CAUSE_UNVERIFIED",
-          })),
         observations: observations.slice(-8),
         ...(graph ? { graph: graph.issueView(seeds, [], 4096, issueSymbols) } : {}),
-        omittedEvidence: 0,
       };
+      const rows = [...catalogue]
+        .sort((a, b) => priority(b[1]) - priority(a[1]))
+        .map(([id, item]) => ({
+          id,
+          path: item.path,
+          symbol: item.symbol,
+          startLine: item.startLine,
+          endLine: item.endLine,
+          contentHash: item.contentHash,
+          snippet: item.snippet,
+          truncated: item.truncated,
+          directImports: item.directImports.slice(0, 4),
+          fileType: item.fileType,
+          parseStatus: item.parseStatus,
+          role: sourceRole(item.path),
+          observation: item.truncated
+            ? "PARTIAL_SOURCE_ROOT_CAUSE_UNVERIFIED"
+            : "SOURCE_OBSERVED_ROOT_CAUSE_UNVERIFIED",
+        }));
       const firstPaths = new Set<string>();
-      state.evidence = state.evidence
+      const ordered = rows
         .map((row, index) => {
           const first = !firstPaths.has(row.path);
           firstPaths.add(row.path);
@@ -559,10 +617,84 @@ export class IssueLocalizationAgent {
         })
         .sort((a, b) => Number(b.first) - Number(a.first) || a.index - b.index)
         .map(({ row }) => row);
-      while (Buffer.byteLength(JSON.stringify(state)) > 20000 && state.evidence.length > 1) {
-        state.evidence.pop();
-        state.omittedEvidence++;
+      if (round === 0)
+        for (const row of ordered) {
+          if (behaviorEvidence(catalogue.get(row.id)!)) anchors.add(row.id);
+        }
+      const configuredOutput = input.maxOutputTokens ?? 4096;
+      const envelopeTokens = estimateState("");
+      const maxStateBytes = Math.max(
+        0,
+        (Math.min(input.contextTokens ?? 32000, input.maxTokens - metrics.totalTokens) -
+          configuredOutput -
+          envelopeTokens) *
+          3,
+      );
+      const projection = projectLocalizationEvidence({
+        rows: ordered,
+        requiredIds: new Set([...anchors, ...latestReads]),
+        state: baseState,
+        maxBytes: maxStateBytes,
+      });
+      if (!projection.permitted) {
+        exitReason = "EVIDENCE_PROJECTION_BUDGET";
+        uncertainty.push(
+          "Earlier behavior evidence and requested reads cannot jointly fit the remaining request envelope. Preserve the source records and inspect the explicit resource gap.",
+        );
+        omittedEvidence = ordered.map(({ id, path, contentHash, startLine, endLine }) => ({
+          id,
+          path,
+          contentHash,
+          startLine,
+          endLine,
+          reason: "CONTEXT_BUDGET" as const,
+        }));
+        await input.onCheckpoint?.({
+          status: "PREFLIGHT_BLOCKED",
+          ...metrics,
+          exitReason,
+          requiredBytes: projection.requiredBytes,
+          maxBytes: projection.maxBytes,
+          requiredRecords: projection.requiredRecords,
+          maxRecords: projection.maxRecords,
+          omittedEvidence,
+          requestIssued: false,
+        });
+        if (!decisions)
+          throw new DevflowError({
+            code: "INSUFFICIENT_EVIDENCE",
+            message:
+              "Localization cannot jointly display necessary evidence; request was not issued.",
+            details: {
+              requiredBytes: projection.requiredBytes,
+              maxBytes: projection.maxBytes,
+              configuredOutputTokens: configuredOutput,
+              effectiveOutputTokens: configuredOutput,
+              contextTokens: input.contextTokens ?? 32000,
+              requestIssued: false,
+            },
+          });
+        break;
       }
+      const state = projection.state;
+      const preparedEvidence = projection.selected.map(
+        ({ id, path, contentHash, startLine, endLine }) => ({
+          id,
+          path,
+          contentHash,
+          startLine,
+          endLine,
+        }),
+      );
+      await input.onCheckpoint?.({
+        status: "PROJECTION",
+        ...metrics,
+        preparedEvidence,
+        omittedEvidence: state.omittedEvidenceDetails,
+        anchors: [...anchors],
+        latestReads: [...latestReads],
+        requestIssued: false,
+      });
       const estimatedInput = estimateState(state);
       const finalState = {
         ...state,
@@ -570,7 +702,6 @@ export class IssueLocalizationAgent {
         canInspect: false,
         remaining: { ...state.remaining, searches: 0, reads: 0, readAttempts: 0 },
       };
-      const configuredOutput = input.maxOutputTokens ?? 4096;
       const finalInput = estimateState(finalState);
       // Subsequent actual requests are always rechecked; reserve one final decision and one
       // compact format/reasoning recovery projection instead of silently shrinking final output.
@@ -600,6 +731,7 @@ export class IssueLocalizationAgent {
             "Read-only hypotheses, bounded evidence requests and evidence-backed candidate regions.",
           purpose: "LOCALIZATION",
           lengthRegeneration: lengthRegenerations === 0,
+          rejectLength: true,
           messages: [
             { role: "SYSTEM", content: SYSTEM },
             {
@@ -741,6 +873,7 @@ export class IssueLocalizationAgent {
         break;
       }
       let expanded = false;
+      latestReads.clear();
       const queryKey = (query: string) => query.trim().replace(/\s+/gu, " ").toLowerCase();
       const readKey = (r: { path: string; startLine: number; endLine: number }) =>
         `${r.path.replaceAll("\\", "/")}:${r.startLine}:${Math.min(r.endLine, r.startLine + LOCALIZATION_READ_LIMITS.maxLines - 1)}`;
@@ -972,6 +1105,8 @@ export class IssueLocalizationAgent {
       ...(implementationEvidence.length ? { implementationEvidence } : {}),
       evidenceState: {
         workspaceRevision: graph?.snapshot().workspaceRevision ?? 0,
+        displayedEvidence,
+        omittedEvidence,
         observedImplementations: implementationEvidence.map(
           ({ path, symbol, contentHash, startLine, endLine }) => ({
             path,

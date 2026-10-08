@@ -72,8 +72,175 @@ function run(source: IndexSource, model: FakeLanguageModel, evidence?: EvidenceP
 const state = (r: ModelRequest) => JSON.parse(String(r.messages[1]!.content));
 
 describe("read-only semantic Issue localization", () => {
+  it("accepts complete long explanations within the shared envelope without a lossless conversion call", async () => {
+    const value = decision({
+      summary: "s".repeat(1018),
+      hypotheses: [{ query: "behavior", explanation: "h".repeat(548) }],
+      uncertainty: ["u".repeat(600)],
+    });
+    const model = new FakeLanguageModel([response(value), response(decision())]);
+    const result = await new IssueLocalizationAgent().run({
+      title: "bug",
+      description: "bug",
+      repositoryId: "repo",
+      baseCommitSha: "base",
+      source: memorySource({}),
+      model,
+      signal,
+      maxTokens: 18000,
+      retrieve: async () => undefined,
+    });
+    expect(model.requests.every((r) => !String(r.messages[0]?.content).includes("lossless"))).toBe(
+      true,
+    );
+    expect(result.metrics.modelCalls).toBe(2);
+    const finalModel = new FakeLanguageModel([response(decision({ summary: value.summary }))]);
+    const final = await run(memorySource({}), finalModel);
+    expect(final.summary).toBe(value.summary);
+    expect(finalModel.requests).toHaveLength(1);
+  });
+  it("rejects an oversized whole decision and does not attempt lossless shortening", async () => {
+    const model = new FakeLanguageModel([response(decision({ summary: "s".repeat(33000) }))]);
+    await expect(run(memorySource({}), model)).rejects.toMatchObject({
+      code: "MODEL_OUTPUT_INVALID",
+      details: { stopReason: "LOCALIZATION_OUTPUT_TOO_LARGE", requestIssued: true },
+    });
+    expect(model.requests).toHaveLength(1);
+  });
+  it("does not act on a parseable LENGTH decision before the one accounted regeneration", async () => {
+    const source = memorySource({ "src/a.ts": "export const a = 1;" });
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        text: JSON.stringify(
+          decision({
+            inspect: [
+              { path: "src/a.ts", startLine: 1, endLine: 1, reason: "Incomplete decision" },
+            ],
+          }),
+        ),
+        finishReason: "LENGTH",
+        toolCalls: [],
+        usage: { inputTokens: 100, outputTokens: 100, totalTokens: 200 },
+      }),
+      response(decision()),
+    ]);
+    const result = await run(source, model);
+    expect(source.read).not.toHaveBeenCalled();
+    expect(result.metrics).toMatchObject({ modelCalls: 2, reads: 0 });
+  });
+  it("keeps earlier behavior and all successful supplementary reads jointly visible under background pressure", async () => {
+    const files = {
+      "src/producer.ts": "export function produce() { return 'skipped'; }",
+      "src/consumer.ts":
+        "export function consume(status: string) { return status === 'skipped' ? 1 : 0; }",
+      "tests/behavior.test.ts": "expect(produce()).toBe('skipped');",
+      ...Object.fromEntries(
+        Array.from({ length: 5 }, (_, i) => [
+          `src/background${i}.ts`,
+          "// declaration context\n".repeat(95),
+        ]),
+      ),
+      ...Object.fromEntries(
+        Array.from({ length: 3 }, (_, i) => [
+          `src/extra${i}.ts`,
+          `// requested evidence ${i}\n`.repeat(120) + `export const observed${i} = 1;`,
+        ]),
+      ),
+    };
+    const source = memorySource(files);
+    const pack = await new IssueLocalizer().retrieve({
+      repositoryId: "repo",
+      accessScope: "test",
+      baseCommitSha: "base",
+      runId: "r",
+      workspaceRevision: 0,
+      description: "src/producer.ts",
+      source,
+      signal,
+    });
+    pack.evidence = Object.entries(files)
+      .filter(([path]) => !path.includes("extra"))
+      .map(([path, snippet]) => ({
+        ...pack.evidence[0]!,
+        path,
+        snippet,
+        startLine: 1,
+        endLine: snippet.split("\n").length,
+        contentHash: hash(snippet),
+        symbol: null,
+        signature: null,
+        retrievalSource: path.includes("background") ? ["symbol-navigation"] : ["lexical"],
+        directImports: [],
+        fileType: path.includes("tests/") ? ("TEST" as const) : ("SOURCE" as const),
+      }));
+    const states: ReturnType<typeof state>[] = [];
+    const model = new FakeLanguageModel([
+      (r) => {
+        states.push(state(r));
+        return response(
+          decision({
+            inspect: Array.from({ length: 3 }, (_, i) => ({
+              path: `src/extra${i}.ts`,
+              startLine: 1,
+              endLine: 80,
+              reason: "Need supplementary source",
+            })),
+          }),
+        );
+      },
+      (r) => {
+        const current = state(r);
+        states.push(current);
+        for (const path of [
+          "src/producer.ts",
+          "src/consumer.ts",
+          "tests/behavior.test.ts",
+          "src/extra0.ts",
+          "src/extra1.ts",
+          "src/extra2.ts",
+        ])
+          expect(current.evidence.some((row: { path: string }) => row.path === path)).toBe(true);
+        const producer = current.evidence.find(
+          (row: { path: string }) => row.path === "src/producer.ts",
+        );
+        return response(
+          decision({
+            candidates: [{ evidenceId: producer.id, explanation: "Current behavior source" }],
+          }),
+        );
+      },
+    ]);
+    const result = await new IssueLocalizationAgent().run({
+      title: "bug",
+      description: "Skipped state is inconsistent",
+      repositoryId: "repo",
+      baseCommitSha: "base",
+      source,
+      evidence: pack,
+      model,
+      signal,
+      maxTokens: 60000,
+      contextTokens: 32000,
+      retrieve: async () => undefined,
+    });
+    expect(result.metrics).toMatchObject({ reads: 3, modelCalls: 2 });
+    expect(result.candidates[0]?.path).toBe("src/producer.ts");
+    expect(result.observedEvidence).toHaveLength(11);
+    expect(
+      result.evidenceState?.displayedEvidence?.some((row) => row.path === "src/producer.ts"),
+    ).toBe(true);
+    expect(
+      states[1].omittedEvidenceDetails.some(
+        (row: { path: string; reason: string }) =>
+          row.path.includes("background") && row.reason === "CONTEXT_BUDGET",
+      ),
+    ).toBe(true);
+  });
   it("accepts input above the retired 8000-token gate, preserves output and persists dispatch before calling", async () => {
-    const content = "// an actual complete source record\n".repeat(850);
+    const content =
+      "export function large() {\n" +
+      "// an actual complete source record\n".repeat(847) +
+      "return 1;\n}\n";
     const source = memorySource({
       "src/large.ts": content,
       "src/next.ts": "export const freshEvidence = 1;",

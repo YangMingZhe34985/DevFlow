@@ -83,3 +83,7 @@ Experiment pause handling checks cancellation before each provider dispatch and 
 ### v2.2 selective migration: evidence continuity
 
 The local migration retains the original Planner proposal contract and one approved read-only discovery. Localization prioritizes public assertions and their runtime imports; type-only edges and unrelated star exports do not displace those routes. Current source evidence is handed across initial planning and discovery with full SHA checks; a sandbox preparation counter change alone is not a source change. Assertions, implementations and consumers share a bounded projection. Unshown or missing records remain unknown and never grant edit authority. Interrupted Localization journals cannot reset resource allowances; whole-request repetition or two evidence-free rounds stop exploration.
+
+### Localization 输出与证据连续性
+
+定位说明使用整份输出大小和 token 预算约束，取消逐字段说明字符门槛；查询、路径、引用、数组与源码身份仍严格校验。宿主档案保留当前 SHA 的已观察记录，请求视图优先联合展示先前行为证据和已验证补读。20 KiB 为普通投影目标，必要完整记录只能在真实上下文及剩余阶段额度内扩展；不足时明确停止。可解析的 LENGTH 回复也必须先恢复才能形成决策，恢复计入原有四次调用。

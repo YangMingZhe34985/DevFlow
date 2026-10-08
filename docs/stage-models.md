@@ -49,3 +49,5 @@ Normal Review reserves its request, one still-available recovery and candidate f
 ### Localization request budget
 
 The host derives the Localization lease from current serialized task/evidence, configured stage outputs and downstream planning/execution/Repair/Review reservations. Unknown envelope/evidence growth is an explicit estimate, rechecked at each boundary. The input plus configured output must fit both the stage balance and configured context window. Insufficient capacity stops before dispatch; the host does not lower the output ceiling to make a request fit. Up to four Localization requests, including recovery, share the lease. Consumption journals survive task interruption; uncertain interrupted state is blocked rather than restarted with fresh allowance.
+
+Localization 的纯说明字段不设细碎字符门槛；整份序列化输出最大字节为配置输出 token 的八倍（大小保护，非精确 token 换算），实际计费与 token 额度仍采用提供方使用记录。配置输出上限保持原值。格式修复处理 JSON/结构错误，完整长说明无需额外无损转换；LENGTH 回复即使可解析也不能作为完整决策。

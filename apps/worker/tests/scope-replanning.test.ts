@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import { DevflowError } from "@devflow/shared";
 import type { SandboxSession } from "@devflow/sandbox";
+import { ContinuationTools } from "../src/runs/continuation-tools.js";
+import { repairSourceIdentity } from "../src/runs/repair-convergence.js";
 import {
   captureReplanCandidate,
   restoreReplanCandidate,
@@ -104,6 +106,38 @@ describe("scope replanning authority and recoverable candidate", () => {
     expect(after.current).toEqual(before.current);
     expect(ScopeReplanStateSchema.parse(JSON.parse(JSON.stringify(state))).used).toBe(1);
     expect(state.repairAttempts).toBe(1);
+  });
+  it("reserves the real remaining checkpoint and identity IO after approved candidate restoration", async () => {
+    const baseline = { "old.ts": "old\n", "deleted.ts": "remove\n", "untouched.ts": "same\n" };
+    const current = fixture(
+      { "old.ts": "new\n", "added.ts": "add\n", "untouched.ts": "same\n" },
+      baseline,
+    );
+    const approved = ["old.ts", "deleted.ts", "added.ts", "untouched.ts"];
+    const continuation = new ContinuationTools(approved);
+    // The previous checkpoint already contains old.ts; continued coding adds/deletes two paths.
+    continuation.changed.add("added.ts");
+    continuation.changed.add("deleted.ts");
+    const reserve = continuation.afterReplan(2, ["old.ts"]);
+    let checkpointReads = 0;
+    await captureReplanCandidate({
+      sandbox: current.sandbox,
+      paths: approved,
+      baseCommitSha: "a".repeat(40),
+      signal: AbortSignal.timeout(10_000),
+      beforeRead: () => {
+        checkpointReads++;
+      },
+    });
+    let identityReads = 0;
+    await repairSourceIdentity(current.sandbox, approved, AbortSignal.timeout(10_000), () => {
+      identityReads++;
+    });
+    expect(checkpointReads).toBe(reserve.operations.checkpoint);
+    expect(identityReads).toBe(reserve.operations.sourceIdentity);
+    expect(reserve.total - checkpointReads - identityReads).toBe(2 + 8);
+    expect(reserve.operations).not.toHaveProperty("checkpointRestore");
+    expect(reserve.operations).not.toHaveProperty("repairContext");
   });
   it("validates all scope and source identities before any restore write", async () => {
     const state = ScopeReplanStateSchema.parse({

@@ -1,4 +1,11 @@
 import { ContinuationTools } from "./continuation-tools.js";
+import { CodingSession, codingMetricDelta } from "./coding-session.js";
+import {
+  codingContinuationReserve,
+  codingBranchFrontier,
+  codingPlannerTokenLease,
+  codingReplanReserve,
+} from "./coding-budget.js";
 import { repairContinuationReserve } from "./repair-reserve.js";
 import { repairDiagnosticTasks } from "./repair-tasks.js";
 import {
@@ -79,6 +86,7 @@ import {
   type WorkingSet,
   type WorkingCode,
   type AgentState,
+  type AgentRunRequest,
   contentHash,
   estimateModelInput,
   type VercelAiModelParameters,
@@ -182,8 +190,7 @@ import { ensureLocalRunSnapshot, requireLocalRunSnapshot } from "./local-run-sna
 import type { RunExecutionOutcome, RunExecutionPort } from "./run-execution.js";
 import {
   WorkflowBudgetLedger,
-  allocateExecuteBudget,
-  allocateRepairBudget,
+  allocateCodingBudget,
   allocateReviewBudget,
   buildAdaptiveBudgetMetrics,
   evaluateBudgetExtension,
@@ -203,6 +210,8 @@ import {
   stageReasoningEffort,
   EVIDENCE_ACTION_PROMPT,
   stageSystemPrompt,
+  codingSystemPrompt,
+  toolsForCoding,
   toolsForStage,
   type AgentPhasePurpose,
 } from "./workflow-stage-policy.js";
@@ -456,7 +465,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             this.modelBindings.get(localizationModel)?.settings?.maxOutputTokens ?? 4096,
           planner: this.modelBindings.get(model)?.settings?.maxOutputTokens ?? 4096,
           execute: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
-          repair: this.environment.stageModels?.REPAIR?.maxOutputTokens ?? 8192,
+          repair: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
           review: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 4096,
         },
       });
@@ -1080,7 +1089,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       let scopeReplan: ScopeReplanState | undefined;
       let continuationRecoveryAvailable = true;
       const continuationReserve = () => {
-        if (scopeReplan) return { tokens: 0, steps: 0, timeMs: 0 };
         const source = JSON.stringify(
           [...continuation.current.values()].map((f) => ({
             path: f.path,
@@ -1088,22 +1096,55 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             content: f.content.slice(0, 3000),
           })),
         ).slice(0, 16000);
-        const repair = repairContinuationReserve({
+        const reserve = codingContinuationReserve({
           title: run.task.title,
           description: run.task.description,
           plan: plan.proposal ?? plan,
           diagnostics: [],
           source,
-          repairOutput: this.environment.stageModels?.REPAIR?.maxOutputTokens ?? 8192,
+          codingOutput: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
           reviewOutput: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048,
-          includeRepair: true,
+          resumeCoding: false,
           reviewRecoveryAvailable: continuationRecoveryAvailable,
         });
-        return {
-          tokens: repair.total,
-          steps: 3,
-          timeMs: reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
-        };
+        // Keep a minimal reachable replan, not a second Repair lifecycle. The branch is
+        // transferred to Planner once scope conflict is confirmed; final Review is shared.
+        const plannerOutput = this.environment.stageModels?.PLANNER?.maxOutputTokens ?? 8192;
+        const replanBranch = !scopeReplan
+          ? codingReplanReserve({
+              plannerContext: { task: run.task.description, plan: plan.proposal ?? plan, source },
+              plannerOutputTokens: plannerOutput,
+              plannerInputGrowthTokens: 2048,
+              plannerTimeoutMs: this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
+              codingMessages: [
+                {
+                  role: "USER",
+                  content: JSON.stringify({
+                    task: run.task.description,
+                    plan: plan.proposal ?? plan,
+                    source,
+                    diagnostics: "Public validation feedback",
+                  }),
+                },
+              ],
+              codingTools: [],
+              codingOutputTokens: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+              codingInputGrowthTokens: 4096,
+              codingTimeoutMs: 60_000,
+            })
+          : undefined;
+        const frontier = codingBranchFrontier({
+          sharedFinal: {
+            tokens: reserve.total,
+            steps: 2,
+            tools: testCommandCache.profile?.checks.length ?? 1,
+            timeMs:
+              300_000 + reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
+          },
+          continuing: { tokens: 0, steps: 0, tools: 0, timeMs: 0 },
+          ...(replanBranch ? { replanning: replanBranch.required } : {}),
+        });
+        return { ...frontier.required, audit: frontier };
       };
       const replanArtifact = (await this.database.artifacts.list(run.id)).findLast(
         (a) => a.name === "scope-replan-v1.json",
@@ -1246,6 +1287,76 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
       );
       const implementationModel = this.createModel(run, benchmark?.configuration.modelParameters);
+      const codingArtifacts = await this.database.artifacts.list(run.id);
+      const savedCoding = codingArtifacts.findLast((a) => a.name === "coding-session-v1.json");
+      if (
+        !savedCoding &&
+        (resumeReplan || codingArtifacts.some((a) => a.name === "execute-convergence-v1.json"))
+      )
+        throw new DevflowError({
+          code: "CONFLICT",
+          message:
+            "CODING_LEGACY_RESUME_UNCONFIRMED: historical report remains readable, but full session consumption and source identity cannot be reconstructed safely.",
+          details: { requestIssued: false },
+        });
+      let restoredCoding: AgentState | undefined;
+      if (savedCoding?.content) {
+        if (
+          !resumeReplan ||
+          !scopeReplan?.codingSessionSha256 ||
+          contentHash(savedCoding.content) !== scopeReplan.codingSessionSha256
+        )
+          throw new DevflowError({
+            code: "CONFLICT",
+            message:
+              "CODING_RESUME_REQUIRES_VERIFIED_CHECKPOINT: saved session cannot restart against unverified source.",
+            details: { requestIssued: false },
+          });
+        restoredCoding = AgentStateSchema.parse(
+          JSON.parse(savedCoding.content).state,
+        ) as AgentState;
+      }
+      const codingSession = new CodingSession(
+        implementationModel,
+        async (state) => {
+          const content = JSON.stringify({ version: 1, sessionId: run.id, state });
+          await this.database.artifacts.create({
+            runId: run.id,
+            kind: "OTHER",
+            name: "coding-session-v1.json",
+            mimeType: "application/json",
+            content,
+            sha256: contentHash(content),
+            metadata: {
+              visibility: "HOST_ONLY",
+              lifecycle: "UNIFIED_CODING",
+              steps: state.stepCount,
+            },
+          });
+        },
+        restoredCoding,
+      );
+      let codingCompressionHold = restoredCoding?.contextCompression?.pendingTokenReserve ?? 0;
+      const recordCodingSegment = (
+        result: RunResult,
+        stage: "EXECUTE" | "REPAIR",
+        duration: number,
+      ) => {
+        // Pending compression is a hold, not consumption. Transfer/release it instead of
+        // repeatedly adding its cumulative checkpoint value to the workflow ledger.
+        const nextHold = codingSession.state?.contextCompression?.pendingTokenReserve ?? 0;
+        metrics.contextCompressionReservedTokens = Math.max(
+          0,
+          (metrics.contextCompressionReservedTokens ?? 0) - codingCompressionHold,
+        );
+        mergeAgentPhaseMetrics(
+          metrics,
+          { ...result.metrics, contextCompressionReservedTokens: nextHold },
+          stage,
+          duration,
+        );
+        codingCompressionHold = nextHold;
+      };
       if (plan.approvalScope?.mode === "DISCOVERY_ONLY") {
         // One bounded read-only investigation. No editing runtime or mutation
         // tools are registered before returning the newly proposed approval.
@@ -1551,6 +1662,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         };
       };
 
+      let approvalContinuationPending = resumeReplan;
       let implementation: RunResult = {
         runId: run.id,
         status: "SUCCEEDED",
@@ -1681,14 +1793,22 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         budget.requireAgentSteps("EXECUTE");
         recordStageAttempt(metrics, "EXECUTE");
         const implementationStartedAt = Date.now();
-        const implementationLease = allocateExecuteBudget({
+        const implementationLease = allocateCodingBudget({
           budget: adaptiveBudget,
           consumedSteps: metrics.steps,
-          remainingRepairAttempts: run.maxTestRetries + run.maxReviewRetries,
+          remainingReviewRequests: 2,
         });
+        if (implementationLease.maximumSteps < 1)
+          throw new DevflowError({
+            code: "EXECUTION_BUDGET_EXCEEDED",
+            message: "CODING_REVIEW_STEP_RESERVE: no coding decision fits before mandatory Review.",
+            details: { requestIssued: false },
+          });
         const implementationBaseSteps = metrics.steps;
 
         implementation = await this.runAgentPhase({
+          codingSession,
+          continuationReserve,
           run,
           plan,
           sandbox,
@@ -1701,7 +1821,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ? {
                 continuationTools: () =>
                   scopeReplan
-                    ? 0
+                    ? continuation.afterReplan(
+                        testCommandCache.profile?.checks.length ?? 1,
+                        scopeReplan.files.map((file) => file.path),
+                      ).total
                     : continuation.reserve(
                         testCommandCache.profile?.checks.length ?? 1,
                         !!localSnapshot,
@@ -1710,14 +1833,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: implementationLease.mandatoryDownstreamSteps,
-                  downstreamTokens:
-                    2 *
-                    (Math.ceil((64 * 1024) / 3) +
-                      (this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048)),
+                  downstreamTokens: continuationReserve().tokens,
                 },
               }
             : {}),
-          maxSteps: adaptiveBudget.hardLimit - implementationBaseSteps,
+          maxSteps: implementationLease.maximumSteps,
           adaptiveStepBudget: adaptiveControllerFor(
             "EXECUTE",
             implementationLease,
@@ -1744,12 +1864,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               }
             : {}),
         });
-        mergeAgentPhaseMetrics(
-          metrics,
-          implementation.metrics,
-          "EXECUTE",
-          Date.now() - implementationStartedAt,
-        );
+        recordCodingSegment(implementation, "EXECUTE", Date.now() - implementationStartedAt);
         if (implementation.metrics.prePatch) metrics.prePatch = implementation.metrics.prePatch;
         completion = implementation.executeCompletion;
         if (completion) verification.execution = completion.outcome;
@@ -1880,13 +1995,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         { before: string | undefined; after: string | undefined }
       >();
       if (unfinishedImplementation) {
-        let diagnosticTest: WorkflowTestResult | undefined;
-        let diagnosticStop: string | undefined;
-        try {
-          diagnosticTest = await executeTest(0, "EXECUTE");
-        } catch (error) {
-          diagnosticStop = error instanceof Error ? error.message : String(error);
-        }
         await this.database.artifacts.create({
           runId: run.id,
           kind: "OTHER",
@@ -1894,28 +2002,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           content: JSON.stringify({
             completion,
             stop: unfinishedImplementation.error,
-            diagnosticTest,
-            diagnosticStop,
+            next: "FINAL_VALIDATION_THEN_SAME_CODING_SESSION",
             strictCompletion: false,
           }),
           metadata: { visibility: "HOST_ONLY" },
         });
-        return await this.finalizeBenchmark(
-          benchmark,
-          sandbox,
-          withWorkflowMetrics(
-            {
-              ...unfinishedImplementation,
-              verification,
-            },
-            metrics,
-            startedAt,
-          ),
-          false,
-          0,
-          0,
-          executionSignal,
-        );
       }
       const observeRepairIdentity = async () =>
         repairSourceIdentity(
@@ -1967,10 +2058,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         }
         return { repositoryManifest: repairManifest, beforeOperation };
       };
-      const runRepair = async (
+      const continueCoding = async (
         purpose: "TEST_REPAIR" | "REVIEW_REPAIR",
         additionalContext: string,
-        entryProgress: "DIFF_PROGRESS" | "DISCOVERY_PROGRESS" | "NO_PROGRESS",
+        _entryProgress: "DIFF_PROGRESS" | "DISCOVERY_PROGRESS" | "NO_PROGRESS",
         currentSources: WorkingCode[],
         reviewFindingIds?: readonly string[],
         stableTaskContext?: string,
@@ -1986,69 +2077,54 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         const beforeIdentity = await observeRepairIdentity();
         recordStageAttempt(metrics, "REPAIR");
         const repairStartedAt = Date.now();
-        const remainingRepairAttempts = Math.max(
-          1,
-          run.maxTestRetries - repairAttempt + 1 + run.maxReviewRetries - reviewAttempt,
-        );
-        let repairLease = allocateRepairBudget({
+        const repairLease = allocateCodingBudget({
           budget: adaptiveBudget,
           consumedSteps: metrics.steps,
-          remainingRepairAttempts,
+          remainingReviewRequests: 2,
         });
-        if (repairLease.initialSteps < 1) {
-          const decision = evaluateBudgetExtension({
-            stage: "REPAIR",
-            budget: adaptiveBudget,
-            consumedSteps: metrics.steps,
-            mandatoryDownstreamSteps: repairLease.mandatoryDownstreamSteps,
-            progress: entryProgress,
-            progressFingerprintChanged: entryProgress === "DIFF_PROGRESS",
-            discoveryExtensionUsed,
-            budgetExtensions,
+        if (repairLease.maximumSteps < 1)
+          throw new DevflowError({
+            code: "EXECUTION_BUDGET_EXCEEDED",
+            message:
+              "CODING_REVIEW_STEP_RESERVE: no continued coding decision fits before mandatory Review.",
+            details: { requestIssued: false },
           });
-          if (decision.kind === "DENIED") {
-            throw new DevflowError({
-              code: decision.code,
-              message: "REPAIR could not obtain a progress-aware stage-entry extension.",
-              details: decision.details,
-            });
-          }
-          adaptiveBudget = {
-            ...adaptiveBudget,
-            activeLimit: decision.newActiveLimit,
-          };
-          budgetExtensions = decision.budgetExtensions;
-          if (entryProgress === "DISCOVERY_PROGRESS") discoveryExtensionUsed = true;
-          refreshAdaptiveMetrics();
-          repairLease = allocateRepairBudget({
-            budget: adaptiveBudget,
-            consumedSteps: metrics.steps,
-            remainingRepairAttempts,
-          });
-        }
         const repairBaseSteps = metrics.steps;
         const result = await this.runAgentPhase({
+          codingSession,
+          hostContinuation: {
+            id: `${approvalContinuationPending ? "approval:" + approved!.id : purpose}:${repairAttempt}:${reviewAttempt}`,
+            kind: approvalContinuationPending
+              ? "APPROVAL"
+              : purpose === "TEST_REPAIR"
+                ? "PUBLIC_VALIDATION"
+                : "INDEPENDENT_REVIEW",
+            feedback: `Host ${purpose} observation ${contentHash(stableTaskContext ?? additionalContext)}. The complete diagnostics and requirements appear once in Stable Coding task state; current source appears in Repository/stage evidence. Continue from this observation without changing approval or budgets.`,
+            ...(beforeIdentity ? { sourceIdentity: beforeIdentity } : {}),
+            observedSourceChanged: true,
+          },
           run,
           plan,
           sandbox: activeSandbox,
           signal: executionSignal,
           executor,
           tools,
-          model: this.modelFactory
-            ? implementationModel
-            : this.createModel(run, benchmark?.configuration.modelParameters, "REPAIR"),
+          model: implementationModel,
           purpose,
           ...(plan.proposalVersion
             ? {
                 continuationTools: () =>
                   scopeReplan
-                    ? 0
+                    ? continuation.afterReplan(
+                        testCommandCache.profile?.checks.length ?? 1,
+                        scopeReplan.files.map((file) => file.path),
+                      ).total
                     : continuation.reserve(
                         testCommandCache.profile?.checks.length ?? 1,
                         !!localSnapshot,
                       ).total,
-                // This request is already Repair. Preserve its Test/Review branch;
-                // the existing replan admission computes Planner costs only after a scope conflict.
+                continuationReserve,
+                // Same session: retain only the reachable continuation and final checks.
                 onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: repairLease.mandatoryDownstreamSteps,
@@ -2058,7 +2134,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                     plan: plan.proposal ?? plan,
                     diagnostics: stableTaskContext ?? additionalContext,
                     source: JSON.stringify(currentSources),
-                    repairOutput: this.environment.stageModels?.REPAIR?.maxOutputTokens ?? 8192,
+                    repairOutput: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
                     reviewOutput: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048,
                     includeRepair: false,
                     reviewRecoveryAvailable: await remainingReviewRecovery(),
@@ -2066,7 +2142,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 },
               }
             : {}),
-          maxSteps: adaptiveBudget.hardLimit - repairBaseSteps,
+          maxSteps: repairLease.maximumSteps,
           adaptiveStepBudget: adaptiveControllerFor("REPAIR", repairLease, repairBaseSteps),
           timeoutMs: budget.remainingTimeoutMs("REPAIR"),
           executionBudget: {
@@ -2089,7 +2165,14 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           ...(reviewFindingIds ? { reviewFindingIds } : {}),
           workspaceRevision: localizationView.revision(),
         });
-        mergeAgentPhaseMetrics(metrics, result.metrics, "REPAIR", Date.now() - repairStartedAt);
+        approvalContinuationPending = false;
+        recordCodingSegment(result, "REPAIR", Date.now() - repairStartedAt);
+        completion = result.executeCompletion ?? completion;
+        if (completion) verification.execution = completion.outcome;
+        // Evidence-only responses still require validation/Review; explicit unfinished work blocks delivery.
+        unfinishedImplementation = result.executeCompletion?.unfinishedWork?.length
+          ? result
+          : undefined;
         if (scopeReplan?.status === "RESUMED") {
           const candidate = await captureReplanCandidate({
             sandbox: activeSandbox,
@@ -2248,7 +2331,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           budget.requireToolCalls("PLAN", metrics, 1 + toolReserve.downstream);
           replanTool();
         };
-        const repairOutput = this.environment.stageModels?.REPAIR?.maxOutputTokens ?? 8192;
+        const repairOutput = this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192;
         const reviewOutput = this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048;
         const compactDiagnostic = repairDiagnosticTasks(
           diagnostic,
@@ -2256,15 +2339,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         );
         // Before source preparation only enforce a known lower bound. The complete projection is
         // computed from the checkpoint/current evidence before constructing any Planner request.
-        let reserve = repairContinuationReserve({
+        let reserve = codingContinuationReserve({
           title: run.task.title,
           description: run.task.description,
           plan: plan.proposal ?? plan,
           diagnostics: compactDiagnostic,
           source: "",
-          repairOutput,
+          codingOutput: repairOutput,
           reviewOutput,
-          includeRepair: true,
+          resumeCoding: true,
           reviewRecoveryAvailable: await remainingReviewRecovery(),
         });
         let downstreamTokens = reserve.total;
@@ -2273,8 +2356,13 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           60_000 +
           300_000 +
           reviewTimeReserve(this.environment);
+        const requiredReplanSteps =
+          2 +
+          1 +
+          (codingSession.state?.executionRecovery?.used ? 0 : 1) +
+          ((await remainingReviewRecovery()) ? 2 : 1);
         const missing = {
-          steps: Math.max(0, 7 - budget.remainingAgentSteps),
+          steps: Math.max(0, requiredReplanSteps - budget.remainingAgentSteps),
           tokens: Math.max(
             0,
             downstreamTokens +
@@ -2296,6 +2384,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               paths: requestedPaths,
               missing,
               requiredTimeMs,
+              requiredReplanSteps,
               downstreamTokens,
             },
           }),
@@ -2406,15 +2495,20 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             const started = Date.now();
             recordStageAttempt(metrics, "REPAIR");
             const corrected = await this.runAgentPhase({
+              codingSession,
+              hostContinuation: {
+                id: "replan-handoff-correction",
+                kind: "PUBLIC_VALIDATION",
+                feedback: JSON.stringify(admission.rejected),
+                observedSourceChanged: true,
+              },
               run,
               plan,
               sandbox: activeSandbox,
               signal: executionSignal,
               executor,
               tools,
-              model: this.modelFactory
-                ? implementationModel
-                : this.createModel(run, benchmark?.configuration.modelParameters, "REPAIR"),
+              model: implementationModel,
               purpose: "TEST_REPAIR",
               handoffOnly: true,
               maxSteps: 1,
@@ -2444,7 +2538,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               currentSources: sources,
               workspaceRevision: localizationView.revision(),
             });
-            mergeAgentPhaseMetrics(metrics, corrected.metrics, "REPAIR", Date.now() - started);
+            recordCodingSegment(corrected, "REPAIR", Date.now() - started);
             budget.synchronizeAgentSteps(metrics, "REPAIR");
             refreshAdaptiveMetrics();
             budget.assertWithinLimits("REPAIR", metrics);
@@ -2574,7 +2668,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             )
             .join("\n"),
         }));
-        reserve = repairContinuationReserve({
+        reserve = codingContinuationReserve({
           title: run.task.title,
           description: run.task.description,
           plan: plan.proposal ?? plan,
@@ -2584,16 +2678,18 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             .map((f) => f.content ?? "")
             .join("\n")
             .slice(0, 8192),
-          repairOutput,
+          codingOutput: repairOutput,
           reviewOutput,
-          includeRepair: true,
+          resumeCoding: true,
           reviewRecoveryAvailable: await remainingReviewRecovery(),
         });
         downstreamTokens = reserve.total;
-        const plannerTokens = Math.min(
-          this.environment.DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS ?? 12000,
-          Math.max(0, budget.remainingTotalTokens(metrics) - downstreamTokens),
-        );
+        const plannerLease = codingPlannerTokenLease({
+          configuredMaximumTokens: this.environment.DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS ?? 12000,
+          remainingTokens: budget.remainingTotalTokens(metrics),
+          downstreamTokens,
+        });
+        const plannerTokens = plannerLease.maxTotalTokens;
         await this.database.events.append({
           runId: run.id,
           type: "WORKFLOW_CHECKPOINT",
@@ -2746,6 +2842,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         }
         scopeReplan.planSha256 = approvedPlanIdentity(AgentPlanSchema.parse(proposed));
         scopeReplan.status = "WAITING_APPROVAL";
+        const sessionArtifact = (await this.database.artifacts.list(run.id)).findLast(
+          (a) => a.name === "coding-session-v1.json",
+        );
+        if (sessionArtifact?.content)
+          scopeReplan.codingSessionSha256 = contentHash(sessionArtifact.content);
         await saveScopeReplan();
         await this.database.events.append({
           runId: run.id,
@@ -2800,7 +2901,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             payload: { attempt: repairAttempt, reason: "APPROVED_SCOPE_REPLAN" },
           },
         });
-        const repaired = await runRepair(
+        const repaired = await continueCoding(
           "TEST_REPAIR",
           context.text,
           "DIFF_PROGRESS",
@@ -2823,6 +2924,23 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       } else test = await executeTest(0, "EXECUTE");
       const executeReplan = await requestScopeReplan(implementation, test);
       if (executeReplan) return executeReplan;
+      if (
+        unfinishedImplementation &&
+        test.exitCode === 0 &&
+        !unfinishedImplementation.executeCompletion?.unfinishedWork?.length
+      ) {
+        // A successful diagnostic does not supply new failing evidence or undo an
+        // Agent stagnation stop. Preserve the candidate without another paid decision.
+        return await this.finalizeBenchmark(
+          benchmark,
+          sandbox,
+          withWorkflowMetrics({ ...unfinishedImplementation, verification }, metrics, startedAt),
+          !test.skipped,
+          repairAttempt,
+          reviewAttempt,
+          executionSignal,
+        );
+      }
 
       let previousProgress: string | undefined;
       let stagnantRepairCount = 0;
@@ -2893,13 +3011,13 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           }),
         });
       };
-      while (test.exitCode !== 0) {
+      while (test.exitCode !== 0 || unfinishedImplementation !== undefined) {
         const repairContext = await buildRepairContext(
           git,
           sandbox,
           test,
           executionSignal,
-          `Repair the deterministic test failure. This is test-repair attempt ${String(repairAttempt + 1)}.`,
+          `Continue the same Coding Session after final validation. Iteration ${String(repairAttempt + 1)}. ${unfinishedImplementation ? "Unfinished task requirements remain: " + JSON.stringify(unfinishedImplementation.executeCompletion?.unfinishedWork ?? unfinishedImplementation.phaseCompletion?.unfinishedWork ?? []) : "Repair the deterministic public validation failure."}`,
           {
             ...(await repairPreparationOptions()),
             evidenceRecoveryAvailable: tools.some((tool) => tool.name === "readEvidenceArtifact"),
@@ -2929,7 +3047,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             payload: { attempt: repairAttempt, reason: "TEST_FAILED" },
           },
         });
-        const repair = await runRepair(
+        const repair = await continueCoding(
           "TEST_REPAIR",
           [repairContext.text, convergenceWarning].filter(Boolean).join("\n\n"),
           convergenceWarning.length === 0 ? "DIFF_PROGRESS" : "NO_PROGRESS",
@@ -2956,10 +3074,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         });
         const replanOutcome = await requestScopeReplan(repair, test);
         if (replanOutcome) return replanOutcome;
+        completion = repair.executeCompletion ?? completion;
+        verification.execution = completion?.outcome ?? verification.execution;
+        unfinishedImplementation = repair.executeCompletion?.unfinishedWork?.length
+          ? repair
+          : undefined;
         preventRepeatedFailedVerification(repair, test);
         test = await executeTest(repairAttempt, "FIX");
       }
-      if (test.exitCode !== 0) {
+      if (test.exitCode !== 0 || unfinishedImplementation !== undefined) {
         const failed = await this.failedResult(
           run,
           metrics,
@@ -3691,7 +3814,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           ),
         );
         await persistRepairCheckpoint(reviewRepairContext, "REVIEW_REJECTED");
-        const repair = await runRepair(
+        const repair = await continueCoding(
           "REVIEW_REPAIR",
           [reviewRepairContext.text, reviewRepairWarning].filter(Boolean).join("\n\n"),
           "DISCOVERY_PROGRESS",
@@ -3716,7 +3839,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         if (replanOutcome) return replanOutcome;
         preventRepeatedFailedVerification(repair, test);
         test = await executeTest(repairAttempt, "FIX");
-        while (test.exitCode !== 0 && repairAttempt < run.maxTestRetries) {
+        while (
+          (test.exitCode !== 0 || unfinishedImplementation !== undefined) &&
+          repairAttempt < run.maxTestRetries
+        ) {
           const reviewTriggeredTestContext = await buildRepairContext(
             git,
             sandbox,
@@ -3758,7 +3884,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               },
             },
           });
-          const testRepair = await runRepair(
+          const testRepair = await continueCoding(
             "TEST_REPAIR",
             [reviewTriggeredTestContext.text, testRepairWarning].filter(Boolean).join("\n\n"),
             testRepairWarning.length === 0 ? "DIFF_PROGRESS" : "NO_PROGRESS",
@@ -3782,7 +3908,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           preventRepeatedFailedVerification(testRepair, test);
           test = await executeTest(repairAttempt, "FIX");
         }
-        if (test.exitCode !== 0) {
+        if (test.exitCode !== 0 || unfinishedImplementation !== undefined) {
           const failed = await this.failedResult(
             run,
             metrics,
@@ -4225,6 +4351,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
   }
 
   private async runAgentPhase(input: {
+    codingSession?: CodingSession;
+    hostContinuation?: AgentRunRequest["hostContinuation"];
     run: RunExecutionRecord;
     plan: AgentPlan;
     sandbox: SandboxSession;
@@ -4272,7 +4400,22 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             : "REVIEW";
       if (input.purpose === "IMPLEMENTATION") trace.executeStartedAt = Date.now();
     }
-    const runtime = new DefaultAgentRuntime(input.model);
+    const runtime = input.codingSession?.runtime ?? new DefaultAgentRuntime(input.model);
+    const priorState = input.codingSession?.state;
+    const priorMetrics = priorState?.finalResult?.metrics;
+    const sessionSteps = priorState?.stepCount ?? 0;
+    const sessionBudget = input.codingSession
+      ? {
+          ...input.executionBudget,
+          maxModelCalls:
+            input.executionBudget.maxModelCalls + (priorState?.metrics.modelCalls ?? 0),
+          maxToolCalls: input.executionBudget.maxToolCalls + (priorState?.metrics.toolCalls ?? 0),
+          maxTotalTokens:
+            input.executionBudget.maxTotalTokens +
+            (priorState?.metrics.tokenUsage.totalTokens ?? 0) +
+            (priorState?.contextCompression?.pendingTokenReserve ?? 0),
+        }
+      : input.executionBudget;
     const phaseArtifacts = await this.database.artifacts.list(input.run.id);
     const reviewRecoveryArtifact = phaseArtifacts.findLast(
       (a) => a.name === "review-output-recovery-v1.json",
@@ -4327,8 +4470,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       this.modelBindings.has(input.model)
         ? await this.restoreCompressionState(input.run.id, input.purpose, phaseArtifacts)
         : undefined;
-    let relationGraph: RepositoryRelationGraph | undefined;
-    if (baselineArtifact?.content) {
+    let relationGraph: RepositoryRelationGraph | undefined = input.codingSession?.relationGraph;
+    if (!relationGraph && baselineArtifact?.content) {
       try {
         const baseline = RelationGraphSchema.parse(JSON.parse(baselineArtifact.content));
         if (input.run.task.baseCommitSha && baseline.baseCommitSha !== input.run.task.baseCommitSha)
@@ -4343,6 +4486,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       } catch {
         /* Missing/invalid graph never restricts normal evidence reads or edit scope. */
       }
+    }
+    if (input.codingSession && relationGraph) {
+      input.codingSession.relationGraph = relationGraph;
+      if (input.hostContinuation?.observedSourceChanged !== false && input.hostContinuation)
+        relationGraph.invalidate(
+          [],
+          input.workspaceRevision ?? relationGraph.snapshot().workspaceRevision + 1,
+          true,
+        );
     }
     const workingSet = input.workingSet;
     const targetScope = input.plan.proposalVersion
@@ -4359,8 +4511,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           }
         : plannedTargetScope(input.plan, workingSet?.targetFiles ?? []);
     const postPatch =
-      input.purpose === "IMPLEMENTATION" &&
-      (this.environment.DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED === true ||
+      (input.codingSession !== undefined || input.purpose === "IMPLEMENTATION") &&
+      (input.codingSession !== undefined ||
+        this.environment.DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED === true ||
         input.executionPacket !== undefined)
         ? new PostPatchController(
             targetScope.targets,
@@ -4371,8 +4524,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         : undefined;
     if (postPatch && targetScope.blockers.length)
       postPatch.failures.set("<plan>", targetScope.blockers.join("; "));
-    // Repair keeps its existing context/tools/termination, but shares truthful
-    // mutation observations so no-op or rejected writes never become progress.
+    // All coding iterations use the same candidate and truthful mutation observations.
     const mutationObserver =
       postPatch ??
       (this.environment.DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED === true ||
@@ -4421,7 +4573,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       mutatesWorkspace: false,
     };
     const phaseTools = [
-      ...toolsForStage(input.tools, input.purpose),
+      ...(input.codingSession
+        ? toolsForCoding(input.tools)
+        : toolsForStage(input.tools, input.purpose)),
       ...(relationGraph ? [relationTool] : []),
     ].filter((tool) =>
       input.handoffOnly
@@ -4439,7 +4593,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     );
     const stalePaths = new Set<string>();
     const reasoningEffort = stageReasoningEffort(
-      input.purpose,
+      input.codingSession ? "IMPLEMENTATION" : input.purpose,
       this.environment.LLM_REASONING_PROFILE,
     );
     const prePatch =
@@ -4481,14 +4635,18 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               ),
           )
         : undefined;
-    const phaseResult = await runtime.run(
+    const cumulativeResult = await runtime.run(
       {
+        ...(input.codingSession ? { codingSession: true, repairMode: true } : {}),
+        ...(input.hostContinuation ? { hostContinuation: input.hostContinuation } : {}),
         approvedPlan: input.plan,
-        contextStage: input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR",
+        contextStage:
+          input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR",
         ...(restoredCompression ? { contextCompressionState: restoredCompression } : {}),
         contextMaxBytes:
-          (this.environment.stageModels?.[input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"]
-            ?.contextTokens ?? 32000) * 3,
+          (this.environment.stageModels?.[
+            input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
+          ]?.contextTokens ?? 32000) * 3,
         ...((this.environment.DEVFLOW_CONTEXT_COMPRESSION_ENABLED ?? true) &&
         this.modelBindings.has(input.model)
           ? {
@@ -4498,18 +4656,18 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 maxInputTokens: Math.min(
                   this.environment.DEVFLOW_CONTEXT_COMPRESSION_MAX_INPUT_TOKENS ?? 6000,
                   this.environment.stageModels?.[
-                    input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
+                    input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
                   ]?.contextTokens ?? 32000,
                 ),
                 maxOutputTokens: Math.min(
                   this.environment.DEVFLOW_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS ?? 2048,
                   this.environment.stageModels?.[
-                    input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
+                    input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
                   ]?.maxOutputTokens ?? 8192,
                 ),
                 mainOutputReserve:
                   this.environment.stageModels?.[
-                    input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
+                    input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
                   ]?.maxOutputTokens ?? 8192,
                 onRecord: async (summary, context) => {
                   const content = JSON.stringify({
@@ -4551,15 +4709,17 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           : {}),
         ...(postPatch ? { postPatch } : {}),
         ...(prePatch ? { prePatch } : {}),
-        maxSteps: input.maxSteps,
-        ...(input.adaptiveStepBudget ? { adaptiveStepBudget: input.adaptiveStepBudget } : {}),
+        maxSteps: input.maxSteps + sessionSteps,
+        ...(!input.codingSession && input.adaptiveStepBudget
+          ? { adaptiveStepBudget: input.adaptiveStepBudget }
+          : {}),
         timeoutMs: input.timeoutMs,
         timeReserve: {
           downstreamMs: reviewTimeReserve(this.environment, reviewRecoveryUsed),
           requestMs: 60_000,
         },
         maxRetries: this.environment.DEVFLOW_MAX_RETRIES,
-        executionBudget: input.executionBudget,
+        executionBudget: sessionBudget,
         ...(input.convergenceReserve ? { convergenceReserve: input.convergenceReserve } : {}),
         ...(input.continuationTools ? { continuationTools: input.continuationTools } : {}),
         ...(input.continuationReserve ? { continuationReserve: input.continuationReserve } : {}),
@@ -4568,14 +4728,16 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         deduplicateContext: actionEnabled,
         ...(workingSet ? { workingSet } : {}),
         systemPrompt:
-          stageSystemPrompt(input.purpose) +
+          (input.codingSession
+            ? codingSystemPrompt(input.purpose)
+            : stageSystemPrompt(input.purpose)) +
           (prePatch ? PACKET_PROMPT : workingSet ? ` ${EVIDENCE_ACTION_PROMPT}` : ""),
         modelSettings: {
           ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
           ...this.modelBindings.get(input.model)?.settings,
         },
         additionalContext: input.additionalContext,
-        ...(input.purpose === "IMPLEMENTATION"
+        ...(!input.codingSession && input.purpose === "IMPLEMENTATION"
           ? {
               stateStore: {
                 load: async () => {
@@ -4694,30 +4856,32 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             }),
         closingReadPaths: () =>
           targetScope.targets.filter((path) => !versions.has(path) || stalePaths.has(path)),
-        ...(input.purpose === "IMPLEMENTATION"
-          ? {}
-          : {
-              stateStore: {
-                load: async () => undefined,
-                save: async (state: AgentState) => {
-                  if (!state.executionRecovery) return;
-                  const key = JSON.stringify({
-                    ...state.executionRecovery,
-                    completed: state.phase === "COMPLETED",
-                  });
-                  if (key === savedRecoveryKey) return;
-                  await this.database.artifacts.create({
-                    runId: input.run.id,
-                    kind: "OTHER",
-                    name: "repair-execution-recovery-v1.json",
-                    mimeType: "application/json",
-                    content: key,
-                    metadata: { visibility: "HOST_ONLY" },
-                  });
-                  savedRecoveryKey = key;
+        ...(input.codingSession
+          ? { stateStore: input.codingSession }
+          : input.purpose === "IMPLEMENTATION"
+            ? {}
+            : {
+                stateStore: {
+                  load: async () => undefined,
+                  save: async (state: AgentState) => {
+                    if (!state.executionRecovery) return;
+                    const key = JSON.stringify({
+                      ...state.executionRecovery,
+                      completed: state.phase === "COMPLETED",
+                    });
+                    if (key === savedRecoveryKey) return;
+                    await this.database.artifacts.create({
+                      runId: input.run.id,
+                      kind: "OTHER",
+                      name: "repair-execution-recovery-v1.json",
+                      mimeType: "application/json",
+                      content: key,
+                      metadata: { visibility: "HOST_ONLY" },
+                    });
+                    savedRecoveryKey = key;
+                  },
                 },
-              },
-            }),
+              }),
         ...(exploration
           ? {
               availableTools: () => phaseTools.filter((t) => exploration.available(t.name)),
@@ -5163,6 +5327,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
       },
     );
+    const phaseResult = {
+      ...cumulativeResult,
+      metrics: input.codingSession
+        ? codingMetricDelta(cumulativeResult.metrics, priorMetrics)
+        : cumulativeResult.metrics,
+    };
     const checkedAt = Date.now();
     let checks = 0;
     const response = await checkRepairResponse(

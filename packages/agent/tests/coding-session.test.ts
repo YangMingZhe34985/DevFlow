@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { z } from "zod";
-import { PhaseCompletionSchema, type MutationResult } from "@devflow/shared";
+import { PhaseCompletionSchema, AgentPlanSchema, type MutationResult } from "@devflow/shared";
 import {
   DefaultAgentRuntime,
   FakeLanguageModel,
@@ -10,6 +10,8 @@ import {
   PostPatchController,
   contentHash,
   continueCodingSession,
+  projectCodingSessionHistory,
+  prepareStageContext,
   type AgentRunRequest,
   type FakeModelStep,
   type RunContext,
@@ -350,6 +352,31 @@ it("only a new approved Plan replaces the prior plan view and does not erase old
   expect(stored.metrics.modelRequestsDispatched).toBe(2);
 });
 
+it("accepts the same proposal after persisted schema normalization changes object-key order", async () => {
+  const plan = {
+    approvalScope: {
+      files: [{ operation: "MODIFY" as const, path: "src/a.ts" }],
+      workspaceRevision: 0,
+      baseCommitSha: "a".repeat(40),
+      mode: "READY" as const,
+      version: "plan-approval-scope-v1" as const,
+    },
+    proposalVersion: "plan-proposal-v1" as const,
+    warnings: [],
+    steps: [{ description: "Repair current behavior", title: "Current edit", id: "first" }],
+    summary: "Current approved proposal",
+  };
+  expect(JSON.stringify(AgentPlanSchema.parse(plan))).not.toBe(JSON.stringify(plan));
+  const f = fixture([decision("partial"), decision("complete")], { approvedPlan: plan });
+  await f.run();
+  const second = await f.run({ hostContinuation: feedback });
+  expect(second.status).toBe("SUCCEEDED");
+  expect(
+    await f.run({ hostContinuation: feedback, approvedPlan: AgentPlanSchema.parse(plan) }),
+  ).toEqual(second);
+  expect(f.model.requests).toHaveLength(2);
+});
+
 it("reports zero dispatch when resource admission rejects the first request", async () => {
   const f = fixture([decision("must-not-run")], {
     convergenceReserve: { downstreamSteps: 1, downstreamTokens: 1000 },
@@ -431,9 +458,24 @@ it("admits requests against the larger current time branch without counting the 
   expect(result.error?.details).toMatchObject({
     requestIssued: false,
     downstreamTimeMs: 1000,
-    additionalDownstreamMs: 900,
+    additionalDownstreamMs: 1000,
   });
   expect(f.model.requests).toHaveLength(0);
+});
+
+it("releases downstream time only within the original absolute coding deadline", async () => {
+  let downstreamMs = 3000;
+  const f = fixture([decision("partial"), decision("complete")], {
+    timeoutMs: 5000,
+    timeReserve: { downstreamMs: 1000, requestMs: 100 },
+    continuationReserve: () => ({ timeMs: downstreamMs, tokens: 0, steps: 0 }),
+  });
+  await f.run();
+  const before = (await f.stateStore.load(f.context.runId))!;
+  expect(before.phaseDeadlineAt! - Date.parse(before.startedAt)).toBeGreaterThan(4900);
+  downstreamMs = 1000;
+  expect((await f.run({ hostContinuation: feedback, timeoutMs: 10000 })).status).toBe("SUCCEEDED");
+  expect((await f.stateStore.load(f.context.runId))?.phaseDeadlineAt).toBe(before.phaseDeadlineAt);
 });
 
 it("reserves a possible correction but not an extra completion request when coding can edit and finish together", async () => {
@@ -446,4 +488,52 @@ it("reserves a possible correction but not an extra completion request when codi
   expect(result.status).toBe("SUCCEEDED");
   expect(f.model.requests).toHaveLength(1);
   expect(result.metrics.modelRequestsDispatched).toBe(1);
+});
+
+it("projects duplicate pinned feedback by reference while keeping every diagnostic and counterexample", () => {
+  const diagnostics =
+    "Finding finding-123: actual restored status is wrong. COUNTEREVIDENCE: event factory is correct.\n".repeat(
+      170,
+    );
+  const feedbackRecord = { ...feedback, feedback: diagnostics };
+  const history = [
+    { role: "USER" as const, content: "Task: preserve skipped state through restore" },
+    {
+      role: "USER" as const,
+      content:
+        "Host Coding Loop feedback (same session; no new resources or permissions):\n" +
+        JSON.stringify(feedbackRecord),
+    },
+    {
+      role: "USER" as const,
+      content:
+        "Stable Coding task state (requirements persist; source citations must be refreshed):\n" +
+        diagnostics +
+        "\nAdditional unresolved finding-456.",
+    },
+  ];
+  expect(() => prepareStageContext({ stage: "EXECUTE", history, maxBytes: 25000 })).toThrow(
+    "pinned context",
+  );
+  const projected = projectCodingSessionHistory(history);
+  const result = prepareStageContext({ stage: "EXECUTE", history: projected, maxBytes: 25000 });
+  expect(result.viewBytes).toBeLessThan(25000);
+  const serialized = JSON.stringify(result.view);
+  expect(serialized).toContain("feedbackRef");
+  expect(serialized).toContain("finding-123");
+  expect(serialized).toContain("finding-456");
+  expect(serialized).toContain("COUNTEREVIDENCE: event factory is correct");
+  expect(history[1]!.content).toContain(diagnostics.slice(0, 60));
+  const nonidentical = history.map((message, index) =>
+    index === 2
+      ? {
+          ...message,
+          content: message.content.replaceAll(
+            "actual restored status is wrong",
+            "a different failure",
+          ),
+        }
+      : message,
+  );
+  expect(projectCodingSessionHistory(nonidentical)[1]).toEqual(nonidentical[1]);
 });

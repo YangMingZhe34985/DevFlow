@@ -49,4 +49,24 @@ export class ContinuationTools {
       cachedReads: needed.filter((p) => this.current.has(p)).length,
     });
   }
+
+  /** Preparation and restore have already consumed their capacity after new approval. */
+  afterReplan(checks: number, restoredChangedPaths: readonly string[]) {
+    const changed = new Set([
+      ...restoredChangedPaths,
+      ...this.changed,
+      ...(this.unknownMutation ? this.approved : []),
+    ]);
+    const operations = {
+      // captureReplanCandidate: head/status, then baseline/current for each changed file.
+      checkpoint: 2 + 2 * changed.size,
+      // continueCoding observes the new approved scope once after the Agent returns.
+      sourceIdentity: new Set(this.approved).size,
+      // The failed public profile has already been discovered before scope replanning.
+      publicChecks: Math.max(0, checks),
+      // Reuse the existing initial Review/delivery envelope; no second Review branch.
+      reviewReads: replanOperationReserve(0, checks, true).operations.reviewReads,
+    };
+    return { operations, total: Object.values(operations).reduce((sum, n) => sum + n, 0) };
+  }
 }

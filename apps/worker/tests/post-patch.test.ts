@@ -829,7 +829,7 @@ it.each([false, true])(
     const result = await workflow["executeApprovedPlan"](run, new AbortController().signal);
     expect(result, JSON.stringify({ result, events, order: f.order })).toMatchObject({
       status: "SUCCEEDED",
-      executeCompletion: { outcome: "PATCH_READY", metrics: { postPatchModelCalls: 0 } },
+      executeCompletion: { outcome: "PATCH_READY", metrics: { postPatchModelCalls: skip ? 0 : 4 } },
     });
     expect(f.order).toEqual(
       skip

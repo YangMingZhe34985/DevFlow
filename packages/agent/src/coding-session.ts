@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { DevflowError, type AgentPlan } from "@devflow/shared";
+import { AgentPlanSchema, DevflowError, type AgentPlan } from "@devflow/shared";
 import type { ModelMessage } from "./model.js";
 import type { AgentState } from "./state.js";
 
@@ -15,7 +15,20 @@ export interface HostCodingContinuation {
 }
 
 const boundary = "HOST_CODING_SOURCE_BOUNDARY:";
-const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, canonical(item)]),
+    );
+  return value;
+}
+const digest = (value: unknown) =>
+  createHash("sha256")
+    .update(JSON.stringify(canonical(value)) ?? "undefined")
+    .digest("hex");
 
 export function continueCodingSession(
   state: AgentState | undefined,
@@ -29,10 +42,13 @@ export function continueCodingSession(
         "Coding continuation requires a saved session, a stable host ID and observed feedback.",
       details: { requestIssued: false },
     });
+  const approvedPlan = current.approvedPlan
+    ? AgentPlanSchema.parse(current.approvedPlan)
+    : undefined;
   const fingerprint = digest({
     ...continuation,
     id: undefined,
-    approvedPlan: current.approvedPlan,
+    approvedPlan,
   });
   const existing = state.codingContinuations?.find((record) => record.id === continuation.id);
   if (existing) {
@@ -61,10 +77,10 @@ export function continueCodingSession(
       details: { requestIssued: false },
     });
   if (
-    (continuation.kind === "APPROVAL" && !current.approvedPlan) ||
+    (continuation.kind === "APPROVAL" && !approvedPlan) ||
     (continuation.kind !== "APPROVAL" &&
-      current.approvedPlan &&
-      digest(current.approvedPlan) !== digest(state.plan))
+      approvedPlan &&
+      digest(approvedPlan) !== digest(state.plan))
   )
     throw new DevflowError({
       code: "CONFLICT",
@@ -144,6 +160,13 @@ export function continueCodingSession(
 export function projectCodingSessionHistory(history: readonly ModelMessage[]): ModelMessage[] {
   let invalidBefore = -1;
   let latestPlan = -1;
+  const stableRecords = history.flatMap((message, index) =>
+    message.role === "USER" &&
+    (message.content.startsWith("Stable Coding task state") ||
+      message.content.startsWith("Stable Repair task state"))
+      ? [{ index, content: message.content }]
+      : [],
+  );
   for (let index = 0; index < history.length; index++) {
     const message = history[index]!;
     if (message.role === "SYSTEM" && message.content.startsWith(boundary)) {
@@ -156,6 +179,33 @@ export function projectCodingSessionHistory(history: readonly ModelMessage[]): M
       latestPlan = index;
   }
   return history.map((message, index) => {
+    if (message.role === "USER" && message.content.startsWith("Host Coding Loop feedback")) {
+      // A feedback envelope and its stable task record can contain the exact same public diagnostics.
+      // Both records are pinned; reference only a verbatim duplicate, retaining every unique field.
+      const newline = message.content.indexOf("\n");
+      const record = JSON.parse(message.content.slice(newline + 1)) as Record<string, unknown>;
+      if (typeof record.feedback === "string" && record.feedback.length > 512) {
+        const same = stableRecords.find((entry) =>
+          entry.content.includes(record.feedback as string),
+        );
+        if (same)
+          return {
+            ...message,
+            content:
+              message.content.slice(0, newline + 1) +
+              JSON.stringify({
+                ...record,
+                feedback:
+                  "Verbatim diagnostic feedback is preserved in the pinned stable task record referenced below.",
+                feedbackRef: {
+                  historyIndex: same.index,
+                  recordSha256: digest(same.content),
+                  feedbackSha256: digest(record.feedback),
+                },
+              }),
+          };
+      }
+    }
     if (
       message.role === "USER" &&
       message.content.startsWith("Approved plan (follow this plan):") &&

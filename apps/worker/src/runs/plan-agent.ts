@@ -225,6 +225,37 @@ export interface PlanAttemptResult {
 }
 const REPAIR_SYSTEM =
   "You are a lossless JSON format converter. Preserve the supplied decision and meaning exactly. Do not review, infer, add, remove, or improve content. Return only the schema-conforming object requested by the response format.";
+
+/** Shared with the workflow's early replan frontier; identical to dispatch preflight. */
+export function estimatePlanOutputRecoveryReserve(input: {
+  finalOutputTokens: number;
+  formatRepairOutputTokens: number;
+}): number {
+  return (
+    estimatePlanRequest({
+      messages: [
+        { role: "SYSTEM", content: REPAIR_SYSTEM },
+        {
+          role: "USER",
+          content: JSON.stringify({
+            rawOutput: "x".repeat(input.finalOutputTokens * 6),
+            validationErrors: "invalid output shape",
+          }),
+        },
+      ],
+      tools: [],
+      output: {
+        name: "plan_proposal",
+        description: "A concise, safe and testable software implementation plan.",
+        schema: PlanProposalSchema,
+      },
+      settings: {
+        reasoningEffort: "none",
+        maxOutputTokens: Math.max(input.finalOutputTokens, input.formatRepairOutputTokens),
+      },
+    }).estimatedInputTokens + Math.max(input.finalOutputTokens, input.formatRepairOutputTokens)
+  );
+}
 class Blocked extends Error {
   constructor(
     readonly code: string,
@@ -590,15 +621,7 @@ class PlanSession {
     );
   }
   repairReserve(): number {
-    {
-      if (!this.recoveryCalls()) return 0;
-      return (
-        estimatePlanRequest(
-          this.repairRequest("x".repeat(this.limits.finalOutputTokens * 6), "invalid output shape"),
-        ).estimatedInputTokens +
-        Math.max(this.limits.finalOutputTokens, this.limits.formatRepairOutputTokens)
-      );
-    }
+    return this.recoveryCalls() ? estimatePlanOutputRecoveryReserve(this.limits) : 0;
   }
   private recoveryCalls(): number {
     return this.limits.maxModelCalls > 1 ? 1 : 0;

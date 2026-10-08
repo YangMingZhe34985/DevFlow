@@ -88,6 +88,11 @@ export interface ReviewBudgetLeaseInput {
   consumedSteps: number;
 }
 
+export interface CodingBudgetLeaseInput extends ReviewBudgetLeaseInput {
+  /** Normal independent Review plus its remaining bounded output recovery. */
+  remainingReviewRequests?: number;
+}
+
 export interface StageBudgetLease {
   stage: "EXECUTE" | "REPAIR" | "REVIEW";
   /** The phase starts with this many model-decision steps. */
@@ -274,7 +279,35 @@ export function restoreAdaptiveBudgetState(
   };
 }
 
-/** Allocates an initial implementation lease while retaining repair/review capacity. */
+/**
+ * Observe/edit/test/revise share one lease. There is no separate Repair pool to
+ * strand capacity when validation fails; Review remains outside the session.
+ * The caller restores consumedSteps from the workflow ledger on every resume.
+ */
+export function allocateCodingBudget(input: CodingBudgetLeaseInput): StageBudgetLease {
+  const consumedSteps = assertBudgetPosition(input.budget, input.consumedSteps);
+  const reviewRequests = nonnegativeIntegerStrict(
+    input.remainingReviewRequests ?? 2,
+    "remainingReviewRequests",
+  );
+  const remainingActiveSteps = Math.max(0, input.budget.activeLimit - consumedSteps);
+  const hardRemaining = Math.max(0, input.budget.hardLimit - consumedSteps);
+  const reviewReserve = Math.min(reviewRequests, remainingActiveSteps);
+  const mandatoryDownstreamSteps = Math.min(reviewRequests, hardRemaining);
+  return {
+    // The historical stage label remains readable; one persistent coding
+    // session may pass through EXECUTE/TEST/REPAIR display states.
+    stage: "EXECUTE",
+    initialSteps: Math.max(0, remainingActiveSteps - reviewReserve),
+    maximumSteps: Math.max(0, hardRemaining - mandatoryDownstreamSteps),
+    remainingActiveSteps,
+    reviewReserve,
+    repairReserve: 0,
+    mandatoryDownstreamSteps,
+  };
+}
+
+/** Legacy allocation retained for saved workflows that predate unified coding. */
 export function allocateExecuteBudget(input: ExecuteBudgetLeaseInput): StageBudgetLease {
   const consumedSteps = assertBudgetPosition(input.budget, input.consumedSteps);
   const remainingRepairAttempts = nonnegativeIntegerStrict(

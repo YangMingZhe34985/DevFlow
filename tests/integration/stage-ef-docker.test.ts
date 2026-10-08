@@ -273,7 +273,10 @@ integration("E/F real Docker and database integration", () => {
       if (mode === "BUDGET_STOP") {
         expect(paused.status, JSON.stringify(paused)).toBe("FAILED");
         if (paused.status !== "FAILED") throw new Error("Expected preflight stop");
-        expect(paused.error.message).toContain("REPLAN_DOWNSTREAM_RESERVE_INSUFFICIENT");
+        // The unified session reserves the actual continuation instead of a fresh
+        // Repair agent. This fixture now reaches the prepared Planner preflight,
+        // which must still reject the request before any Planner HTTP dispatch.
+        expect(paused.error.message).toContain("PLAN_FINAL_PREFLIGHT_BLOCKED");
         expect(model.requests).toHaveLength(2); // Closed exploration responds directly with a scope conflict.
         expect(JSON.stringify(await database.events.list(created.id, { limit: 1000 }))).toContain(
           '"requestIssued":false',

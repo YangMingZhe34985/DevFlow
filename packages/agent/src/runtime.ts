@@ -214,15 +214,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
         };
       return restoredState.finalResult;
     }
-    const requestedDeadlineAt =
-      Date.now() + request.timeoutMs - (request.timeReserve?.downstreamMs ?? 0);
+    // Coding owns one immutable workflow deadline; selected downstream branches are dynamic reserves.
+    // Legacy standalone phases keep their previous phase-local deadline semantics.
+    const fixedDownstreamMs = request.codingSession ? 0 : (request.timeReserve?.downstreamMs ?? 0);
+    const requestedDeadlineAt = Date.now() + request.timeoutMs - fixedDownstreamMs;
     const phaseDeadlineAt = Math.min(
       requestedDeadlineAt,
       restoredState?.phaseDeadlineAt ??
         (restoredState
-          ? Date.parse(restoredState.startedAt) +
-            request.timeoutMs -
-            (request.timeReserve?.downstreamMs ?? 0)
+          ? Date.parse(restoredState.startedAt) + request.timeoutMs - fixedDownstreamMs
           : requestedDeadlineAt),
     );
     const deadlineSignal = AbortSignal.timeout(Math.max(1, phaseDeadlineAt - Date.now()));
@@ -770,11 +770,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
               request.timeReserve.downstreamMs,
               request.continuationReserve?.().timeMs ?? 0,
             );
-            // phaseDeadlineAt already reserves the original downstream allowance. Add only the branch difference.
-            const additionalDownstreamMs = Math.max(
-              0,
-              downstreamTimeMs - request.timeReserve.downstreamMs,
-            );
+            // Standalone phases already subtract their fixed reserve. Coding retains an absolute deadline.
+            const additionalDownstreamMs = Math.max(0, downstreamTimeMs - fixedDownstreamMs);
             const remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
             explorationClosed ||= remainingTimeMs < 3 * request.timeReserve.requestMs;
             if (explorationClosed) {

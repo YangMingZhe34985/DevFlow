@@ -1,23 +1,23 @@
 # DevFlow 2.2
 
-Current release: **v2.2 (2.2.0)**. This release strengthens diagnostic handoff, bounded scope replanning, Repair recovery and host-assisted Review evidence.
+Current published release: **v2.2 (2.2.0)**. The development branch unifies code editing and failure repair into one persistent Coding Session. Its acceptance status is recorded in [the unified Coding report](docs/unified-coding-loop-20261008.md); the package version remains 2.2.0 until the new release criterion is met.
 
 [中文](README_CN.md) | [English](README.md)
 
-DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, repair planning, code edits, deterministic tests, targeted repair and independent review.
+DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, approved planning, an iterative Coding Loop, deterministic final validation and independent review.
 
 The API persists intent and queues work. The Worker owns execution; agents access repository code through policy-controlled tools in Docker sandboxes. Tasks pin an immutable base commit, and runs retain events, source references, diff artifacts and budgets.
 
 ## Current capabilities
 
 - A concise proposal Planner: repair direction, intended source files, verification and uncertainty. Human approval defines write scope.
-- Separate model bindings for Localization, Planner, Execute, Repair and Review. The example configuration uses Bailian.
+- Separate model bindings for Localization, Planner, Coding and Review. All Coding iterations use the `EXECUTE` binding; legacy `REPAIR` configuration remains readable. The example configuration uses Bailian.
 - Versioned TS/JS dependency/export evidence and bounded Python/Java/C++ static navigation, shared across stages. Partial or ambiguous relationships stay explicit.
 - Full-file SHA checks, precise text replacement and protected-file policies before code writes.
-- Tool-free Review with bounded host evidence and public reproductions; Repair retains diagnostic tasks, SHA-linked evidence records and checked answers, with a shared protocol/edit/output correction credit.
+- Tool-free Review with bounded host evidence and public reproductions; confirmed defects return to the same Coding Session with diagnostic tasks, SHA-linked evidence and checked answers.
 - Public build/typecheck/lint/test profiles, source-aware diagnostic handoff and one bounded scope replan requiring a new approval.
-- Execute reserves editing correction and completion budgets; repeated source/graph queries cannot earn new progress, while malformed edits receive one bounded correction.
-- A stable patch remains editable within approval. Execute hands it to Test on an explicit `finishPhase`; two decisions without new evidence or candidate changes stop further work. See [candidate submission and acceptance](docs/execute-completion-20261008.md).
+- One Coding Session retains history, checkpoints, tool policy and resource consumption across edits and public test/review failures. Repeated observations cannot earn new progress; edit-format and output correction share one bounded credit.
+- A stable patch remains editable within approval. `finishPhase` yields to Workflow-owned final validation; failures or explicit unfinished work can return to the same session within the remaining limits. Final Review remains independent. See [the current Coding lifecycle](docs/unified-coding-loop-20261008.md).
 - Shared request/recovery budgets, complete-output checks and protected write scope throughout the workflow.
 
 The final nine-case cohort passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing validated nine-case coverage to six strict successes. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).
@@ -48,14 +48,16 @@ Web: http://localhost:3000; API: http://localhost:3001/api/v1; Worker readiness:
 
 ## Model configuration
 
-[.env.example](.env.example) defaults to Bailian's compatible endpoint. Planner/Review use `deepseek-v4-pro-0813`, Execute/Repair use `glm-5.3`, and Localization inherits `LLM_MODEL`. Review uses high reasoning effort; Review/Repair allow 16,384 output tokens and 64,000 context tokens. Each stage has its own `LLM_<STAGE>_*` settings. Users choose models suited to their provider and workload. Read [stage bindings, inheritance and budgets](docs/stage-models.md), then restart the Worker after changes.
+[.env.example](.env.example) defaults to Bailian's compatible endpoint. Planner/Review use `deepseek-v4-pro-0813`, the entire Coding Loop uses `glm-5.3`, and Localization inherits `LLM_MODEL`. Coding uses `LLM_EXECUTE_*`: thinking enabled, low effort, 8,192 output tokens and 32,000 context tokens. Independent Review uses high effort, 16,384 output tokens and 64,000 context tokens. `LLM_REPAIR_*` remains a legacy configuration interface; it does not create another Coding agent or change the unified session's limits. Read [stage bindings, inheritance and budgets](docs/stage-models.md), then restart the Worker after changes.
 
 ## Workflow
 
 ```text
 Repository + pinned Task -> Localization -> Planner -> Plan Approval
-  -> Execute -> Test -> bounded Repair / retest
-  -> Review -> targeted repair or evidence response -> Test -> Review
+  -> Unified Coding Loop: Observe -> Edit -> Test -> Analyze -> Revise
+  -> Workflow Final Validation -> Independent Review
+       -> failed validation / confirmed defect -> same Coding Session
+       -> new write scope -> Planner -> new Plan Approval -> same Coding Session
   -> Diff -> Local completion or approved GitHub Push / Pull Request
 ```
 

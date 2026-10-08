@@ -83,6 +83,20 @@ export function toolsForStage(
   return [...tools.filter((tool) => allowed.has(tool.name)), FinishPhaseTool];
 }
 
+/** Coding retains observation/edit/evidence capabilities throughout validation feedback. */
+export function toolsForCoding(
+  tools: readonly ModelToolDescriptor[],
+): readonly ModelToolDescriptor[] {
+  return [
+    ...tools.filter((tool) => IMPLEMENTATION_TOOLS.has(tool.name) || REPAIR_TOOLS.has(tool.name)),
+    FinishPhaseTool,
+  ];
+}
+
+export function codingSystemPrompt(purpose: AgentPhasePurpose): string {
+  return `${COMMON_PROMPT} You are the single Coding Agent for this task. Observe, edit, submit a candidate for public validation, analyze the host's failure feedback, and revise in the same session. Your original task and approved behavioral requirements remain active after every edit and test. Check remaining requirements, but do not edit a file merely because it is approved. Use finishPhase to yield the current candidate to the workflow; put it after edits in the same response when ready. Workflow always performs Final Validation and Independent Review; a failed check returns to this session while resources remain. A successful submission requires no extra confirmation call. Never invent test results, repeat an unchanged failed candidate, or ignore unfinishedWork. When blocked by scope, cite the current public failure and candidate implementation using SCOPE_CONFLICT; only a new PLAN approval authorizes expanded writes. Current feedback reason: ${purpose}.`;
+}
+
 /**
  * Clamps a lease selected by the adaptive budget planner. Stage policy must not
  * impose a second fixed 12/4 ceiling: the shared ledger owns allocation.

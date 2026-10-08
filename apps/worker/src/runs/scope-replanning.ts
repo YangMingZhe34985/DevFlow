@@ -63,6 +63,8 @@ export const ScopeReplanStateSchema = z.object({
   taskBaseCommitSha: z.string().optional(),
   sourceManifestHash: z.string().optional(),
   planSha256: z.string().optional(),
+  /** Links the same Coding Session to this exact candidate before approval wait. */
+  codingSessionSha256: z.string().optional(),
   repairAttempts: z.number().int().nonnegative(),
   reviewAttempts: z.number().int().nonnegative(),
   repairInFlight: z.boolean().optional(),

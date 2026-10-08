@@ -101,7 +101,13 @@ import {
 } from "@devflow/agent";
 import type { DatabaseAdapter, RunExecutionRecord } from "@devflow/database";
 import { SandboxGitService } from "@devflow/git";
-import { reviewTimeReserve, restoredWorkflowTiming } from "./review-time-budget.js";
+import {
+  reviewTimeReserve,
+  restoredWorkflowTiming,
+  finalValidationReviewTimePlan,
+  codingTimePathPlan,
+  codingReplanReachable,
+} from "./review-time-budget.js";
 import { preserveInterruptedWorkflow } from "./workflow-interruption.js";
 import {
   retainReviewEvidence,
@@ -1197,7 +1203,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
             : {}),
         });
-        if (operation === "SUBMIT_CURRENT" || scopeReplan) return finalization.total;
+        if (
+          operation === "SUBMIT_CURRENT" ||
+          !codingReplanReachable(!!scopeReplan, repairAttempt, run.maxTestRetries)
+        )
+          return finalization.total;
         // Unknown targets retain only a named minimum investigation branch. At an actual
         // conflict the concrete diagnostic/source operation list replaces this estimate.
         const investigation = continuation.operationPlan({
@@ -1275,7 +1285,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         // Keep a minimal reachable replan, not a second Repair lifecycle. The branch is
         // transferred to Planner once scope conflict is confirmed; final Review is shared.
         const plannerOutput = this.environment.stageModels?.PLANNER?.maxOutputTokens ?? 8192;
-        const replanBranch = !scopeReplan
+        const replanBranch = codingReplanReachable(!!scopeReplan, repairAttempt, run.maxTestRetries)
           ? codingReplanReserve({
               plannerContext: { task: run.task.description, plan: plan.proposal ?? plan, source },
               plannerOutputTokens: plannerOutput,
@@ -1310,7 +1320,22 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           continuing: { tokens: 0, steps: 0, tools: 0, timeMs: 0 },
           ...(replanBranch ? { replanning: replanBranch.required } : {}),
         });
-        return { ...frontier.required, audit: frontier };
+        return {
+          ...frontier.required,
+          audit: {
+            ...frontier,
+            timeOperationPlan: codingTimePathPlan({
+              sharedFinal: finalValidationReviewTimePlan(
+                this.environment,
+                continuationRecoveryAvailable,
+              ),
+              ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
+              submitCurrent: operation === "SUBMIT_CURRENT",
+            }),
+            // Repository IO is individually guarded; this model/deadline quote does not price it as free.
+            preparationAndRestoreTime: "GUARDED_PER_OPERATION_NOT_ESTIMATED_BY_THIS_TIME_PLAN",
+          },
+        };
       };
       const replanArtifact = (await this.database.artifacts.list(run.id)).findLast(
         (a) => a.name === "scope-replan-v1.json",
@@ -2564,6 +2589,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         };
         // Before source preparation only enforce a known lower bound. The complete projection is
         // computed from the checkpoint/current evidence before constructing any Planner request.
+        const reviewRecoveryAvailable = await remainingReviewRecovery();
         let reserve = codingContinuationReserve({
           title: run.task.title,
           description: run.task.description,
@@ -2573,19 +2599,19 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           codingOutput: repairOutput,
           reviewOutput,
           resumeCoding: true,
-          reviewRecoveryAvailable: await remainingReviewRecovery(),
+          reviewRecoveryAvailable,
         });
         let downstreamTokens = reserve.total;
         const requiredTimeMs =
           (this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000) +
           60_000 +
           300_000 +
-          reviewTimeReserve(this.environment);
+          reviewTimeReserve(this.environment, reviewRecoveryAvailable ? 0 : 2);
         const requiredReplanSteps =
           2 +
           1 +
           (codingSession.state?.executionRecovery?.used ? 0 : 1) +
-          ((await remainingReviewRecovery()) ? 2 : 1);
+          (reviewRecoveryAvailable ? 2 : 1);
         const missing = {
           steps: Math.max(0, requiredReplanSteps - budget.remainingAgentSteps),
           tokens: Math.max(

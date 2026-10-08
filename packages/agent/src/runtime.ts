@@ -121,6 +121,8 @@ export interface AgentRunRequest {
     tokens: number;
     steps: number;
     timeMs: number;
+    /** Host-only projection provenance; never included in model messages or tool Schema. */
+    audit?: unknown;
   };
   /** Absolute stage time is supplied by the host; applies to every execution path. */
   /** requestMs is an admission estimate, not a new per-request model timeout. */
@@ -904,6 +906,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             }
             const observation = {
               requestIssued: false,
+              continuationAudit: request.continuationReserve?.(budgetOperation()).audit,
               operation: budgetOperation(),
               releasedDownstreamMs: initialDownstreamTimeMs - downstreamTimeMs,
               explorationClosed,

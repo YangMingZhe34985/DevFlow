@@ -153,4 +153,6 @@ The subsequent [E10 Runtime P0 repair](e10-runtime-p0-20261008.md) aligns the cu
 
 See [workflow behavior](v2-workflow.md), [stage model configuration](stage-models.md) and [validation boundaries](validation-v2.md).
 
+The [Coding Context Projection Optimizer](context-projection-optimizer.md) selects a deterministic request view from immutable Session evidence. Provider SDK input is materialized without network dispatch, quoted by the Scheduler, and verified before actual HTTP. The original adapter envelope and final-body caps both remain enforced; projection changes neither approval nor accumulated consumption.
+
 The [targeted time/failure-feedback audit](e10-time-feedback-20261009.md) preserves the frozen E10's valid 1,020-second downstream time quote. Time reservations now omit exhausted Review recovery and unreachable Replan branches, with named operations retained in admission diagnostics. Two complete public failures may open one persisted read-only diagnostic investigation in the same Coding Session. Current verified imports may extend its read roots, without replenishing quota or changing write approval; confirmed scope requests still require Planner and a new PLAN approval.

@@ -2,6 +2,8 @@
 
 包版本保持 **2.3.0**。代码编辑与失败修复共用持久化的 Coding Session。Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，**未达到 v2.4 升级条件**。见[资源调度架构](docs/resource-budget-scheduler.md)、[本轮结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
 
+后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），版本继续保持 2.3.0。
+
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。

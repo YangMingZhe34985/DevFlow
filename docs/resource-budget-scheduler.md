@@ -149,4 +149,6 @@ The implementation tests cover operation-plan arithmetic, optional-work omission
 
 The frozen real batch passed **1/4** (E07). E10 dispatched Replan, received a new approval and resumed its Coding Session, but subsequently stalled without a patch. E02 failed after approval recovery, and E08 remained blocked on Review evidence despite independent patch acceptance. The **2.4.0 release gate was not met**; the package stays at **2.3.0**. See the [experiment comparison, accounting correction and unresolved issues](resource-budget-validation-20261008.md).
 
+The subsequent [E10 Runtime P0 repair](e10-runtime-p0-20261008.md) aligns the current read Schema with the existing closing-refresh cap, classifies argument/exploration/authorization failures, and expires obsolete Session control prompts. Original-request Docker replay passed; the separate real E10 run still failed public tests and stopped before another Coding request on downstream time reservation. This is not a real Issue repair success and does not change the earlier four-case cohort.
+
 See [workflow behavior](v2-workflow.md), [stage model configuration](stage-models.md) and [validation boundaries](validation-v2.md).

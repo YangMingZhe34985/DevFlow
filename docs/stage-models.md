@@ -36,6 +36,10 @@ Normal Review requests use these configured reasoning settings. Review-only sema
 
 Run limits remain independent: `DEVFLOW_MAX_STEPS`, `DEVFLOW_MAX_TOTAL_TOKENS`, `DEVFLOW_TIMEOUT_MS`, and Planner's `DEVFLOW_PLAN_AGENT_*` limits. The static context view is bounded separately from archived history. `DEVFLOW_CONTEXT_COMPRESSION_ENABLED` enables bounded optional summaries with source citations and static fallback. Credentials, permission state and revision authority are never delegated to summaries.
 
+The [Resource Budget Scheduler](resource-budget-scheduler.md) measures the actual serialized request and configured output maximum at the dispatch boundary, then settles reported input/output usage once. It preserves Run consumption and uncertain request reservations across restart or new approval. Optional `DEVFLOW_MAX_TOOL_EXECUTIONS` and `DEVFLOW_MAX_IO_BYTES` add internal-operation limits; they do not replace or raise the existing logical-tool limit.
+
+`DEVFLOW_MODEL_PRICES_JSON` supplies token rates for each active transport `provider:model`, for example `openai-compatible:glm-5.3`. Each value contains integer `inputMicrosPerMillionTokens` and `outputMicrosPerMillionTokens`; the `LLM_PROVIDER_NAME` display label is not part of the key. All rates and the optional `DEVFLOW_MAX_COST_MICROS` use millionths of one chosen currency. Missing rates are `UNPRICED`, not zero-cost usage; enabling a cost cap without complete prices prevents unpriced dispatch. The example leaves prices blank and assumes no vendor rate. Model requests retain their configured output settings, including thinking, under this cost preflight.
+
 New tasks default to a 25-minute total workflow limit. Explicit task limits take precedence; changing configuration or resuming a task does not extend its saved absolute deadline. Review request deadlines and conservative time reserves are configured separately:
 
 ```dotenv

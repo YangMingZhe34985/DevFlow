@@ -1,6 +1,6 @@
-# DevFlow 2.2
+# DevFlow 2.3
 
-当前已发布版本：**v2.2（2.2.0）**。开发分支将代码编辑与失败修复统一为持久化的 Coding Session。本轮验收状态见[统一 Coding 验收报告](docs/unified-coding-loop-20261008.md)；达到新版本发布条件前，包版本保持 2.2.0。
+当前开发版本：**v2.3（2.3.0）**。代码编辑与失败修复共用持久化的 Coding Session。冻结实现已严格通过 E07，达到本次版本升级条件；E10 仍在重新规划派发前被宿主工具预算预留阻断。详细结果、回归验收和剩余 P0 见[统一 Coding 验收报告](docs/unified-coding-loop-20261008.md)。GitHub 已发布版本仍为 v2.2；本次本地升级不代表已经发布。
 
 [中文](README_CN.md) | [English](README.md)
 

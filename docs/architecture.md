@@ -1,6 +1,6 @@
 # DevFlow 架构说明
 
-v2.0 的生产阶段契约、提案式 Planner 和 Review/Repair 证据交接见 [v2 workflow](v2-workflow.md)，模型接入见 [stage models](stage-models.md)。下述组件边界继续适用；历史复杂度/执行契约兼容字段不代表新的 Planner 必填输出。
+当前开发版本为 v2.3，代码修改和失败修复共用一个持久化 Coding Session。流程、验收结果及剩余预算阻断见 [Unified Coding Loop](unified-coding-loop-20261008.md)，生产契约见 [v2 workflow](v2-workflow.md)，模型接入见 [stage models](stage-models.md)。历史阶段标签和复杂度字段保持兼容，不代表新的 Agent 生命周期或 Planner 必填输出。
 
 ## 1. 设计目标
 
@@ -9,7 +9,7 @@ DevFlow 将一次 AI 软件工程任务建模为可持久化、可恢复、可�
 - API 与不可信代码执行分离；
 - Agent 只通过明确的 Tool 端口获得能力；
 - 代码、Git 和测试操作都在 Docker Sandbox 中完成；
-- PLAN、测试、Repair、Review 与 GitHub 发布都有明确边界；
+- PLAN 审批、Coding、宿主最终验证、独立 Review 与 GitHub 发布都有明确边界；
 - Run 状态、事件、指标和审批可以在进程崩溃后恢复；
 - 用户能通过 Web/SSE 理解 Agent 做了什么、为什么停止。
 
@@ -69,7 +69,7 @@ Worker 消费队列、Claim Run 执行 Lease、定期续租/检查取消，并�
 
 ### Agent Runtime
 
-Agent Runtime 管理模型消息、Tool Call、Tool Result、Checkpoint、Retry、Context Projection 和 Step Budget。生产 Workflow 会为 PLAN、EXECUTE、REPAIR 和 REVIEW 选择不同 Prompt、Tool 集与 reasoning 策略。
+Agent Runtime 管理模型消息、Tool Call、Tool Result、Checkpoint、Retry、Context Projection 和 Step Budget。Localization、Planner 和独立 Review 各自绑定模型；代码编辑、测试失败修订、Review 缺陷处理和重新审批恢复均使用同一 Coding Session，沿用 `LLM_EXECUTE_*`。宿主反馈更新稳定任务状态和有效源码证据，不重置历史、预算、纠正额度或进展计数。历史 `REPAIR` 标签只表示失败处理原因。
 
 ### Tool Executor
 
@@ -98,22 +98,23 @@ Run -- persist immutable options/snapshot -- enqueue
 Worker claim + lease
    |
    v
-PLAN -- structured output + adaptive budget -- Approval
+LOCALIZATION -- read-only evidence
    |
    v
-EXECUTE -- minimal repository changes
+PLAN -- concise proposal -- Approval
    |
    v
-TEST -- deterministic command
-   | pass                         | fail
-   |                              v
-   |                           REPAIR
-   |                              |
+CODING SESSION -- observe / edit / analyze / revise
+   | submit                       ^
+   v                              | public failures / unfinished work
+FINAL VALIDATION -- public build / typecheck / lint / test
+   | pass                         |
    +------------------------------+
    |
    v
 REVIEW -- structured independent result
-   | fail -> targeted repair -> TEST -> REVIEW
+   | confirmed defect -> same CODING SESSION -> VALIDATION -> REVIEW
+   | evidence gap -> bounded host evidence / public reproduction
    v
 DIFF
    |
@@ -122,7 +123,7 @@ DIFF
    +-- GIT: push approval -> branch -> PR approval -> pull request
 ```
 
-PLAN 输出的 `complexity` / `estimatedSteps` / `confidence` 与仓库路径元数据一起生成 soft budget。`Run.maxSteps` 是 PLAN、EXECUTE、REPAIR、REVIEW 共用的硬上限。有效 Diff 或定向探索可获得有界扩展；重复 Tool、未变 Diff 或相同测试失败会触发收敛保护。
+PlanProposal 不要求历史 `complexity` / `estimatedSteps` / `confidence` 字段。宿主按当前输入、配置输出、可达后续操作和剩余资源预检；同一任务共享步骤、token、工具、时间及费用上限。修订不会生成一份新的 Repair 预算。重复读取、未变 diff 或相同失败不能构成进展；有效 `finishPhase` 直接交给宿主验证，不追加模型确认。扩大修改范围需要一次只读 Replan 和新的 PLAN 审批，批准前不得写入新增目标。
 
 ## 4. 状态与事件
 
@@ -142,6 +143,8 @@ START -> ANALYZE_REPOSITORY -> ANALYZE_TASK -> GENERATE_PLAN
 ```
 
 `FAILED` 和 `CANCELLED` 是终态阶段。状态写入使用当前 status/stage 作为 CAS 条件，并经过转移约束校验，防止过期 Worker 覆盖新状态。
+
+`EXECUTE`、`FIX` 等存储与展示标签为兼容保留。`FIX` 不再创建独立 Repair Agent：公开验证或 Review 的反馈继续原 Coding Session；无资源、停滞或证据无法确认时保存候选和具体原因，不能标记为成功。
 
 Event 在单个 Run 内使用单调递增 `sequence`。SSE 客户端携带 `Last-Event-ID` 或 `afterSequence` 后，API 从 PostgreSQL 补发缺失事件，再持续轮询新事件；空闲期发送 heartbeat，终态后发送 `stream-end`。
 
@@ -166,7 +169,8 @@ Prisma Schema 定义持久化结构，`DatabaseAdapter` 是应用层端口，防
 - Run 创建支持 `idempotencyKey`，重放请求不会重新读取已变化的 LOCAL 仓库。
 - BullMQ Job 携带 `dispatchRevision`，过期派发可以被拒绝。
 - Worker 通过 owner + lease 保证单个 Run 的有效执行者。
-- Agent/Workflow Checkpoint 持久化预算、指标、测试指纹和 Diff 指纹。
+- Agent/Workflow Checkpoint 持久化会话历史、任务反馈、预算、纠正额度、指标、测试指纹和 Diff 指纹；恢复不重新领取消费或重规划次数。
+- 新审批恢复先核对基准、累计变更、当前 SHA、批准范围和原会话关联，再继续 Coding。无法确认旧任务身份或消费时明确阻断。
 - 审批会暂停执行并释放 Worker，而不是在进程内阻塞等待。
 - GitHub 写操作使用稳定 operation key；在远程写入可能已成功而本地响应丢失时，协调器会先对账再持久化。
 

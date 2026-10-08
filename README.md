@@ -1,6 +1,6 @@
-# DevFlow 2.2
+# DevFlow 2.3
 
-Current published release: **v2.2 (2.2.0)**. The development branch unifies code editing and failure repair into one persistent Coding Session. Its acceptance status is recorded in [the unified Coding report](docs/unified-coding-loop-20261008.md); the package version remains 2.2.0 until the new release criterion is met.
+Current development version: **v2.3 (2.3.0)**. Editing and failure repair share one persistent Coding Session. The frozen implementation strictly passed E07, meeting this version's acceptance criterion; E10 still stopped before replanning on host tool-budget reservations. See [the results, regression validation and remaining P0 blockers](docs/unified-coding-loop-20261008.md). The published GitHub release remains v2.2; this local version update does not publish a release.
 
 [中文](README_CN.md) | [English](README.md)
 

@@ -1,6 +1,6 @@
 {
   "name": "devflow",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "private": true,
   "description": "Observable and verifiable AI software engineering agent runs.",
   "type": "module",

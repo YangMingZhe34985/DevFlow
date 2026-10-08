@@ -15,6 +15,18 @@ export interface HostCodingContinuation {
 }
 
 const boundary = "HOST_CODING_SOURCE_BOUNDARY:";
+// These records describe one completed decision segment, rather than task evidence.
+// Keep their original contents on disk; only their active request projection expires.
+const transientControlPrefixes = [
+  "HOST_AUTHORIZATION_HANDOFF:",
+  "HOST_SUBMISSION_RESERVE:",
+  "HOST_TIME_RESERVE:",
+  "HOST_CONVERGENCE:",
+  "HOST_REPAIR_LENGTH_RECOVERY:",
+  "One shared bounded correction decision:",
+  "One bounded edit correction is available.",
+  "Convergence warning:",
+] as const;
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object")
@@ -87,6 +99,8 @@ export function continueCodingSession(
       message: "Only a new host APPROVAL continuation can replace the approved Coding plan.",
       details: { requestIssued: false },
     });
+  const approvalChanged =
+    continuation.kind === "APPROVAL" && approvedPlan && digest(approvedPlan) !== digest(state.plan);
   const next: AgentState = {
     ...state,
     phase: "IDLE",
@@ -146,7 +160,9 @@ export function continueCodingSession(
             explorationClosed: false,
             submissionOnly: false,
             handoffPending: false,
-            authorizationHandoffUsed: false,
+            // A same-approval resume cannot grant a fresh authorization handoff.
+            // Only the host's distinct approved plan invalidates the prior scope refusal.
+            ...(approvalChanged ? { authorizationHandoffUsed: false } : {}),
           },
         }
       : {}),
@@ -156,9 +172,10 @@ export function continueCodingSession(
   return { state: next, accepted: true };
 }
 
-/** Preserve full history on disk. Only old source records/old approval views are projected out. */
+/** Preserve history on disk; project out stale source, approval and transient control views. */
 export function projectCodingSessionHistory(history: readonly ModelMessage[]): ModelMessage[] {
   let invalidBefore = -1;
+  let controlBefore = -1;
   let latestPlan = -1;
   const stableRecords = history.flatMap((message, index) =>
     message.role === "USER" &&
@@ -173,12 +190,25 @@ export function projectCodingSessionHistory(history: readonly ModelMessage[]): M
       const record = JSON.parse(message.content.slice(boundary.length)) as {
         invalidateSource?: boolean;
       };
+      controlBefore = index;
       if (record.invalidateSource) invalidBefore = index;
     }
     if (message.role === "USER" && message.content.startsWith("Approved plan (follow this plan):"))
       latestPlan = index;
   }
   return history.map((message, index) => {
+    if (
+      index < controlBefore &&
+      message.role === "USER" &&
+      transientControlPrefixes.some((prefix) => message.content.startsWith(prefix))
+    )
+      return {
+        ...message,
+        content:
+          "Historical host control decision is superseded by the current Coding continuation. " +
+          "Current tool policy and persisted resource consumption remain authoritative. " +
+          JSON.stringify({ historyIndex: index, previousRecordSha256: digest(message.content) }),
+      };
     if (message.role === "USER" && message.content.startsWith("Host Coding Loop feedback")) {
       // A feedback envelope and its stable task record can contain the exact same public diagnostics.
       // Both records are pinned; reference only a verbatim duplicate, retaining every unique field.
@@ -219,6 +249,7 @@ export function projectCodingSessionHistory(history: readonly ModelMessage[]): M
     if (index >= invalidBefore) return message;
     if (
       message.role === "TOOL" &&
+      !message.isError &&
       [
         "readFile",
         "batchReadFiles",

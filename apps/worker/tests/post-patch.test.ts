@@ -398,6 +398,89 @@ function fixture(skipTests = false) {
   return { sandbox, order, tests: () => testCalls };
 }
 
+it("runs public diagnostics on a stalled stable candidate without converting it into completion", async () => {
+  const f = fixture();
+  vi.spyOn(DockerSandboxManager.prototype, "create").mockResolvedValue(f.sandbox);
+  const artifacts: { name: string; content?: string }[] = [];
+  const plan = {
+    summary: "Update a.ts",
+    steps: [{ id: "edit", title: "Edit", description: "Update a.ts" }],
+  };
+  const db = {
+    approvals: { list: async () => [{ kind: "PLAN", status: "APPROVED", request: { plan } }] },
+    events: { list: async () => [], append: async () => {} },
+    artifacts: {
+      list: async () => artifacts,
+      create: async (a: { name: string; content?: string }) => {
+        artifacts.push(a);
+        return { ...a, id: randomUUID() };
+      },
+    },
+    runs: { transition: async () => ({}) },
+  } as unknown as DatabaseAdapter;
+  const model = new FakeLanguageModel([
+    fakeModelResponse({
+      toolCalls: [
+        {
+          id: "write",
+          name: "writeFile",
+          input: {
+            path: "a.ts",
+            content: "export const value = 2;\n",
+          },
+        },
+      ],
+    }),
+    ...Array.from({ length: 4 }, (_, i) =>
+      fakeModelResponse({
+        toolCalls: [{ id: `r${i}`, name: "readFile", input: { path: "a.ts" } }],
+      }),
+    ),
+  ]);
+  const reviewer = new FakeLanguageModel([]);
+  const workflow = new ApprovalWorkflowRunExecutor(
+    db,
+    loadWorkerEnvironment({
+      DATABASE_URL: "unused",
+      DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED: "true",
+    }),
+    () => model,
+    () => reviewer,
+  );
+  const result = await workflow["executeApprovedPlan"](
+    {
+      id: randomUUID(),
+      currentStage: "EXECUTE",
+      status: "RUNNING",
+      retryCount: 0,
+      maxSteps: 12,
+      maxTestRetries: 1,
+      maxReviewRetries: 1,
+      repository: {
+        id: randomUUID(),
+        sourceKind: "GIT",
+        sourceUri: "https://example.invalid/repo.git",
+      },
+      task: {
+        id: randomUUID(),
+        title: "Update",
+        description: "Update a.ts",
+        baseCommitSha: "a".repeat(40),
+      },
+    } as RunExecutionRecord,
+    new AbortController().signal,
+  );
+  expect(result.status).toBe("FAILED");
+  expect(result.executeCompletion).toMatchObject({
+    outcome: "NEEDS_MORE_WORK",
+    termination: "NO_PROGRESS",
+  });
+  expect(result.verification?.test).toBe("TEST_PASSED");
+  expect(f.order.filter((e) => e === "TEST")).toHaveLength(1);
+  expect(reviewer.requests).toHaveLength(0);
+  expect(artifacts.some((a) => a.name === "execute-unfinished-candidate-v1.json")).toBe(true);
+});
+
 function reviewedFindings(request: ModelRequest) {
   const message = request.messages.find(
     (m) =>

@@ -9,6 +9,10 @@ export const ExecuteCompletionSchema = z.object({
   unexpectedFiles: z.array(z.string()),
   blockers: z.array(z.string()),
   diffFingerprint: z.string().nullable(),
+  termination: z
+    .enum(["MODEL_SUBMITTED", "NO_PROGRESS", "BUDGET_STOP", "INVALID_CANDIDATE"])
+    .optional(),
+  unfinishedWork: z.array(z.string()).optional(),
   failure: z
     .enum([
       "NO_VALID_PATCH",

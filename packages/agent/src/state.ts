@@ -122,11 +122,43 @@ export const AgentStateSchema = z.object({
   messages: z.array(ModelMessageSchema),
   metrics: AgentStateMetricsSchema,
   startedAt: z.string().datetime({ offset: true }),
+  phaseDeadlineAt: z.number().optional(),
   updatedAt: z.string().datetime({ offset: true }),
   /** Optional so schema-version 1 checkpoints written before adaptive leases remain valid. */
   adaptiveStepBudget: AdaptiveStepBudgetStateSchema.optional(),
   plan: AgentPlanSchema.optional(),
   contextCompression: ContextCompressionStateSchema.optional(),
+  executionConvergence: z
+    .object({
+      noProgressStreak: z.number().int().nonnegative(),
+      diffFingerprints: z.array(z.string()),
+      evidence: z.object({
+        ranges: z.array(z.tuple([z.string(), z.array(z.tuple([z.number(), z.number()]))])),
+        facts: z.array(z.string()),
+      }),
+    })
+    .optional(),
+  postPatch: z
+    .object({
+      revision: z.number().int().nonnegative(),
+      changed: z.array(z.string()),
+      hashes: z.record(z.string(), z.string()),
+      failures: z.record(z.string(), z.string()),
+      firstMutationEndedAt: z.number().nullable(),
+      diff: z.string(),
+      diffFingerprint: z.string().nullable(),
+      completionDecision: z.boolean(),
+      calls: z.object({
+        model: z.number(),
+        tool: z.number(),
+        input: z.number(),
+        output: z.number(),
+        mutation: z.number(),
+        reads: z.number(),
+        diff: z.number(),
+      }),
+    })
+    .optional(),
   executionRecovery: z
     .object({
       pending: z.boolean(),
@@ -135,6 +167,7 @@ export const AgentStateSchema = z.object({
       handoffPending: z.boolean().optional(),
       authorizationHandoffUsed: z.boolean().optional(),
       evidenceRefreshUsed: z.boolean().optional(),
+      submissionOnly: z.boolean().optional(),
       correctionTool: z.string().optional(),
       correctionInput: z.string().optional(),
       correctionReason: z.enum(["FORMAT_INVALID", "OUTPUT_LENGTH", "PROTOCOL_INVALID"]).optional(),
@@ -144,6 +177,8 @@ export const AgentStateSchema = z.object({
   finalResult: RunResultSchema.optional(),
 });
 export interface AgentState {
+  executionConvergence?: z.infer<typeof AgentStateSchema>["executionConvergence"];
+  postPatch?: z.infer<typeof AgentStateSchema>["postPatch"];
   executionRecovery?: {
     pending: boolean;
     used: boolean;
@@ -151,6 +186,7 @@ export interface AgentState {
     handoffPending?: boolean;
     authorizationHandoffUsed?: boolean;
     evidenceRefreshUsed?: boolean;
+    submissionOnly?: boolean;
     correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
     correctionTool?: string;
     correctionInput?: string;
@@ -162,6 +198,7 @@ export interface AgentState {
   messages: readonly ModelMessage[];
   metrics: AgentStateMetrics;
   startedAt: string;
+  phaseDeadlineAt?: number;
   updatedAt: string;
   adaptiveStepBudget?: AdaptiveStepBudgetState;
   plan?: AgentPlan;
@@ -311,6 +348,7 @@ export function createInitialAgentState(
     stepCount: 0,
     messages,
     metrics: {
+      modelRequestsDispatched: 0,
       modelCalls: 0,
       toolCalls: 0,
       toolExecutions: 0,

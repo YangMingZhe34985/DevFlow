@@ -317,6 +317,7 @@ export const RepairFindingResponseSchema = z
   })
   .strict();
 export const PhaseCompletionSchema = z.object({
+  unfinishedWork: z.array(z.string().min(1).max(2000)).max(8).optional(),
   evidenceRefs: z
     .array(z.string().regex(/^source-[a-f0-9]{24}$/u))
     .max(4)

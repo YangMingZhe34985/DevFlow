@@ -170,8 +170,40 @@ export class DefaultAgentRuntime implements AgentRuntime {
     validateRunRequest(request);
     const postPatch = request.postPatch;
     if (postPatch) context = { ...context, postPatch };
-    const phaseDeadlineAt =
+    const restoredState = await context.stateStore?.load(context.runId);
+    if (restoredState?.finalResult !== undefined) {
+      if (
+        postPatch &&
+        restoredState.finalResult.executeCompletion?.outcome === "PATCH_READY" &&
+        !restoredState.postPatch?.completionDecision &&
+        !restoredState.messages.some(
+          (m) => m.role === "TOOL" && m.toolName === "finishPhase" && !m.isError,
+        )
+      )
+        return {
+          ...restoredState.finalResult,
+          status: "FAILED",
+          error: {
+            code: "CONFLICT",
+            retryable: false,
+            message:
+              "LEGACY_COMPLETION_UNCONFIRMED: saved PATCH_READY has no explicit submission evidence; no request was issued.",
+            details: { requestIssued: false },
+          },
+        };
+      return restoredState.finalResult;
+    }
+    const requestedDeadlineAt =
       Date.now() + request.timeoutMs - (request.timeReserve?.downstreamMs ?? 0);
+    const phaseDeadlineAt = Math.min(
+      requestedDeadlineAt,
+      restoredState?.phaseDeadlineAt ??
+        (restoredState
+          ? Date.parse(restoredState.startedAt) +
+            request.timeoutMs -
+            (request.timeReserve?.downstreamMs ?? 0)
+          : requestedDeadlineAt),
+    );
     const deadlineSignal = AbortSignal.timeout(Math.max(1, phaseDeadlineAt - Date.now()));
     const signal = AbortSignal.any([context.signal, deadlineSignal]);
     const initialMessages: ModelMessage[] = [
@@ -183,12 +215,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
       },
       ...buildUserMessages(request, context.task.title, context.task.description),
     ];
-    const restoredState = await context.stateStore?.load(context.runId);
-    if (restoredState?.finalResult !== undefined) return restoredState.finalResult;
-
     let state =
       restoredState ??
       createInitialAgentState(context.runId, initialMessages, new Date().toISOString());
+    state = { ...state, phaseDeadlineAt };
     if (restoredState === undefined && request.approvedPlan !== undefined) {
       state = { ...state, plan: request.approvedPlan };
     }
@@ -198,6 +228,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
       state = { ...state, executionRecovery: structuredClone(request.executionRecovery) };
     const messages: ModelMessage[] = [...state.messages];
     const execution = createExecutionState(context.tools);
+    execution.noProgressStreak = state.executionConvergence?.noProgressStreak ?? 0;
+    if (postPatch && state.postPatch) postPatch.restore(state.postPatch);
     execution.editCorrectionPending = state.executionRecovery?.pending ?? false;
     execution.editCorrectionUsed = state.executionRecovery?.used ?? false;
     if (state.executionRecovery?.correctionTool)
@@ -206,21 +238,40 @@ export class DefaultAgentRuntime implements AgentRuntime {
       execution.correctionInput = state.executionRecovery.correctionInput;
     if (state.executionRecovery?.correctionReason)
       execution.correctionReason = state.executionRecovery.correctionReason;
-    const sourceProgress = new EvidenceProgress();
+    const sourceProgress = new EvidenceProgress(state.executionConvergence?.evidence);
+    const candidateFingerprints = new Set(state.executionConvergence?.diffFingerprints ?? []);
     const compatibilityObservations = new Set<string>();
     for (const source of request.workingSet?.relevantCode ?? [])
       sourceProgress.observe(source, source.workspaceRevision);
+    for (const message of messages)
+      if (
+        message.role === "TOOL" &&
+        !message.isError &&
+        ["readFile", "batchReadFiles", "queryRelations", "searchCode"].includes(message.toolName)
+      )
+        sourceProgress.observe(message.content, execution.workspaceRevision);
     const originalAuthorize = context.authorizeTool;
     let correctingEdit = false;
     let explorationClosed = state.executionRecovery?.explorationClosed ?? false;
     let closingDecisionPending = state.executionRecovery?.handoffPending ?? false;
     let authorizationHandoffUsed = state.executionRecovery?.authorizationHandoffUsed ?? false;
     let evidenceRefreshUsed = state.executionRecovery?.evidenceRefreshUsed ?? false;
+    let submissionOnly = state.executionRecovery?.submissionOnly ?? false;
     const closingReadAllowed = () =>
       !correctingEdit && !evidenceRefreshUsed && (context.closingReadPaths?.().length ?? 0) > 0;
     context = {
       ...context,
       authorizeTool: (call) => {
+        if (
+          submissionOnly &&
+          call.name !== "finishPhase" &&
+          !(
+            postPatch?.needsVerification &&
+            call.name === "gitDiff" &&
+            Object.keys(objectValue(call.input) ?? {}).length === 0
+          )
+        )
+          return "HOST_SUBMISSION_RESERVE: only finishPhase is available; preserve the candidate and report remaining work.";
         const required = request.continuationTools?.() ?? 0;
         const remaining =
           (request.executionBudget?.maxToolCalls ?? Number.MAX_SAFE_INTEGER) -
@@ -302,6 +353,12 @@ export class DefaultAgentRuntime implements AgentRuntime {
 
     try {
       while (true) {
+        if (Date.now() >= phaseDeadlineAt)
+          throw new DevflowError({
+            code: "TIMEOUT",
+            message: "Agent's saved phase deadline has expired; no request was issued.",
+            details: { requestIssued: false, phaseDeadlineAt },
+          });
         throwIfAborted(signal, context.signal, deadlineSignal);
         if (adaptiveStepBudget === undefined) {
           if (state.stepCount >= request.maxSteps) break;
@@ -312,6 +369,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             handoffPending: closingDecisionPending,
             authorizationHandoffUsed,
             evidenceRefreshUsed,
+            submissionOnly,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -366,6 +424,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             handoffPending: closingDecisionPending,
             authorizationHandoffUsed,
             evidenceRefreshUsed,
+            submissionOnly,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -415,6 +474,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
               metrics: {
                 ...state.metrics,
                 modelCalls: state.metrics.modelCalls + 1,
+                modelRequestsDispatched: (state.metrics.modelRequestsDispatched ?? 0) + 1,
               },
             });
           }
@@ -725,7 +785,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           }
           if (authorizationHandoffUsed)
             availableTools = availableTools.filter((t) => t.name === "finishPhase");
-          if (request.convergenceReserve && !postPatch?.active && !prePatch) {
+          if (request.convergenceReserve && !prePatch) {
             const continuation = request.continuationReserve?.();
             const downstreamTokens = Math.max(
               request.convergenceReserve.downstreamTokens,
@@ -760,6 +820,35 @@ export class DefaultAgentRuntime implements AgentRuntime {
               remainingTokens < nextTokens + reserveTokens ||
               remainingSteps <= Math.max(2, (continuation?.steps ?? 0) + 2) ||
               remainingTools <= downstreamTools + 3;
+            if (
+              postPatch?.canSubmit &&
+              (remainingTokens < nextTokens + reserveTokens ||
+                remainingSteps <= 1 ||
+                remainingTools <= downstreamTools + 3)
+            ) {
+              submissionOnly = true;
+              availableTools = finishTools;
+              projectedMessages = [
+                ...projectedMessages,
+                {
+                  role: "USER",
+                  content:
+                    "HOST_SUBMISSION_RESERVE: only finishPhase is now available. Hand off the current candidate immediately, or report INSUFFICIENT_EVIDENCE/SCOPE_CONFLICT with remaining work. Do not claim unfinished behavior is fixed.",
+                },
+              ];
+              state = await checkpoint(context, {
+                ...state,
+                executionRecovery: {
+                  pending: execution.editCorrectionPending,
+                  used: execution.editCorrectionUsed,
+                  explorationClosed,
+                  handoffPending: closingDecisionPending,
+                  authorizationHandoffUsed,
+                  evidenceRefreshUsed,
+                  submissionOnly,
+                },
+              });
+            }
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
                 [
@@ -770,7 +859,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
                   ...(correctingEdit && execution.correctionReason === "PROTOCOL_INVALID"
                     ? [execution.correctionTool!]
                     : []),
-                  ...(closingReadAllowed() ? ["readFile"] : []),
+                  ...(!submissionOnly && closingReadAllowed() ? ["readFile"] : []),
                 ].includes(t.name),
               );
               projectedMessages = [
@@ -786,7 +875,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
               estimateModelInput(projectedMessages, availableTools) +
               outputTokens +
               downstreamTokens +
-              (explorationClosed && closingReadAllowed()
+              (explorationClosed && !submissionOnly && closingReadAllowed()
                 ? completionTokens + Math.ceil(16384 / 3)
                 : 0);
             const observation = {
@@ -803,6 +892,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
               remainingSteps,
               remainingTools,
               downstreamTools,
+              submissionOnly,
             };
             await context.emit({
               runId: context.runId,
@@ -1099,7 +1189,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
         // Never trust a model-filtered/cached/base-relative diff as completion evidence.
         if (
           postPatch &&
-          calls.some((c) => toolMetadata(c.name, execution.tools.get(c.name)).mutatesWorkspace) &&
+          (calls.some((c) => toolMetadata(c.name, execution.tools.get(c.name)).mutatesWorkspace) ||
+            (postPatch.needsVerification && calls.some((c) => c.name === "finishPhase"))) &&
           !calls
             .slice(
               calls.findLastIndex(
@@ -1356,23 +1447,24 @@ export class DefaultAgentRuntime implements AgentRuntime {
         for (const { call, result, metadata } of normalCalls) {
           if (metadata.mutatesWorkspace) continue;
           const identity = `${execution.workspaceRevision}:${call.name}:${stableStringify(result.ok ? result.output : { input: call.input, error: result.error })}`;
-          const observed = request.convergenceReserve
-            ? result.ok &&
-              sourceProgress.observe(
-                result.output,
-                execution.workspaceRevision,
-                typeof objectValue(call.input)?.path === "string"
-                  ? (objectValue(call.input)!.path as string)
-                  : undefined,
-              )
-            : !compatibilityObservations.has(identity);
+          const observed =
+            request.convergenceReserve || postPatch
+              ? result.ok &&
+                sourceProgress.observe(
+                  result.output,
+                  execution.workspaceRevision,
+                  typeof objectValue(call.input)?.path === "string"
+                    ? (objectValue(call.input)!.path as string)
+                    : undefined,
+                )
+              : !compatibilityObservations.has(identity);
           compatibilityObservations.add(identity);
           if (observed) {
             if (result.ok) execution.evidenceDiscoveries++;
             newEvidence = true;
           }
         }
-        const madeWorkspaceProgress = normalCalls.some(
+        let madeWorkspaceProgress = normalCalls.some(
           ({ metadata, result }) =>
             result.mutation?.mutationApplied ?? (metadata.mutatesWorkspace && result.ok),
         );
@@ -1388,6 +1480,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
         const observedDiffFingerprint = postPatch
           ? (postPatch.diffFingerprint ?? undefined)
           : diffEvidenceFingerprint(normalCalls);
+        if (postPatch && madeWorkspaceProgress && observedDiffFingerprint) {
+          madeWorkspaceProgress = !candidateFingerprints.has(observedDiffFingerprint);
+          candidateFingerprints.add(observedDiffFingerprint);
+        }
         execution.successfulMutations += successfulMutations;
         if (
           observedDiffFingerprint !== undefined &&
@@ -1405,6 +1501,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             (!madeWorkspaceProgress && !newEvidence) ||
             (!madeWorkspaceProgress &&
               normalCalls.some(({ result }) => result.mutation !== undefined)));
+        const submitted = executedCalls.some(({ control, result }) => control && result.ok);
         state = await checkpoint(context, {
           ...state,
           phase: "CALLING_TOOL",
@@ -1416,15 +1513,40 @@ export class DefaultAgentRuntime implements AgentRuntime {
           },
         });
 
-        if (madeWorkspaceProgress || !repeatedWithoutProgress || execution.editCorrectionPending) {
+        if (
+          submitted ||
+          madeWorkspaceProgress ||
+          !repeatedWithoutProgress ||
+          execution.editCorrectionPending
+        ) {
           execution.noProgressStreak = 0;
         } else {
           execution.noProgressStreak += 1;
+          state = {
+            ...state,
+            executionConvergence: {
+              noProgressStreak: execution.noProgressStreak,
+              diffFingerprints: [...candidateFingerprints],
+              evidence: sourceProgress.snapshot(),
+            },
+          };
           if (execution.noProgressStreak === 1) {
             messages.push({
               role: "USER",
               content:
                 "Convergence warning: the previous calls produced no new evidence or workspace change. Do not repeat unchanged reads, failed calls or no-op edits; change strategy or finish with the unresolved gap.",
+            });
+          } else if (postPatch) {
+            throw new DevflowError({
+              code: "AGENT_STALLED",
+              message:
+                "Execute stopped after two decisions without new source or candidate changes.",
+              details: {
+                stopReason: "STALLED",
+                noProgressStreak: execution.noProgressStreak,
+                requestIssued: false,
+                candidateRetained: postPatch.canSubmit,
+              },
             });
           } else if (authorizationHandoff) {
             // One ordinary, budgeted finish-only decision; do not reset progress or correction credit.
@@ -1440,9 +1562,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           } else {
             throw new DevflowError({
               code: "AGENT_STALLED",
-              message: postPatch?.ready
-                ? "PATCH_READY_BUT_NOT_FINISHED: repeated confirmation instead of phase handoff."
-                : "Agent repeated the same unchanged tool calls without making progress.",
+              message: "Agent repeated the same unchanged tool calls without making progress.",
               details: {
                 noProgressStreak: execution.noProgressStreak,
                 tools: normalCalls.map(({ call }) => call.name),
@@ -1453,6 +1573,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
 
         state = await checkpoint(context, {
           ...state,
+          executionConvergence: {
+            noProgressStreak: execution.noProgressStreak,
+            diffFingerprints: [...candidateFingerprints],
+            evidence: sourceProgress.snapshot(),
+          },
           executionRecovery: {
             pending: execution.editCorrectionPending,
             used: execution.editCorrectionUsed,
@@ -1460,6 +1585,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             handoffPending: closingDecisionPending,
             authorizationHandoffUsed,
             evidenceRefreshUsed,
+            submissionOnly,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -1818,9 +1944,13 @@ async function executeToolBatch(
               : !priorSucceeded
                 ? "finishPhase was ignored because an earlier tool call failed."
                 : undefined;
+    if (error === undefined && context.postPatch)
+      context.postPatch.unfinishedWork =
+        PhaseCompletionSchema.safeParse(call.input).data?.unfinishedWork ?? [];
     if (
       error === undefined &&
       context.postPatch &&
+      context.postPatch.unfinishedWork.length === 0 &&
       !["INSUFFICIENT_EVIDENCE", "SCOPE_CONFLICT"].includes(
         PhaseCompletionSchema.safeParse(call.input).data?.outcome ?? "",
       )
@@ -2514,7 +2644,11 @@ function assertExecutionBudget(
 }
 
 async function checkpoint(context: RunContext, state: AgentState): Promise<AgentState> {
-  const updated = { ...state, updatedAt: new Date().toISOString() };
+  const updated = {
+    ...state,
+    updatedAt: new Date().toISOString(),
+    ...(context.postPatch ? { postPatch: context.postPatch.snapshot() } : {}),
+  };
   await context.stateStore?.save(updated);
   return updated;
 }

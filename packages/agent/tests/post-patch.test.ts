@@ -6,7 +6,10 @@ import {
   FakeLanguageModel,
   fakeModelResponse,
   PostPatchController,
+  contentHash,
   type ModelToolCall,
+  InMemoryAgentStateStore,
+  type AgentStateStore,
 } from "../src/index.js";
 import type { MutationResult } from "@devflow/shared";
 
@@ -29,9 +32,13 @@ async function run(
     calls?: ModelToolCall[][];
     maxSteps?: number;
     maxTools?: number;
+    initialContent?: string;
+    stateStore?: AgentStateStore;
+    runId?: string;
   } = {},
 ) {
   const c = new PostPatchController(["a.ts"], 4, options.auto);
+  let current = options.initialContent ?? "old";
   const tools = ["writeFile", "readFile", "gitDiff", "finishPhase", "searchCode"].map((name) => ({
     name,
     description: name,
@@ -47,7 +54,9 @@ async function run(
         expect(text).toContain("Task:");
         expect(request.tools.map((t) => t.name)).not.toContain("searchCode");
         expect(c.ready).toBe(false);
-        expect(request.tools.map((t) => t.name)).toContain("writeFile");
+        if (options.reserve && i === calls.length - 1)
+          expect(request.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+        else expect(request.tools.map((t) => t.name)).toContain("writeFile");
       }
       return fakeModelResponse({
         toolCalls,
@@ -60,7 +69,10 @@ async function run(
       maxSteps: options.maxSteps ?? calls.length,
       maxRetries: 0,
       timeoutMs: 3000,
-      approvedPlan: { summary: "Update a.ts", steps: [] },
+      approvedPlan: {
+        summary: "Update a.ts",
+        steps: [{ id: "edit", title: "Edit", description: "Correct a.ts" }],
+      },
       additionalContext: "STALE_WORKING_SET EXPLORATION_HISTORY",
       postPatch: c,
       ...(options.reserve
@@ -78,7 +90,8 @@ async function run(
       emitRunLifecycle: false,
     },
     {
-      runId: randomUUID(),
+      runId: options.runId ?? randomUUID(),
+      ...(options.stateStore ? { stateStore: options.stateStore } : {}),
       signal: new AbortController().signal,
       task: {
         taskId: randomUUID(),
@@ -90,28 +103,35 @@ async function run(
       emit: async () => undefined,
       executeTool: async (_step, request) => {
         if (request.name === "writeFile") {
+          const next = String((request.input as { content: string }).content);
+          const unchanged = options.noop || next === current;
           const mutation: MutationResult = {
-            status: options.noop ? "NO_OP" : "APPLIED",
+            status: unchanged ? "NO_OP" : "APPLIED",
             executionSucceeded: true,
             mutationAttempted: true,
-            mutationApplied: !options.noop,
-            workspaceChanged: !options.noop,
-            reason: options.noop ? "CONTENT_IDENTICAL" : "CONTENT_CHANGED",
+            mutationApplied: !unchanged,
+            workspaceChanged: !unchanged,
+            reason: unchanged ? "CONTENT_IDENTICAL" : "CONTENT_CHANGED",
             beforeRevision: c.revision,
-            afterRevision: c.revision + (options.noop ? 0 : 1),
-            changedFiles: options.noop ? [] : ["a.ts"],
-            currentHashes: { "a.ts": "new" },
+            afterRevision: c.revision + (unchanged ? 0 : 1),
+            changedFiles: unchanged ? [] : ["a.ts"],
+            currentHashes: { "a.ts": contentHash(next) },
           };
+          if (!unchanged) current = next;
           c.observeMutation(mutation, ["a.ts"]);
           return { ok: true, output: {}, durationMs: 1, mutation };
         }
         if (request.name === "gitDiff")
           c.observeDiff(
-            options.noop ? "" : "valid current diff",
-            options.noop ? [] : ["a.ts"],
+            current === "old" ? "" : `valid current diff:${current}`,
+            current === "old" ? [] : ["a.ts"],
             true,
           );
-        return { ok: true, output: { content: "new" }, durationMs: 1 };
+        return {
+          ok: true,
+          output: { path: "a.ts", fileSha256: contentHash(current), content: current },
+          durationMs: 1,
+        };
       },
     },
   );
@@ -202,4 +222,84 @@ it("does not require a stable patch's other approved candidate to be modified", 
   expect(c.canSubmit).toBe(true);
   expect(c.ready).toBe(false);
   expect(c.submit()).toBe(true);
+});
+it("stops two oscillating candidates without using an extra summary call", async () => {
+  const alternative = { ...write, id: "other", input: { path: "a.ts", content: "alternative" } };
+  const { result, model } = await run({
+    calls: [
+      [write],
+      [alternative],
+      [{ ...write, id: "again" }],
+      [{ ...alternative, id: "again2" }],
+      [finish],
+    ],
+  });
+  expect(result.error?.details).toMatchObject({ stopReason: "STALLED", noProgressStreak: 2 });
+  expect(result.executeCompletion?.outcome).toBe("NEEDS_MORE_WORK");
+  expect(model.requests).toHaveLength(4);
+});
+it("retains nonprogress and candidate identities across resume and revalidates before submit", async () => {
+  const store = new InMemoryAgentStateStore(),
+    runId = randomUUID();
+  await run({ calls: [[write], [read]], runId, stateStore: store });
+  const checkpoint = (await store.load(runId))!;
+  expect(checkpoint.executionConvergence?.noProgressStreak).toBe(1);
+  delete checkpoint.finalResult;
+  checkpoint.phase = "THINKING";
+  await store.save(checkpoint);
+  const stopped = await run({
+    calls: [[read]],
+    runId,
+    stateStore: store,
+    maxSteps: 5,
+    initialContent: "new",
+  });
+  expect(stopped.model.requests).toHaveLength(1);
+  expect(stopped.result.error?.details).toMatchObject({ noProgressStreak: 2 });
+  // A separately resumed unfinished snapshot can explicitly hand off once it is revalidated.
+  await store.save(checkpoint);
+  const submitted = await run({
+    calls: [[finish]],
+    runId,
+    stateStore: store,
+    maxSteps: 5,
+    initialContent: "new",
+  });
+  expect(submitted.result.status).toBe("SUCCEEDED");
+  expect(submitted.c.calls.diff).toBe(2);
+  const completed = await run({
+    calls: [],
+    maxSteps: 5,
+    runId,
+    stateStore: store,
+    initialContent: "new",
+  });
+  expect(completed.result.status).toBe("SUCCEEDED");
+  expect(completed.model.requests).toHaveLength(0);
+});
+it("does not reset an expired deadline or trust a legacy automatic completion", async () => {
+  const store = new InMemoryAgentStateStore(),
+    runId = randomUUID();
+  await run({ calls: [[write]], runId, stateStore: store });
+  const saved = (await store.load(runId))!;
+  delete saved.finalResult;
+  saved.phaseDeadlineAt = Date.now() - 1000;
+  await store.save(saved);
+  const expired = await run({ calls: [[finish]], maxSteps: 5, runId, stateStore: store });
+  expect(expired.result.status).toBe("TIMED_OUT");
+  expect(expired.model.requests).toHaveLength(0);
+  saved.finalResult = {
+    ...expired.result,
+    status: "SUCCEEDED",
+    executeCompletion: {
+      ...expired.result.executeCompletion!,
+      outcome: "PATCH_READY",
+      state: "PATCH_READY",
+    },
+  };
+  delete saved.postPatch;
+  await store.save(saved);
+  const legacy = await run({ calls: [[finish]], maxSteps: 5, runId, stateStore: store });
+  expect(legacy.result.error?.message).toContain("LEGACY_COMPLETION_UNCONFIRMED");
+  expect(legacy.model.requests).toHaveLength(0);
 });

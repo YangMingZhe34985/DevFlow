@@ -303,7 +303,7 @@ export async function observePostPatchTool(input: {
       !args.base &&
       !args.cached &&
       !args.paths &&
-      [...controller.hashes].every(([p, hash]) => hashes[p] === hash && hash !== "ABSENT");
+      [...controller.hashes].every(([p, hash]) => hashes[p] === hash);
     try {
       // A filtered diff cannot hide staged, untracked or unrelated files from readiness.
       const status = await new SandboxGitService().status(sandbox, signal);

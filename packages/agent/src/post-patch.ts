@@ -28,6 +28,8 @@ export class PostPatchController {
   diffFingerprint: string | null = null;
   unexpectedFiles: string[] = [];
   firstMutationEndedAt: number | null = null;
+  needsVerification = false;
+  unfinishedWork: string[] = [];
   calls = { model: 0, tool: 0, input: 0, output: 0, mutation: 0, reads: 0, diff: 0 };
   constructor(
     readonly targets: readonly string[],
@@ -50,6 +52,32 @@ export class PostPatchController {
     if (!this.canSubmit) return false;
     this.state = "PATCH_READY";
     return true;
+  }
+  snapshot() {
+    return {
+      revision: this.revision,
+      changed: [...this.changed],
+      hashes: Object.fromEntries(this.hashes),
+      failures: Object.fromEntries(this.failures),
+      firstMutationEndedAt: this.firstMutationEndedAt,
+      diff: this.diff,
+      diffFingerprint: this.diffFingerprint,
+      calls: { ...this.calls },
+      completionDecision: this.ready,
+    };
+  }
+  restore(value: ReturnType<PostPatchController["snapshot"]>): void {
+    this.revision = value.revision;
+    for (const p of value.changed) this.changed.add(p);
+    for (const [p, sha] of Object.entries(value.hashes)) this.hashes.set(p, sha);
+    for (const [p, failure] of Object.entries(value.failures)) this.failures.set(p, failure);
+    this.firstMutationEndedAt = value.firstMutationEndedAt;
+    this.calls = { ...value.calls };
+    // Saved identity is not fresh sandbox evidence. A budgeted global probe must revalidate it.
+    this.diff = "";
+    this.diffFingerprint = null;
+    this.state = this.active ? "PATCH_APPLIED" : "NO_PATCH";
+    this.needsVerification = this.active;
   }
   get blockers(): string[] {
     return [
@@ -84,20 +112,17 @@ export class PostPatchController {
     }
   }
   observeDiff(patch: string, paths: readonly string[], valid: boolean): void {
-    this.diff = patch.slice(0, 24 * 1024);
+    this.diff = patch;
     this.unexpectedFiles = paths.filter((p) => !this.targets.includes(p));
-    if (
-      !this.active ||
-      !valid ||
-      !patch.trim() ||
-      !paths.length ||
-      [...this.changed].some((p) => !paths.includes(p))
-    ) {
+    if (!this.active || !valid || !patch.trim() || !paths.length) {
       this.diffFingerprint = null;
       this.state = this.active ? "PATCH_APPLIED" : "NO_PATCH";
       return;
     }
     this.diffFingerprint = createHash("sha256").update(patch).digest("hex");
+    this.changed.clear();
+    for (const path of paths) this.changed.add(path);
+    this.needsVerification = false;
     this.state = "PATCH_STABLE";
   }
   allowed(name: string): boolean {
@@ -201,6 +226,15 @@ export class PostPatchController {
       unexpectedFiles: this.unexpectedFiles,
       blockers: this.blockers,
       diffFingerprint: this.diffFingerprint,
+      termination:
+        success && this.ready
+          ? "MODEL_SUBMITTED"
+          : /BUDGET|MAX_STEPS|TIMEOUT/u.test(errorCode ?? "")
+            ? "BUDGET_STOP"
+            : /PROGRESS|STALLED/u.test(errorCode ?? "")
+              ? "NO_PROGRESS"
+              : "INVALID_CANDIDATE",
+      unfinishedWork: this.unfinishedWork,
       failure,
       metrics: {
         firstMutationEndedAt: this.firstMutationEndedAt,

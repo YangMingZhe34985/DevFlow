@@ -47,6 +47,7 @@ export const FinishPhaseTool: ModelToolDescriptor = {
     .object({
       summary: z.string().min(1).max(2_000),
       outcome: PhaseCompletionSchema.shape.outcome,
+      unfinishedWork: PhaseCompletionSchema.shape.unfinishedWork,
       evidence: PhaseCompletionSchema.shape.evidence,
       evidenceRefs: PhaseCompletionSchema.shape.evidenceRefs,
       findingIds: PhaseCompletionSchema.shape.findingIds,

@@ -17,6 +17,7 @@ The API persists intent and queues work. The Worker owns execution; agents acces
 - Tool-free Review with bounded host evidence and public reproductions; Repair retains diagnostic tasks, SHA-linked evidence records and checked answers, with a shared protocol/edit/output correction credit.
 - Public build/typecheck/lint/test profiles, source-aware diagnostic handoff and one bounded scope replan requiring a new approval.
 - Execute reserves editing correction and completion budgets; repeated source/graph queries cannot earn new progress, while malformed edits receive one bounded correction.
+- A stable patch remains editable within approval. Execute hands it to Test on an explicit `finishPhase`; two decisions without new evidence or candidate changes stop further work. See [candidate submission and acceptance](docs/execute-completion-20261008.md).
 - Shared request/recovery budgets, complete-output checks and protected write scope throughout the workflow.
 
 The final nine-case cohort passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing validated nine-case coverage to six strict successes. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).

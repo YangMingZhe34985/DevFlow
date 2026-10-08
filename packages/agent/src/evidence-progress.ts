@@ -6,6 +6,15 @@ const object = (v: unknown): Record<string, unknown> =>
 export class EvidenceProgress {
   private ranges = new Map<string, [number, number][]>();
   private facts = new Set<string>();
+  constructor(saved?: { ranges: [string, [number, number][]][]; facts: string[] }) {
+    if (saved) {
+      this.ranges = new Map(saved.ranges);
+      this.facts = new Set(saved.facts);
+    }
+  }
+  snapshot() {
+    return { ranges: [...this.ranges], facts: [...this.facts] };
+  }
   observe(value: unknown, revision: number, pathHint?: string): boolean {
     const row = object(value);
     let changed = false;

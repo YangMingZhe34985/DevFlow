@@ -964,6 +964,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     let repairAttempt = 0;
     let reviewAttempt = 0;
     let completion: RunResult["executeCompletion"];
+    let unfinishedImplementation: RunResult | undefined;
     const verification = verificationContract("NEEDS_MORE_WORK", "NOT_RUN", "NOT_RUN");
     try {
       budget.assertWithinLimits("PLAN", metrics);
@@ -1098,26 +1099,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           includeRepair: true,
           reviewRecoveryAvailable: continuationRecoveryAvailable,
         });
-        const plannerInput =
-          estimateModelInput(
-            [
-              {
-                role: "USER",
-                content: JSON.stringify({
-                  issue: run.task.description,
-                  plan: plan.proposal ?? plan,
-                  source,
-                }),
-              },
-            ],
-            [],
-          ) + 3072;
-        const plannerOutput = this.environment.stageModels?.PLANNER?.maxOutputTokens ?? 4096;
         return {
-          tokens: repair.total + 2 * (plannerInput + plannerOutput),
-          steps: 5,
-          timeMs:
-            reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2) + 180000,
+          tokens: repair.total,
+          steps: 3,
+          timeMs: reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
         };
       };
       const replanArtifact = (await this.database.artifacts.list(run.id)).findLast(
@@ -1782,7 +1767,32 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ...(completion ? { executeCompletion: completion } : {}),
           }),
         });
-        if (implementation.status !== "SUCCEEDED") {
+        if (
+          implementation.status === "SUCCEEDED" &&
+          completion?.outcome === "NEEDS_MORE_WORK" &&
+          implementation.phaseCompletion?.outcome !== "SCOPE_CONFLICT"
+        ) {
+          unfinishedImplementation = {
+            ...implementation,
+            status: "FAILED",
+            error: {
+              code: "INSUFFICIENT_EVIDENCE",
+              message:
+                implementation.phaseCompletion?.summary ??
+                "Execute submitted an unfinished candidate.",
+              retryable: false,
+            },
+          };
+        } else if (
+          implementation.status !== "SUCCEEDED" &&
+          completion?.outcome === "NEEDS_MORE_WORK" &&
+          completion.state === "PATCH_STABLE" &&
+          ["AGENT_STALLED", "EXECUTION_BUDGET_EXCEEDED", "MAX_STEPS_EXCEEDED"].includes(
+            implementation.error?.code ?? "",
+          )
+        ) {
+          unfinishedImplementation = implementation;
+        } else if (implementation.status !== "SUCCEEDED") {
           return await this.finalizeBenchmark(
             benchmark,
             sandbox,
@@ -1869,6 +1879,44 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         RunResult,
         { before: string | undefined; after: string | undefined }
       >();
+      if (unfinishedImplementation) {
+        let diagnosticTest: WorkflowTestResult | undefined;
+        let diagnosticStop: string | undefined;
+        try {
+          diagnosticTest = await executeTest(0, "EXECUTE");
+        } catch (error) {
+          diagnosticStop = error instanceof Error ? error.message : String(error);
+        }
+        await this.database.artifacts.create({
+          runId: run.id,
+          kind: "OTHER",
+          name: "execute-unfinished-candidate-v1.json",
+          content: JSON.stringify({
+            completion,
+            stop: unfinishedImplementation.error,
+            diagnosticTest,
+            diagnosticStop,
+            strictCompletion: false,
+          }),
+          metadata: { visibility: "HOST_ONLY" },
+        });
+        return await this.finalizeBenchmark(
+          benchmark,
+          sandbox,
+          withWorkflowMetrics(
+            {
+              ...unfinishedImplementation,
+              verification,
+            },
+            metrics,
+            startedAt,
+          ),
+          false,
+          0,
+          0,
+          executionSignal,
+        );
+      }
       const observeRepairIdentity = async () =>
         repairSourceIdentity(
           activeSandbox,
@@ -1999,7 +2047,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                         testCommandCache.profile?.checks.length ?? 1,
                         !!localSnapshot,
                       ).total,
-                continuationReserve,
+                // This request is already Repair. Preserve its Test/Review branch;
+                // the existing replan admission computes Planner costs only after a scope conflict.
                 onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: repairLease.mandatoryDownstreamSteps,
@@ -4527,7 +4576,45 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
         additionalContext: input.additionalContext,
         ...(input.purpose === "IMPLEMENTATION"
-          ? {}
+          ? {
+              stateStore: {
+                load: async () => {
+                  const previous = (await this.database.artifacts.list(input.run.id)).findLast(
+                    (a) =>
+                      a.name === "execute-convergence-v1.json" &&
+                      a.content &&
+                      JSON.parse(a.content).planSha256 === contentHash(JSON.stringify(input.plan)),
+                  );
+                  if (previous)
+                    throw new DevflowError({
+                      code: "CONFLICT",
+                      message:
+                        "EXECUTE_RESUME_REQUIRES_CANDIDATE_IDENTITY: saved Execute state cannot be restarted in a fresh sandbox without validated candidate restoration.",
+                      details: { requestIssued: false, artifactId: previous.id },
+                    });
+                  return undefined;
+                },
+                save: async (state: AgentState) => {
+                  await this.database.artifacts.create({
+                    runId: input.run.id,
+                    kind: "OTHER",
+                    name: "execute-convergence-v1.json",
+                    mimeType: "application/json",
+                    content: JSON.stringify({
+                      planSha256: contentHash(JSON.stringify(input.plan)),
+                      phase: state.phase,
+                      steps: state.stepCount,
+                      startedAt: state.startedAt,
+                      convergence: state.executionConvergence,
+                      recovery: state.executionRecovery,
+                      postPatch: state.postPatch,
+                      metrics: state.metrics,
+                    }),
+                    metadata: { visibility: "HOST_ONLY" },
+                  });
+                },
+              },
+            }
           : {
               repairMode: true,
               ...(repairRecovery ? { executionRecovery: repairRecovery } : {}),

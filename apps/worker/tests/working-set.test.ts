@@ -7,9 +7,125 @@ import {
 } from "@devflow/agent";
 import { randomUUID } from "node:crypto";
 import { CodingSession } from "../src/runs/coding-session.js";
-import { buildWorkingSet, ExplorationBudget, patchTargetPaths } from "../src/runs/working-set.js";
+import {
+  buildWorkingSet,
+  ExplorationBudget,
+  patchTargetPaths,
+  canOpenFailureInvestigation,
+} from "../src/runs/working-set.js";
 import type { EvidencePack } from "../src/localization/contracts.js";
 const ws = { evidenceSufficient: true, relevantCode: [{ path: "a.ts" }] } as WorkingSet;
+
+it("persists a single bounded diagnostic investigation without replenishing ordinary exploration", () => {
+  const budget = new ExplorationBudget(
+    ws,
+    { targetedReads: 1, broadSearches: 1, relocations: 1 },
+    true,
+    ["a.ts"],
+  );
+  budget.authorize("readFile", { path: "ordinary.ts" });
+  const grant = {
+    id: "public-failure",
+    roots: ["consumer.ts", "tests/behavior.test.ts"],
+    candidates: ["consumer.ts"],
+    failureFingerprint: "failure",
+    evidence: [],
+  };
+  expect(budget.grantFailureInvestigation(grant)).toBe(true);
+  expect(canOpenFailureInvestigation(budget.snapshot())).toBe(false);
+  expect(budget.available("searchCode")).toBe(true);
+  expect(budget.authorize("readFile", { path: "consumer.ts" })).toBeUndefined();
+  expect(budget.authorize("searchCode", { path: "consumer.ts", query: "event" })).toBeUndefined();
+  expect(budget.snapshot()).toMatchObject({
+    reads: 1,
+    searches: 0,
+    investigation: { reads: 1, navigation: 1 },
+  });
+  const restored = new ExplorationBudget(ws, budget.limits, true, ["a.ts"]);
+  restored.restore(JSON.parse(JSON.stringify(budget.snapshot())), true);
+  expect(restored.grantFailureInvestigation({ ...grant, id: "retry" })).toBe(false);
+  expect(restored.authorize("readFile", { path: "consumer.ts" })).toBeUndefined();
+  expect(restored.authorize("readFile", { path: "consumer.ts" })?.details).toMatchObject({
+    reasonCode: "FAILURE_INVESTIGATION_READ_LIMIT",
+  });
+  expect(restored.authorize("queryRelations", { paths: ["consumer.ts"] })?.details).toMatchObject({
+    reasonCode: "FAILURE_INVESTIGATION_NAVIGATION_LIMIT",
+  });
+  expect(restored.authorize("readFile", { path: "unrelated.ts" })?.details).toMatchObject({
+    reasonCode: "OPTIONAL_READ_LIMIT",
+  });
+  expect(restored.authorize("queryRelations", { paths: ["unrelated.ts"] })?.details).toMatchObject({
+    reasonCode: "FAILURE_INVESTIGATION_ROOTS",
+  });
+  expect(restored.investigationReadPaths()).toEqual([]);
+  expect(restored.authorize("readFile", { path: "a.ts" })).toBeUndefined();
+  expect(restored.snapshot().reads).toBe(1);
+});
+
+it("does not grant investigation to unknown old consumption or unsafe roots", () => {
+  const grant = {
+    id: "public-failure",
+    roots: ["consumer.ts"],
+    candidates: ["consumer.ts"],
+    failureFingerprint: "failure",
+    evidence: [],
+  };
+  const old = new ExplorationBudget(ws, { targetedReads: 1, broadSearches: 1, relocations: 1 });
+  old.restore(undefined, true);
+  expect(canOpenFailureInvestigation(undefined)).toBe(false);
+  expect(canOpenFailureInvestigation({ version: "coding-exploration-v1" })).toBe(false);
+  expect(canOpenFailureInvestigation(old.snapshot())).toBe(false);
+  expect(old.grantFailureInvestigation(grant)).toBe(false);
+  for (const path of ["../consumer.ts", "C:/consumer.ts", "/consumer.ts"])
+    expect(
+      new ExplorationBudget(ws, old.limits).grantFailureInvestigation({ ...grant, roots: [path] }),
+    ).toBe(false);
+});
+
+it("follows only host-verified imports within the same two-read/one-query investigation", () => {
+  const budget = new ExplorationBudget(
+    ws,
+    { targetedReads: 0, broadSearches: 0, relocations: 0 },
+    true,
+    ["a.ts"],
+  );
+  expect(
+    budget.grantFailureInvestigation({
+      id: "public-failure",
+      roots: ["tests/failure.test.ts"],
+      candidates: [],
+      failureFingerprint: "failure",
+      evidence: [],
+    }),
+  ).toBe(true);
+  budget.observeFailureRelations({
+    path: "unrelated.ts",
+    fileSha256: "a".repeat(64),
+    targets: ["rogue.ts"],
+  });
+  expect(budget.investigationReadPaths()).toEqual(["tests/failure.test.ts"]);
+  budget.authorize("readFile", { path: "tests/failure.test.ts" });
+  budget.observeFailureRelations({
+    path: "tests/failure.test.ts",
+    fileSha256: "a".repeat(64),
+    targets: ["tests/fixtures.ts", "../outside.ts"],
+  });
+  expect(budget.authorize("readFile", { path: "tests/fixtures.ts" })).toBeUndefined();
+  expect(budget.authorize("queryRelations", { paths: ["tests/fixtures.ts"] })).toBeUndefined();
+  const saved = JSON.parse(JSON.stringify(budget.snapshot()));
+  const restored = new ExplorationBudget(ws, budget.limits, true, ["a.ts"]);
+  restored.restore(saved, true);
+  expect(restored.snapshot().investigation).toMatchObject({
+    reads: 2,
+    navigation: 1,
+    relatedEvidence: [
+      { from: "tests/failure.test.ts", path: "tests/fixtures.ts", sourceSha256: "a".repeat(64) },
+    ],
+  });
+  expect(restored.authorize("readFile", { path: "tests/fixtures.ts" })?.details).toMatchObject({
+    reasonCode: "FAILURE_INVESTIGATION_READ_LIMIT",
+  });
+});
 it("verifies quoted text patch paths and fails closed for ambiguous or metadata-only patches", () => {
   expect(
     patchTargetPaths(

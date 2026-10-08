@@ -13,7 +13,12 @@ import {
   codingReplanReserve,
 } from "./coding-budget.js";
 import { repairContinuationReserve } from "./repair-reserve.js";
-import { repairContextSourcePaths, repairDiagnosticTasks } from "./repair-tasks.js";
+import {
+  repairContextSourcePaths,
+  repairDiagnosticTasks,
+  failureInvestigationFor,
+  type FailureInvestigation,
+} from "./repair-tasks.js";
 import { CurrentSourceCache } from "./current-source-cache.js";
 import {
   ScopeReplanStateSchema,
@@ -37,7 +42,7 @@ import {
   resolveRepairEvidenceRefs,
 } from "./repair-response.js";
 import { repairModeInstructions } from "./repair-diagnostics.js";
-import { resolveRepairDiagnostics } from "./repair-diagnostics.js";
+import { resolveRepairDiagnostics, type DiagnosticResolution } from "./repair-diagnostics.js";
 import {
   ReplanEvidenceReader,
   verifyReplanEvidence,
@@ -64,7 +69,12 @@ import {
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomUUID } from "node:crypto";
 import { EfficiencyTrace } from "./efficiency-trace.js";
-import { buildWorkingSet, ExplorationBudget, patchTargetPaths } from "./working-set.js";
+import {
+  buildWorkingSet,
+  ExplorationBudget,
+  patchTargetPaths,
+  canOpenFailureInvestigation,
+} from "./working-set.js";
 import { buildExecutionPacket, sourceSlice, PACKET_PROMPT } from "./execution-packet.js";
 import {
   observePostPatchTool,
@@ -2125,6 +2135,22 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         )
           throw new Error("REPLAN_PUBLIC_PROFILE_CHANGED");
       }
+      let publicFailureStreak = 0;
+      for (const artifact of (await this.database.artifacts.list(run.id))
+        .filter((a) => a.kind === "TEST_REPORT")
+        .reverse()) {
+        const metadata = recordValue(artifact.metadata);
+        const observation = recordValue(metadata.publicVerification);
+        if (
+          metadata.skipped === true ||
+          (observation.timedOut ?? metadata.timedOut) !== false ||
+          (observation.outputTruncated ?? metadata.outputTruncated) !== false ||
+          typeof metadata.exitCode !== "number" ||
+          metadata.exitCode === 0
+        )
+          break;
+        publicFailureStreak++;
+      }
       const executeTest = async (
         attempt: number,
         expectedStage: "EXECUTE" | "FIX",
@@ -2147,6 +2173,14 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           },
           `test:${repairAttempt}:review:${reviewAttempt}:coding-step:${codingSession.state?.stepCount ?? 0}`,
         );
+        publicFailureStreak =
+          typeof result.exitCode === "number" &&
+          result.exitCode !== 0 &&
+          !result.skipped &&
+          !result.timedOut &&
+          !result.outputTruncated
+            ? publicFailureStreak + 1
+            : 0;
         verification.test = result.skipped
           ? "SKIPPED"
           : result.exitCode === 0
@@ -2258,9 +2292,45 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         currentSources: WorkingCode[],
         reviewFindingIds?: readonly string[],
         stableTaskContext?: string,
+        investigationObservation?: {
+          test: CommandResult;
+          resolution: DiagnosticResolution | undefined;
+          fingerprint: string;
+        },
       ): Promise<RunResult> => {
         budget.requireAgentSteps("REPAIR");
         continuationRecoveryAvailable = await remainingReviewRecovery();
+        const failureInvestigation =
+          purpose === "TEST_REPAIR" &&
+          plan.proposalVersion === "plan-proposal-v1" &&
+          investigationObservation &&
+          investigationObservation.resolution &&
+          canOpenFailureInvestigation(codingSession.state?.hostToolState?.exploration)
+            ? await failureInvestigationFor({
+                consecutiveFailures: publicFailureStreak,
+                test: investigationObservation.test,
+                failureFingerprint: investigationObservation.fingerprint,
+                approvedPaths: plan.approvalScope?.files.map((f) => f.path) ?? [],
+                repositoryPaths: repairManifest?.paths ?? currentSources.map((s) => s.path),
+                resolution: investigationObservation.resolution,
+                currentSources,
+                signal: executionSignal,
+              })
+            : undefined;
+        if (failureInvestigation)
+          await this.database.artifacts.create({
+            runId: run.id,
+            kind: "OTHER",
+            name: `failure-investigation-${failureInvestigation.id}.json`,
+            content: JSON.stringify({
+              ...failureInvestigation,
+              consecutiveFailures: publicFailureStreak,
+              readOnly: true,
+              limits: { reads: 2, navigation: 1 },
+              writeApprovalUnchanged: true,
+            }),
+            metadata: { visibility: "HOST_ONLY" },
+          });
         if (scopeReplan?.status === "RESUMED") {
           scopeReplan.repairAttempts = repairAttempt;
           scopeReplan.reviewAttempts = reviewAttempt;
@@ -2344,6 +2414,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           additionalContext,
           stableTaskContext: [
             stableTaskContext,
+            failureInvestigation
+              ? "Host-observed public failures permit bounded read-only investigation: " +
+                JSON.stringify(failureInvestigation) +
+                ". At most two diagnostic reads and one rooted search/relation query, within persisted/global budgets. Relations are hypotheses, not proven root causes. If scope is insufficient, reply with literal current source/SHA and SCOPE_CONFLICT/replanRequest; never edit unapproved targets."
+              : undefined,
             repairModeInstructions(
               reviewFindingIds ? "REVIEW_REPAIR" : "TEST_REPAIR",
               reviewFindingIds,
@@ -2352,6 +2427,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             .filter(Boolean)
             .join("\n"),
           currentSources,
+          ...(failureInvestigation ? { failureInvestigation } : {}),
           ...(reviewFindingIds ? { reviewFindingIds } : {}),
           workspaceRevision: localizationView.revision(),
         });
@@ -3194,6 +3270,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           context.currentSources,
           undefined,
           context.stableTaskContext,
+          {
+            test: scopeReplan.testResult,
+            resolution: context.diagnosticResolution,
+            fingerprint: context.testFingerprint,
+          },
         );
         if (repaired.status !== "SUCCEEDED")
           return await this.finalizeBenchmark(
@@ -3340,6 +3421,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           repairContext.currentSources,
           undefined,
           repairContext.stableTaskContext,
+          {
+            test,
+            resolution: repairContext.diagnosticResolution,
+            fingerprint: repairContext.testFingerprint,
+          },
         );
         if (repair.status !== "SUCCEEDED") {
           return await this.finalizeBenchmark(
@@ -4177,6 +4263,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             reviewTriggeredTestContext.currentSources,
             undefined,
             reviewTriggeredTestContext.stableTaskContext,
+            {
+              test,
+              resolution: reviewTriggeredTestContext.diagnosticResolution,
+              fingerprint: reviewTriggeredTestContext.testFingerprint,
+            },
           );
           if (testRepair.status !== "SUCCEEDED") {
             return await this.finalizeBenchmark(
@@ -4661,6 +4752,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     stableTaskContext?: string;
     workingSet?: WorkingSet;
     currentSources?: WorkingCode[];
+    failureInvestigation?: FailureInvestigation;
     workspaceRevision?: number;
     executionPacket?: ExecutionPacket;
     packetSourceBytes?: number;
@@ -4787,7 +4879,29 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           true,
         );
     }
-    const workingSet = input.workingSet;
+    const workingSet: WorkingSet | undefined =
+      input.workingSet ??
+      (input.codingSession && input.plan.proposalVersion
+        ? {
+            version: "working-set-v1",
+            evidenceVersion: "host-current-coding-diagnostics",
+            workspaceRevision: input.workspaceRevision ?? 0,
+            targetFiles: input.plan.approvalScope?.files.map((f) => f.path) ?? [],
+            targetSymbols: [],
+            relevantCode: input.currentSources ?? [],
+            requiredInterfaces: [],
+            relevantTests: [],
+            constraints: [
+              "Only the persisted Plan authorizes writes; diagnostic candidates remain read-only.",
+            ],
+            uncertainty: [
+              "Public failure locations and imports are navigation evidence, not proof of root cause.",
+            ],
+            evidenceSufficient: false,
+            requiresAdditionalExploration: true,
+            missingInformation: [],
+          }
+        : undefined);
     const targetScope = input.plan.proposalVersion
       ? {
           targets: input.plan.approvalScope?.files.map((f) => f.path) ?? [],
@@ -5166,8 +5280,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                   targetScope.targets,
                 ),
             }),
-        closingReadPaths: () =>
-          targetScope.targets.filter((path) => !versions.has(path) || stalePaths.has(path)),
+        closingReadPaths: () => [
+          ...new Set([
+            ...targetScope.targets.filter((path) => !versions.has(path) || stalePaths.has(path)),
+            ...(exploration?.investigationReadPaths() ?? []),
+          ]),
+        ],
         ...(input.codingSession
           ? {
               stateStore:
@@ -5207,6 +5325,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                       restore: (value: Record<string, unknown> | undefined, resumed: boolean) => {
                         exploration.restore(value?.exploration, resumed);
                         if (resumed) exploration.invalidate([], true);
+                        if (input.failureInvestigation)
+                          exploration.grantFailureInvestigation(input.failureInvestigation);
                       },
                       snapshot: () => ({ exploration: exploration.snapshot() }),
                     },
@@ -5616,6 +5736,34 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             : await execute();
           input.onToolObservation?.(request.name, result);
           exploration?.observe(request.name, result);
+          if (relationGraph && exploration && result.ok && request.name === "readFile") {
+            const output = recordValue(result.output);
+            const node = relationGraph
+              .snapshot()
+              .files.find(
+                (file) =>
+                  file.path === output.path &&
+                  file.state === "CURRENT" &&
+                  file.sha256 === output.fileSha256,
+              );
+            if (
+              node?.sha256 &&
+              node.parse?.status === "PARSED" &&
+              !node.parse.configurationErrors.length
+            )
+              exploration.observeFailureRelations({
+                path: node.path,
+                fileSha256: node.sha256,
+                targets: node.parse.imports
+                  .filter(
+                    (imported) =>
+                      imported.resolution === "RESOLVED" &&
+                      !imported.typeOnly &&
+                      imported.resolvedPath !== null,
+                  )
+                  .map((imported) => imported.resolvedPath!),
+              });
+          }
           const isMutation = ["writeFile", "replaceText", "applyPatch", "runCommand"].includes(
             request.name,
           );

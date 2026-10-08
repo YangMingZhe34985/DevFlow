@@ -3,8 +3,156 @@ import { diagnosticTriageText } from "./repair-diagnostics.js";
 import type { DiagnosticResolution } from "./repair-diagnostics.js";
 import type { WorkingCode } from "@devflow/agent";
 import { graphPathAllowed } from "../localization/relation-graph.js";
+import { isTestFile } from "../localization/contracts.js";
+import { parseRelations } from "../localization/relation-parser.js";
+
+export interface FailureInvestigation {
+  id: string;
+  failureFingerprint: string;
+  roots: string[];
+  candidates: string[];
+  evidence: {
+    path: string;
+    fileSha256: string;
+    target: string;
+    origin: "PUBLIC_DIAGNOSTIC" | "OBSERVED_TEST_IMPORT" | "PUBLIC_TEST_LOCATION";
+  }[];
+}
+
+/** Host observations can open read-only navigation, never establish a root cause or write scope. */
+export async function failureInvestigationFor(input: {
+  consecutiveFailures: number;
+  test: { exitCode: number | null; timedOut: boolean; outputTruncated: boolean };
+  failureFingerprint: string;
+  approvedPaths: readonly string[];
+  repositoryPaths: readonly string[];
+  resolution: DiagnosticResolution;
+  currentSources: readonly WorkingCode[];
+  signal: AbortSignal;
+}): Promise<FailureInvestigation | undefined> {
+  if (
+    input.consecutiveFailures < 2 ||
+    input.test.exitCode === null ||
+    input.test.exitCode === 0 ||
+    input.test.timedOut ||
+    input.test.outputTruncated
+  )
+    return undefined;
+  const approved = new Set(input.approvedPaths);
+  const observed = new Map(
+    input.currentSources
+      .filter(
+        (s) =>
+          investigationPathAllowed(s.path) &&
+          /^[a-f0-9]{64}$/.test(s.contentHash) &&
+          s.code.trim() &&
+          (!s.complete || digest(s.code) === s.contentHash),
+      )
+      .map((s) => [s.path, s]),
+  );
+  const evidence: FailureInvestigation["evidence"] = [];
+  for (const diagnostic of input.resolution.resolved) {
+    const source = observed.get(diagnostic.path);
+    if (
+      source &&
+      !approved.has(source.path) &&
+      !isTestFile(source.path) &&
+      investigationPathAllowed(source.path)
+    )
+      evidence.push({
+        path: source.path,
+        fileSha256: source.contentHash,
+        target: source.path,
+        origin: "PUBLIC_DIAGNOSTIC",
+      });
+  }
+  // Prefer exact source locations. If only assertions are located, use the existing
+  // resolver on actually observed leading test code; absent aliases/config remain unknown.
+  if (!evidence.length)
+    for (const source of input.currentSources
+      .filter(
+        (s) =>
+          isTestFile(s.path) &&
+          s.startLine === 1 &&
+          observed.has(s.path) &&
+          input.resolution.resolved.some((diagnostic) => diagnostic.path === s.path),
+      )
+      .slice(0, 2)) {
+      try {
+        const parsed = await parseRelations(
+          {
+            path: source.path,
+            content: source.code,
+            paths: [...input.repositoryPaths],
+            configuration: {},
+          },
+          input.signal,
+        );
+        if (parsed.status !== "PARSED" || parsed.configurationErrors.length) continue;
+        for (const imported of parsed.imports) {
+          const target = imported.resolvedPath;
+          if (
+            target &&
+            imported.resolution === "RESOLVED" &&
+            !imported.typeOnly &&
+            investigationPathAllowed(target) &&
+            !isTestFile(target) &&
+            !approved.has(target)
+          )
+            evidence.push({
+              path: source.path,
+              fileSha256: source.contentHash,
+              target,
+              origin: "OBSERVED_TEST_IMPORT",
+            });
+        }
+      } catch (error) {
+        if (input.signal.aborted) throw error;
+        // A failed/ambiguous navigation attempt grants no speculative root.
+      }
+    }
+  const candidates = [...new Set(evidence.map((e) => e.target))].slice(0, 2);
+  if (!candidates.length) {
+    // A diagnostic window often starts below imports. Permit navigation from the
+    // observed failing test, without inventing an implementation candidate or scope conflict.
+    const tests = [...new Set(input.resolution.resolved.map((d) => d.path))]
+      .filter((path) => isTestFile(path) && !approved.has(path) && observed.has(path))
+      .slice(0, 2);
+    if (!tests.length) return undefined;
+    const retained: FailureInvestigation["evidence"] = tests.map((path) => ({
+      path,
+      fileSha256: observed.get(path)!.contentHash,
+      target: path,
+      origin: "PUBLIC_TEST_LOCATION",
+    }));
+    return {
+      id: `failure-investigation-${digest(JSON.stringify({ approved: [...approved].sort(), fingerprint: input.failureFingerprint, retained })).slice(0, 24)}`,
+      failureFingerprint: input.failureFingerprint,
+      roots: tests,
+      candidates: [],
+      evidence: retained,
+    };
+  }
+  const retained = evidence.filter((e) => candidates.includes(e.target)).slice(0, 4);
+  const roots = [...new Set([...candidates, ...retained.map((e) => e.path)])].slice(0, 4);
+  return {
+    id: `failure-investigation-${digest(JSON.stringify({ approved: [...approved].sort(), fingerprint: input.failureFingerprint, retained })).slice(0, 24)}`,
+    failureFingerprint: input.failureFingerprint,
+    roots,
+    candidates,
+    evidence: retained,
+  };
+}
 
 const digest = (text: string) => createHash("sha256").update(text).digest("hex");
+
+function investigationPathAllowed(path: string) {
+  return (
+    !/^(?:[A-Za-z]:|\/|\\)/u.test(path) &&
+    !path.split(/[\\/]/u).some((part) => part === ".." || part === "." || !part) &&
+    graphPathAllowed(path)
+  );
+}
 
 /** Shared selection for resource quotation and the actual Repair-context IO. */
 export function repairContextSourcePaths(input: {

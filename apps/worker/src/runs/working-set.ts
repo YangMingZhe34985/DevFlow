@@ -3,6 +3,8 @@ import { DevflowError, type DevflowErrorShape } from "@devflow/shared";
 import type { ToolExecutionResult } from "@devflow/tools";
 import { z } from "zod";
 import type { EvidencePack } from "../localization/contracts.js";
+import type { FailureInvestigation } from "./repair-tasks.js";
+import { graphPathAllowed } from "../localization/relation-graph.js";
 
 /** Data projection only: never includes ranking internals, timings or alternative schemas. */
 export function buildWorkingSet(pack: EvidencePack, workspaceRevision: number): WorkingSet {
@@ -103,6 +105,24 @@ const ExplorationStateSchema = z.object({
   expanded: z.boolean(),
   necessaryReadRequests: z.number().int().nonnegative(),
   legacyConsumptionUnknown: z.boolean(),
+  investigation: z
+    .object({
+      id: z.string().min(1),
+      roots: z.array(z.string()).min(1).max(4),
+      reads: z.number().int().min(0).max(2),
+      navigation: z.number().int().min(0).max(1),
+      relatedEvidence: z
+        .array(
+          z.object({
+            from: z.string(),
+            path: z.string(),
+            sourceSha256: z.string().regex(/^[a-f0-9]{64}$/u),
+          }),
+        )
+        .max(4)
+        .optional(),
+    })
+    .optional(),
   evidence: z.array(
     z.object({
       path: z.string(),
@@ -113,6 +133,11 @@ const ExplorationStateSchema = z.object({
     }),
   ),
 });
+export function canOpenFailureInvestigation(saved: unknown): boolean {
+  const state = ExplorationStateSchema.safeParse(saved);
+  return state.success && !state.data.legacyConsumptionUnknown && !state.data.investigation;
+}
+
 export class ExplorationBudget {
   private reads = 0;
   private searches = 0;
@@ -123,6 +148,7 @@ export class ExplorationBudget {
   private legacyConsumptionUnknown = false;
   private readonly necessary: Set<string>;
   private evidence = new Map<string, z.infer<typeof ExplorationStateSchema>["evidence"][number]>();
+  private investigation: z.infer<typeof ExplorationStateSchema>["investigation"];
   constructor(
     readonly workingSet: WorkingSet,
     readonly limits: ExplorationLimits,
@@ -144,6 +170,7 @@ export class ExplorationBudget {
       necessaryReadRequests: this.necessaryReadRequests,
       legacyConsumptionUnknown: this.legacyConsumptionUnknown,
       evidence: [...this.evidence.values()],
+      ...(this.investigation ? { investigation: this.investigation } : {}),
     };
   }
   restore(value: unknown, resumed: boolean) {
@@ -156,6 +183,7 @@ export class ExplorationBudget {
       this.relocations = this.limits.relocations;
       this.recoveryGranted = true;
       this.legacyConsumptionUnknown = true;
+      this.investigation = undefined;
       return;
     }
     const saved = parsed.data;
@@ -166,6 +194,7 @@ export class ExplorationBudget {
     this.expanded = saved.expanded;
     this.necessaryReadRequests = saved.necessaryReadRequests;
     this.legacyConsumptionUnknown = saved.legacyConsumptionUnknown;
+    this.investigation = saved.investigation;
     // Source identities are audit records only; current write evidence is independently verified.
     this.evidence = new Map(
       saved.evidence.filter((row) => this.necessary.has(row.path)).map((row) => [row.path, row]),
@@ -205,6 +234,46 @@ export class ExplorationBudget {
       });
     }
   }
+  grantFailureInvestigation(grant: FailureInvestigation): boolean {
+    if (this.investigation || this.legacyConsumptionUnknown) return false;
+    const roots = [...new Set(grant.roots)].filter(
+      (p) =>
+        !/^(?:[A-Za-z]:|\/|\\)/u.test(p) &&
+        !p.split(/[\\/]/u).some((part) => part === ".." || part === "." || !part) &&
+        graphPathAllowed(p) &&
+        /\.[a-z0-9]+$/i.test(p),
+    );
+    if (!roots.length || roots.length > 4 || roots.length !== new Set(grant.roots).size)
+      return false;
+    this.investigation = { id: grant.id, roots, reads: 0, navigation: 0 };
+    return true;
+  }
+  investigationReadPaths(): string[] {
+    return this.investigation && this.investigation.reads < 2 ? [...this.investigation.roots] : [];
+  }
+  /** Only the Worker may supply imports parsed from a current full-SHA graph node. */
+  observeFailureRelations(input: { path: string; fileSha256: string; targets: readonly string[] }) {
+    const investigation = this.investigation;
+    if (!investigation?.roots.includes(input.path) || !/^[a-f0-9]{64}$/u.test(input.fileSha256))
+      return;
+    for (const target of input.targets) {
+      if (investigation.roots.length >= 4) break;
+      if (
+        investigation.roots.includes(target) ||
+        !graphPathAllowed(target) ||
+        /^(?:[A-Za-z]:|\/|\\)/u.test(target) ||
+        target.split(/[\\/]/u).some((part) => !part || part === "." || part === "..")
+      )
+        continue;
+      investigation.roots.push(target);
+      (investigation.relatedEvidence ??= []).push({
+        from: input.path,
+        path: target,
+        sourceSha256: input.fileSha256,
+      });
+    }
+    // Following a verified import changes read-only roots, never quota or write approval.
+  }
   invalidate(paths: readonly string[], unknown: boolean) {
     if (unknown) this.evidence.clear();
     else for (const path of paths) this.evidence.delete(path);
@@ -212,10 +281,17 @@ export class ExplorationBudget {
   }
   available(name: string): boolean {
     if (["listFiles", "searchCode", "batchSearchCode"].includes(name))
-      return this.expanded && this.searches < this.limits.broadSearches;
+      return (
+        (name === "searchCode" && !!this.investigation && this.investigation.navigation < 1) ||
+        (this.expanded && this.searches < this.limits.broadSearches)
+      );
     if (name === "locateIssue") return this.expanded && this.relocations < this.limits.relocations;
     if (["readFile", "batchReadFiles"].includes(name))
-      return this.necessary.size > 0 || this.reads < this.limits.targetedReads;
+      return (
+        (name === "readFile" && !!this.investigation && this.investigation.reads < 2) ||
+        this.necessary.size > 0 ||
+        this.reads < this.limits.targetedReads
+      );
     return true;
   }
   consume(name: string, input: unknown): string | undefined {
@@ -242,6 +318,50 @@ export class ExplorationBudget {
       );
     const value =
       typeof input === "object" && input !== null ? (input as Record<string, unknown>) : {};
+    const investigation = this.investigation;
+    if (
+      investigation &&
+      name === "readFile" &&
+      typeof value.path === "string" &&
+      investigation.roots.includes(value.path) &&
+      !this.necessary.has(value.path)
+    ) {
+      if (investigation.reads >= 2)
+        return limit(
+          "FAILURE_INVESTIGATION_READ_LIMIT",
+          "The two read-only diagnostic reads are exhausted; no new write scope was granted.",
+        );
+      investigation.reads++;
+      return undefined;
+    }
+    if (investigation && ["searchCode", "queryRelations"].includes(name)) {
+      const paths =
+        name === "queryRelations" ? (Array.isArray(value.paths) ? value.paths : []) : [value.path];
+      if (
+        paths.some((p) => typeof p === "string" && investigation.roots.includes(p)) ||
+        (name === "queryRelations" &&
+          paths.some((p) => typeof p !== "string" || !this.necessary.has(p)))
+      ) {
+        if (
+          !paths.length ||
+          paths.some(
+            (p) =>
+              typeof p !== "string" || (!investigation.roots.includes(p) && !this.necessary.has(p)),
+          )
+        )
+          return limit(
+            "FAILURE_INVESTIGATION_ROOTS",
+            "Diagnostic navigation must use the host-observed roots or approved source paths.",
+          );
+        if (investigation.navigation >= 1)
+          return limit(
+            "FAILURE_INVESTIGATION_NAVIGATION_LIMIT",
+            "The single read-only diagnostic search/relation query is exhausted.",
+          );
+        investigation.navigation++;
+        return undefined;
+      }
+    }
     if (["readFile", "batchReadFiles"].includes(name)) {
       const paths =
         name === "readFile" ? [value.path] : Array.isArray(value.paths) ? value.paths : [];

@@ -10,7 +10,7 @@ import { loadWorkerEnvironment } from "../src/config/env.js";
 
 afterEach(() => vi.restoreAllMocks());
 
-function workerFixture(publicValues = [2]) {
+function workerFixture(publicValues = [2], outsideFailure = false) {
   const original = "export const value = 0;\n";
   let source = original;
   const order: string[] = [];
@@ -21,7 +21,11 @@ function workerFixture(publicValues = [2]) {
     workspacePath: "/workspace",
     dispose: async () => undefined,
     listFiles: async () => ({
-      entries: ["a.ts", "package.json"].map((path) => ({ path, kind: "FILE", sizeBytes: 80 })),
+      entries: ["a.ts", "package.json", ...(outsideFailure ? ["b.ts"] : [])].map((path) => ({
+        path,
+        kind: "FILE",
+        sizeBytes: 80,
+      })),
       truncated: false,
     }),
     readFile: async ({ path }: { path: string }) => {
@@ -30,9 +34,18 @@ function workerFixture(publicValues = [2]) {
           ? source
           : path === "package.json"
             ? '{"scripts":{"test":"node --test"}}'
-            : undefined;
+            : outsideFailure && path === "b.ts"
+              ? "export const consumer = 0;\n"
+              : undefined;
       if (content === undefined) throw new DevflowError({ code: "NOT_FOUND", message: "missing" });
-      return { path, content, fileSha256: contentHash(content), truncated: false };
+      return {
+        path,
+        content,
+        startLine: 1,
+        endLine: content.split("\n").length,
+        fileSha256: contentHash(content),
+        truncated: false,
+      };
     },
     writeFile: async ({ path, content }: { path: string; content: string }) => {
       expect(path).toBe("a.ts");
@@ -57,7 +70,9 @@ function workerFixture(publicValues = [2]) {
       } else {
         exitCode = publicValues.some((value) => source.includes(`value = ${value}`)) ? 0 : 1;
         stdout = exitCode
-          ? "a.ts:1: error: expected value 2; received value 1"
+          ? outsideFailure
+            ? "b.ts:1: error: expected consumer 2; received consumer 0"
+            : "a.ts:1: error: expected value 2; received value 1"
           : "public assertion passed";
         order.push(`TEST:${exitCode}`);
       }
@@ -164,6 +179,117 @@ const submitted = (value: number, unfinished = false) =>
   });
 
 describe("unified Coding Loop through the real Worker orchestration", () => {
+  it("opens one persisted read-only investigation after two public failures and dispatches a new Plan approval", async () => {
+    const f = workerFixture([], true);
+    f.run.maxTestRetries = 3;
+    Object.assign(f.plan, {
+      proposalVersion: "plan-proposal-v1",
+      approvalScope: {
+        version: "plan-approval-scope-v1",
+        mode: "READY",
+        baseCommitSha: "a".repeat(40),
+        workspaceRevision: 0,
+        files: [{ path: "a.ts", operation: "MODIFY" }],
+      },
+    });
+    const model = new FakeLanguageModel([
+      submitted(1),
+      fakeModelResponse({
+        toolCalls: [
+          {
+            id: "refresh-approved-current",
+            name: "readFile",
+            input: { path: "a.ts", maxBytes: 1000 },
+          },
+        ],
+      }),
+      submitted(2),
+      async (request) => {
+        expect(JSON.stringify(request.messages)).toContain(
+          "Host-observed public failures permit bounded read-only investigation",
+        );
+        expect(JSON.stringify(request.messages)).toContain("b.ts");
+        expect(f.order.filter((row) => row === "TEST:1")).toHaveLength(2);
+        expect(request.tools.map((tool) => tool.name)).toContain("readFile");
+        return fakeModelResponse({
+          toolCalls: [
+            { id: "inspect-consumer", name: "readFile", input: { path: "b.ts", maxBytes: 1000 } },
+          ],
+        });
+      },
+      async (request) => {
+        const source = "export const consumer = 0;\n";
+        expect(JSON.stringify(request.messages)).toContain("inspect-consumer");
+        const state = JSON.parse(
+          f.artifacts.findLast((artifact) => artifact.name === "coding-session-v1.json")!.content!,
+        ).state;
+        expect(state.hostToolState.exploration.investigation.reads).toBe(1);
+        return fakeModelResponse({
+          toolCalls: [
+            {
+              id: "scope-handoff",
+              name: "finishPhase",
+              input: {
+                outcome: "SCOPE_CONFLICT",
+                summary:
+                  "Public failures point to the unapproved consumer; investigate causality in a new plan.",
+                evidence: [{ path: "b.ts", quote: source.trim(), fileSha256: contentHash(source) }],
+                replanRequest: {
+                  candidatePaths: ["b.ts"],
+                  reason: "The diagnosed consumer is outside current write approval",
+                },
+              },
+            },
+          ],
+        });
+      },
+      async (request) => {
+        expect(request.output?.name).toBe("plan_proposal");
+        expect(JSON.stringify(request.messages)).toContain("expected consumer 2");
+        return fakeModelResponse({
+          toolCalls: [],
+          output: {
+            decision: "PROPOSE",
+            goal: "Correct the diagnosed consumer and preserve current candidate",
+            approach: ["Correct the observed consumer after approval"],
+            candidateFiles: ["a.ts", "b.ts"].map((path) => ({
+              path,
+              intent: "EDIT",
+              reason: "Preserve current candidate and correct public consumer failure",
+            })),
+            verification: ["Run the public test"],
+            uncertainties: [],
+          },
+        });
+      },
+    ]);
+    const reviewer = new FakeLanguageModel([]);
+    const result = await new ApprovalWorkflowRunExecutor(
+      f.db,
+      f.environment,
+      () => model,
+      () => reviewer,
+    ).execute(f.run, AbortSignal.timeout(30_000));
+    expect(result.status, JSON.stringify(result)).toBe("WAITING_APPROVAL");
+    expect(
+      model.requests.filter((request) => request.output?.name === "plan_proposal"),
+    ).toHaveLength(1);
+    expect(f.order.filter((row) => row.startsWith("EDIT:"))).toEqual([
+      "EDIT:export const value = 1;",
+      "EDIT:export const value = 2;",
+    ]);
+    expect(reviewer.requests).toHaveLength(0);
+    const investigation = f.artifacts.filter((artifact) =>
+      artifact.name.startsWith("failure-investigation-"),
+    );
+    expect(investigation).toHaveLength(1);
+    expect(JSON.parse(investigation[0]!.content!)).toMatchObject({
+      readOnly: true,
+      writeApprovalUnchanged: true,
+      consecutiveFailures: 2,
+    });
+  });
+
   it("blocks a legacy lightweight resume whose history and consumed resources cannot be recovered", async () => {
     const f = workerFixture();
     f.artifacts.push({

@@ -166,7 +166,7 @@ export interface RunContext {
   signal: AbortSignal;
   tools: readonly ModelToolDescriptor[];
   availableTools?(): readonly ModelToolDescriptor[];
-  /** Host-approved files whose current edit evidence is missing. At most one closing refresh. */
+  /** Host-selected missing evidence: approved edits or explicit read-only investigation. One closing refresh. */
   closingReadPaths?(): readonly string[];
   validateFinishPhase?(input: unknown): string | undefined;
   authorizeTool?(request: ToolExecutionRequest): string | DevflowErrorShape | undefined;
@@ -378,7 +378,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           if (denied) return denied;
           if (typeof input?.path !== "string" || !context.closingReadPaths?.().includes(input.path))
             return runtimeRejection(
-              "CLOSING_REFRESH_PATH: refresh only the host's missing approved current evidence.",
+              "CLOSING_REFRESH_PATH: refresh only the host-selected current evidence; read authority does not grant write scope.",
               "EXPLORATION_LIMIT",
             );
           evidenceRefreshUsed = true;
@@ -2470,7 +2470,7 @@ function closingReadDescriptor(
     ...tool,
     description:
       tool.description.split("\nCurrent decision contract:")[0] +
-      `\nCurrent decision contract: one approved current-evidence refresh; maxBytes defaults to ${defaultBytes} and cannot exceed ${maximum}. Eligible paths: ${JSON.stringify(paths)}. Approval and budget checks still apply.`,
+      `\nCurrent decision contract: one host-selected current-evidence refresh; maxBytes defaults to ${defaultBytes} and cannot exceed ${maximum}. Eligible paths: ${JSON.stringify(paths)}. This read grants no write scope; approval and budget checks still apply.`,
     inputSchema: originalObject
       ? originalObject.safeExtend(fields)
       : z.intersection(tool.inputSchema, z.object(fields).passthrough()),

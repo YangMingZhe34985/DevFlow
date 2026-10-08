@@ -218,9 +218,9 @@ export class ResourceBudgetRuntime {
         await this.record({
           budgetScheduler: {
             operationId: id,
-            action: "DISPATCH",
+            action: "INVOKE",
             stage: options.stage,
-            requestIssued: true,
+            dispatchStatus: "PENDING",
             resources,
             settings: request.settings,
             inputFingerprint: estimatePlanRequest(request).fingerprint,
@@ -232,14 +232,46 @@ export class ResourceBudgetRuntime {
             signal: AbortSignal.any([requestOptions.signal, AbortSignal.timeout(timeoutMs)]),
           });
         } catch (error) {
+          const knownUsage = { modelCalls: 1, timeMs: Math.max(0, Date.now() - started) };
+          if (
+            error instanceof DevflowError &&
+            typeof error.details === "object" &&
+            error.details !== null &&
+            "requestIssued" in error.details &&
+            error.details.requestIssued === false
+          ) {
+            // The trusted provider adapter can reject locally before HTTP. The invocation
+            // and elapsed time occurred, but no provider token/cost exposure remains.
+            const actual = {
+              ...knownUsage,
+              tokens: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              costMicros: 0,
+            };
+            await this.scheduler.settle(id, actual, { costStatus: "PRICED" });
+            await this.record({
+              budgetScheduler: {
+                operationId: id,
+                action: "NOT_DISPATCHED",
+                dispatchStatus: "NOT_ISSUED",
+                requestIssued: false,
+                reason: "TRUSTED_LOCAL_REJECTION",
+                errorCode: error.code,
+                actual,
+                costStatus: "PRICED",
+              },
+            });
+            throw error;
+          }
           // A transport failure does not establish zero token/cost usage. Persisted ADMITTED remains held.
           await this.scheduler.markUncertain(
             id,
-            { modelCalls: 1, timeMs: Math.max(0, Date.now() - started) },
+            knownUsage,
             "Provider invocation ended without confirmed usage.",
           );
           await this.record({
-            budgetScheduler: { operationId: id, action: "UNCERTAIN", requestIssued: true },
+            budgetScheduler: { operationId: id, action: "UNCERTAIN", dispatchStatus: "UNKNOWN" },
           });
           throw error;
         }
@@ -261,6 +293,8 @@ export class ResourceBudgetRuntime {
           budgetScheduler: {
             operationId: id,
             action: "SETTLE",
+            dispatchStatus: "ISSUED",
+            requestIssued: true,
             actual,
             costStatus: priced ? "PRICED" : "UNPRICED",
           },

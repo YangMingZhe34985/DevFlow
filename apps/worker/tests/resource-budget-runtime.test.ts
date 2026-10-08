@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryBudgetLedgerStore } from "@devflow/database";
+import { DevflowError } from "@devflow/shared";
 import {
+  createConfiguredLanguageModel,
   FakeLanguageModel,
   fakeModelResponse,
   type ModelRequest,
@@ -231,6 +233,130 @@ describe("Resource Budget Scheduler execution boundary", () => {
     expect(
       Object.values((await resumed.snapshot()).reservations).filter((r) => r.status === "ADMITTED"),
     ).toHaveLength(1);
+  });
+
+  it.each([true, false])(
+    "settles a trusted local rejection without token or cost exposure (priced=%s)",
+    async (priced) => {
+      const { runtime, scheduler, options, events } = await fixture();
+      const failure = new DevflowError({
+        code: "VALIDATION_ERROR",
+        message: "The provider input exceeds its local byte limit.",
+        details: { requestIssued: false, requiredBytes: 98090, maxBytes: 96000 },
+      });
+      const model = new FakeLanguageModel([
+        async () => {
+          throw failure;
+        },
+      ]);
+      await expect(
+        runtime
+          .model(model, {
+            stage: "EXECUTE",
+            outputTokens: 16384,
+            timeoutMs: 1000,
+            ...(priced ? { price } : {}),
+          })
+          .generate(request, { signal: signal() }),
+      ).rejects.toBe(failure);
+      const before = await scheduler.snapshot();
+      const reservation = Object.values(before.reservations)[0]!;
+      expect(reservation).toMatchObject({
+        status: "SETTLED",
+        costStatus: "PRICED",
+        actual: { tokens: 0, inputTokens: 0, outputTokens: 0, costMicros: 0, modelCalls: 1 },
+      });
+      expect(reservation.actual!.timeMs).toBeGreaterThanOrEqual(0);
+      expect(before.consumed).toMatchObject({ tokens: 0, costMicros: 0, modelCalls: 1 });
+      expect(before.unpricedOperationIds).toEqual([]);
+      expect(events).toContainEqual({
+        budgetScheduler: expect.objectContaining({
+          action: "NOT_DISPATCHED",
+          requestIssued: false,
+          dispatchStatus: "NOT_ISSUED",
+        }),
+      });
+      expect(JSON.stringify(events)).not.toContain('"requestIssued":true');
+      const resumed = await ResourceBudgetScheduler.open(options);
+      await resumed.settle(reservation.id, reservation.actual!, { costStatus: "PRICED" });
+      expect((await resumed.snapshot()).consumed).toEqual(before.consumed);
+      expect((await resumed.snapshot()).deadlineAt).toBe(before.deadlineAt);
+      expect(Object.values((await resumed.snapshot()).reservations)).toEqual(
+        Object.values(before.reservations),
+      );
+    },
+  );
+
+  it("does not trust a plain transport error claiming that no request was issued", async () => {
+    const { runtime, scheduler, events } = await fixture();
+    const failure = Object.assign(Error("untrusted transport failure"), {
+      details: { requestIssued: false },
+    });
+    await expect(
+      runtime
+        .model(
+          new FakeLanguageModel([
+            async () => {
+              throw failure;
+            },
+          ]),
+          {
+            stage: "EXECUTE",
+            outputTokens: 16384,
+            timeoutMs: 1000,
+            price,
+          },
+        )
+        .generate(request, { signal: signal() }),
+    ).rejects.toBe(failure);
+    const ledger = await scheduler.snapshot();
+    expect(Object.values(ledger.reservations)[0]).toMatchObject({
+      status: "ADMITTED",
+      knownUsage: { modelCalls: 1 },
+    });
+    expect(events).toContainEqual({
+      budgetScheduler: expect.objectContaining({ action: "UNCERTAIN", dispatchStatus: "UNKNOWN" }),
+    });
+    expect(JSON.stringify(events)).not.toContain('"requestIssued":true');
+  });
+
+  it("releases the real provider byte-preflight quote without issuing HTTP", async () => {
+    const { runtime, scheduler, events } = await fixture({ costMicros: 2_000_000 });
+    const http = vi.fn(async () => {
+      throw Error("HTTP must not be called");
+    });
+    vi.stubGlobal("fetch", http);
+    try {
+      const adapter = createConfiguredLanguageModel({
+        provider: "openai-compatible",
+        model: "test-model",
+        apiKey: "test-only",
+        baseUrl: "https://provider.invalid/v1",
+        contextMaxBytes: 96000,
+      });
+      await expect(
+        runtime
+          .model(adapter, { stage: "EXECUTE", outputTokens: 8192, timeoutMs: 1000, price })
+          .generate(
+            {
+              messages: [{ role: "USER", content: "a".repeat(98000) }],
+              tools: [],
+              settings: { maxOutputTokens: 8192 },
+            },
+            { signal: signal() },
+          ),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        details: { maxBytes: 96000, requestIssued: false },
+      });
+      expect(http).not.toHaveBeenCalled();
+      const ledger = await scheduler.snapshot();
+      expect(ledger.consumed).toMatchObject({ tokens: 0, costMicros: 0, modelCalls: 1 });
+      expect(Object.values(ledger.reservations)[0]?.status).toBe("SETTLED");
+      expect(JSON.stringify(events)).not.toContain('"requestIssued":true');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("blocks an unpriced LLM when a hard cost cap is configured", async () => {

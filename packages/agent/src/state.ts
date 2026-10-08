@@ -128,6 +128,16 @@ export const AgentStateSchema = z.object({
   adaptiveStepBudget: AdaptiveStepBudgetStateSchema.optional(),
   plan: AgentPlanSchema.optional(),
   contextCompression: ContextCompressionStateSchema.optional(),
+  codingContinuations: z
+    .array(
+      z.object({
+        id: z.string(),
+        fingerprint: z.string(),
+        kind: z.string(),
+        step: z.number().int().nonnegative(),
+      }),
+    )
+    .optional(),
   executionConvergence: z
     .object({
       noProgressStreak: z.number().int().nonnegative(),
@@ -148,6 +158,7 @@ export const AgentStateSchema = z.object({
       diff: z.string(),
       diffFingerprint: z.string().nullable(),
       completionDecision: z.boolean(),
+      unfinishedWork: z.array(z.string()).optional(),
       calls: z.object({
         model: z.number(),
         tool: z.number(),
@@ -177,6 +188,7 @@ export const AgentStateSchema = z.object({
   finalResult: RunResultSchema.optional(),
 });
 export interface AgentState {
+  codingContinuations?: z.infer<typeof AgentStateSchema>["codingContinuations"];
   executionConvergence?: z.infer<typeof AgentStateSchema>["executionConvergence"];
   postPatch?: z.infer<typeof AgentStateSchema>["postPatch"];
   executionRecovery?: {

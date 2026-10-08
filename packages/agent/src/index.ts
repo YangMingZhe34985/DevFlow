@@ -2,6 +2,7 @@ export * from "./fake-model.js";
 export * from "./model-budget.js";
 export * from "./model.js";
 export * from "./runtime.js";
+export * from "./coding-session.js";
 export * from "./state.js";
 export * from "./vercel-ai-model.js";
 export * from "./working-set.js";

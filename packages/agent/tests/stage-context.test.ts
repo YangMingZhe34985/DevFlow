@@ -2,6 +2,33 @@ import { describe, expect, it } from "vitest";
 import { prepareStageContext, recoverContextMessage } from "../src/stage-context.js";
 import type { ModelMessage } from "../src/model.js";
 describe("static stage context", () => {
+  it("keeps a complete source body larger than 8 KiB when the total request fits", () => {
+    const source = "export const behavior = true;\n".repeat(700) + "// ESSENTIAL_TAIL\n";
+    const history: ModelMessage[] = [
+      { role: "USER", content: "Keep both behaviors" },
+      {
+        role: "ASSISTANT",
+        content: "",
+        toolCalls: [{ id: "large", name: "readFile", input: { path: "src/a.ts" } }],
+      },
+      {
+        role: "TOOL",
+        toolCallId: "large",
+        toolName: "readFile",
+        isError: false,
+        content: {
+          path: "src/a.ts",
+          content: source,
+          fileSha256: "a".repeat(64),
+          truncated: false,
+        },
+      },
+    ];
+    const view = prepareStageContext({ stage: "EXECUTE", history, maxBytes: 64000 });
+    expect(view.projected).toEqual([]);
+    expect(JSON.stringify(view.view)).toContain("ESSENTIAL_TAIL");
+    expect(view.view.at(-1)?.content).toMatchObject({ content: source, truncated: false });
+  });
   it("keeps full history and recoverable hashes while removing old successful interaction groups", () => {
     const history: ModelMessage[] = [
       { role: "SYSTEM", content: "Never expand permissions" },

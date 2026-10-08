@@ -10,6 +10,11 @@ import { CANDIDATE_SUMMARY, type PostPatchController } from "./post-patch.js";
 import type { PrePatchController } from "./pre-patch.js";
 import { EvidenceProgress } from "./evidence-progress.js";
 import { estimateModelInput } from "./model-budget.js";
+import {
+  continueCodingSession,
+  projectCodingSessionHistory,
+  type HostCodingContinuation,
+} from "./coding-session.js";
 
 import {
   DevflowError,
@@ -96,6 +101,10 @@ export interface AdaptiveStepBudgetController {
 }
 
 export interface AgentRunRequest {
+  /** One cumulative Observe/Edit/Test session; finishing hands control to host validation. */
+  codingSession?: boolean;
+  /** Host-only, idempotent reopening after validation/review/new approval, never an Agent tool. */
+  hostContinuation?: HostCodingContinuation;
   contextCompression?: ContextCompressionOptions;
   contextCompressionState?: ContextCompressionState;
   contextStage?: ContextStage;
@@ -170,7 +179,19 @@ export class DefaultAgentRuntime implements AgentRuntime {
     validateRunRequest(request);
     const postPatch = request.postPatch;
     if (postPatch) context = { ...context, postPatch };
-    const restoredState = await context.stateStore?.load(context.runId);
+    let restoredState = await context.stateStore?.load(context.runId);
+    if (request.hostContinuation) {
+      if (!request.codingSession)
+        throw new DevflowError({
+          code: "VALIDATION_ERROR",
+          message: "hostContinuation requires codingSession.",
+          details: { requestIssued: false },
+        });
+      const continued = continueCodingSession(restoredState, request.hostContinuation, request);
+      restoredState = continued.state;
+      // Reserve the continuation before any IO, model request or phase transitions can occur.
+      if (continued.accepted) await context.stateStore!.save(restoredState);
+    }
     if (restoredState?.finalResult !== undefined) {
       if (
         postPatch &&
@@ -230,6 +251,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
     const execution = createExecutionState(context.tools);
     execution.noProgressStreak = state.executionConvergence?.noProgressStreak ?? 0;
     if (postPatch && state.postPatch) postPatch.restore(state.postPatch);
+    if (postPatch)
+      postPatch.diagnosticReadOnly =
+        request.codingSession === true && (state.codingContinuations?.length ?? 0) > 0;
     execution.editCorrectionPending = state.executionRecovery?.pending ?? false;
     execution.editCorrectionUsed = state.executionRecovery?.used ?? false;
     if (state.executionRecovery?.correctionTool)
@@ -474,13 +498,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
               metrics: {
                 ...state.metrics,
                 modelCalls: state.metrics.modelCalls + 1,
-                modelRequestsDispatched: (state.metrics.modelRequestsDispatched ?? 0) + 1,
               },
             });
           }
-          const validMessages = request.deduplicateContext
-            ? invalidateHistoricalReads(messages)
+          const codingMessages = request.codingSession
+            ? projectCodingSessionHistory(messages)
             : messages;
+          const validMessages = request.deduplicateContext
+            ? invalidateHistoricalReads(codingMessages)
+            : codingMessages;
           let currentMessages =
             request.invalidateAdditionalContextOnMutation === true &&
             execution.workspaceRevision !== initialRevision
@@ -502,6 +528,14 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 content: request.systemPrompt ?? (initialMessages[0]!.content as string),
               },
               ...buildUserMessages(stableRequest, context.task.title, context.task.description),
+              ...(request.codingSession
+                ? codingMessages.filter(
+                    (m) =>
+                      m.role === "USER" &&
+                      (m.content.startsWith("Host Coding Loop feedback") ||
+                        m.content.startsWith("Stable Coding task state")),
+                  )
+                : []),
               {
                 role: "USER",
                 content:
@@ -732,7 +766,16 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 ).includes(t.name)),
           );
           if (request.timeReserve) {
-            const remainingTimeMs = phaseDeadlineAt - Date.now();
+            const downstreamTimeMs = Math.max(
+              request.timeReserve.downstreamMs,
+              request.continuationReserve?.().timeMs ?? 0,
+            );
+            // phaseDeadlineAt already reserves the original downstream allowance. Add only the branch difference.
+            const additionalDownstreamMs = Math.max(
+              0,
+              downstreamTimeMs - request.timeReserve.downstreamMs,
+            );
+            const remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
             explorationClosed ||= remainingTimeMs < 3 * request.timeReserve.requestMs;
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
@@ -760,11 +803,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
               requestIssued: false,
               explorationClosed,
               remainingTimeMs,
+              additionalDownstreamMs,
               requestTimeMs: request.timeReserve.requestMs,
-              downstreamTimeMs: Math.max(
-                request.timeReserve.downstreamMs,
-                request.continuationReserve?.().timeMs ?? 0,
-              ),
+              downstreamTimeMs,
             };
             await context.emit({
               runId: context.runId,
@@ -810,8 +851,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
             const finishTools = availableTools.filter((t) => t.name === "finishPhase");
             const correctionTokens =
               estimateModelInput(projectedMessages, editTools) + outputTokens;
-            const completionTokens =
-              estimateModelInput(projectedMessages, finishTools) + outputTokens;
+            const completionTokens = request.codingSession
+              ? 0
+              : estimateModelInput(projectedMessages, finishTools) + outputTokens;
             const reserveTokens =
               (execution.editCorrectionUsed || correctingEdit ? 0 : correctionTokens) +
               completionTokens +
@@ -974,13 +1016,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
               tools: availableTools,
               ...(request.modelSettings === undefined ? {} : { settings: request.modelSettings }),
             };
-            state = {
+            state = await checkpoint(context, {
               ...state,
               metrics: {
                 ...state.metrics,
                 modelRequestsDispatched: (state.metrics.modelRequestsDispatched ?? 0) + 1,
               },
-            };
+            });
             response = await this.model.generate(modelRequest, { signal });
             request.prePatch?.usage(response.usage.inputTokens, response.usage.outputTokens);
             postPatch?.modelUsage(response.usage.inputTokens, response.usage.outputTokens);
@@ -1928,9 +1970,17 @@ async function executeToolBatch(
       finishSchemaError(call, state.tools.get("finishPhase")) ??
       context.validateFinishPhase?.(call.input);
     context.postPatch?.toolStarted("finishPhase");
+    const evidenceOnly =
+      ["ALREADY_SATISFIED", "CONTRADICTED"].includes(
+        PhaseCompletionSchema.safeParse(call.input).data?.outcome ?? "",
+      ) &&
+      context.validateFinishPhase !== undefined &&
+      !context.postPatch?.failures.size &&
+      !context.postPatch?.unexpectedFiles.length;
     const error =
       context.postPatch &&
       !context.postPatch.canSubmit &&
+      !evidenceOnly &&
       !["INSUFFICIENT_EVIDENCE", "SCOPE_CONFLICT"].includes(
         PhaseCompletionSchema.safeParse(call.input).data?.outcome ?? "",
       )

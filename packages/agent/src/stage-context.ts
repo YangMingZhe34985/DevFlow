@@ -19,6 +19,8 @@ export function prepareStageContext(input: {
   const references = history.map((message, index) => ({ index, sha256: hash(message) }));
   const visible = invalidateHistoricalReads(history);
   const cap = input.maxBytes ?? 96000;
+  const sourceProjectionNeeded =
+    bytes(visible) + (input.authoritative ? bytes(input.authoritative) + 256 : 0) > cap;
   const projected: {
     index: number;
     sha256: string;
@@ -77,7 +79,7 @@ export function prepareStageContext(input: {
   // explicit identity and recovery; never slice arbitrary JSON or host policy.
   for (let index = 0; index < visible.length; index++) {
     const m = visible[index]!;
-    if (m.role !== "TOOL" || m.isError) continue;
+    if (!sourceProjectionNeeded || m.role !== "TOOL" || m.isError) continue;
     if (m.toolName === "readFile")
       visible[index] = { ...m, content: projectRead(m.content, index, snippetCap) };
     if (m.toolName === "batchReadFiles" && m.content && typeof m.content === "object") {

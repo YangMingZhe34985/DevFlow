@@ -30,6 +30,8 @@ export class PostPatchController {
   firstMutationEndedAt: number | null = null;
   needsVerification = false;
   unfinishedWork: string[] = [];
+  /** Host feedback can reopen bounded diagnostic reads, never new write authority. */
+  diagnosticReadOnly = false;
   calls = { model: 0, tool: 0, input: 0, output: 0, mutation: 0, reads: 0, diff: 0 };
   constructor(
     readonly targets: readonly string[],
@@ -64,15 +66,21 @@ export class PostPatchController {
       diffFingerprint: this.diffFingerprint,
       calls: { ...this.calls },
       completionDecision: this.ready,
+      unfinishedWork: [...this.unfinishedWork],
     };
   }
-  restore(value: ReturnType<PostPatchController["snapshot"]>): void {
+  restore(
+    value: Omit<ReturnType<PostPatchController["snapshot"]>, "unfinishedWork"> & {
+      unfinishedWork?: string[] | undefined;
+    },
+  ): void {
     this.revision = value.revision;
     for (const p of value.changed) this.changed.add(p);
     for (const [p, sha] of Object.entries(value.hashes)) this.hashes.set(p, sha);
     for (const [p, failure] of Object.entries(value.failures)) this.failures.set(p, failure);
     this.firstMutationEndedAt = value.firstMutationEndedAt;
     this.calls = { ...value.calls };
+    this.unfinishedWork = [...(value.unfinishedWork ?? [])];
     // Saved identity is not fresh sandbox evidence. A budgeted global probe must revalidate it.
     this.diff = "";
     this.diffFingerprint = null;
@@ -132,6 +140,8 @@ export class PostPatchController {
     // executor blockers demote the state and restore the targeted correction tools.
     if (this.ready) return name === "finishPhase";
     return (
+      (this.diagnosticReadOnly &&
+        ["queryRelations", "searchCode", "readEvidence"].includes(name)) ||
       ["finishPhase", "readFile", "batchReadFiles", "gitDiff"].includes(name) ||
       (this.failures.size > 0 && ["writeFile", "replaceText", "applyPatch"].includes(name)) ||
       (!this.ready && ["writeFile", "replaceText", "applyPatch"].includes(name))
@@ -142,7 +152,8 @@ export class PostPatchController {
     if (!this.allowed(name))
       return "POST_PATCH_GATE: finish the candidate or resolve an observed blocker; broad exploration is closed.";
     if (
-      ["readFile", "batchReadFiles", "writeFile", "replaceText", "applyPatch"].includes(name) &&
+      (["writeFile", "replaceText", "applyPatch"].includes(name) ||
+        (!this.diagnosticReadOnly && ["readFile", "batchReadFiles"].includes(name))) &&
       (!paths.length || paths.some((p) => !this.targets.includes(p)))
     )
       return "POST_PATCH_GATE: only planned targets may be read/corrected.";
@@ -191,6 +202,7 @@ export class PostPatchController {
             "writeFile",
             "replaceText",
             "applyPatch",
+            ...(this.diagnosticReadOnly ? ["queryRelations", "searchCode", "readEvidence"] : []),
           ].filter((n) => this.allowed(n)),
         }),
       },
@@ -226,14 +238,13 @@ export class PostPatchController {
       unexpectedFiles: this.unexpectedFiles,
       blockers: this.blockers,
       diffFingerprint: this.diffFingerprint,
-      termination:
-        success && this.ready
-          ? "MODEL_SUBMITTED"
-          : /BUDGET|MAX_STEPS|TIMEOUT/u.test(errorCode ?? "")
-            ? "BUDGET_STOP"
-            : /PROGRESS|STALLED/u.test(errorCode ?? "")
-              ? "NO_PROGRESS"
-              : "INVALID_CANDIDATE",
+      termination: success
+        ? "MODEL_SUBMITTED"
+        : /BUDGET|MAX_STEPS|TIMEOUT/u.test(errorCode ?? "")
+          ? "BUDGET_STOP"
+          : /PROGRESS|STALLED/u.test(errorCode ?? "")
+            ? "NO_PROGRESS"
+            : "INVALID_CANDIDATE",
       unfinishedWork: this.unfinishedWork,
       failure,
       metrics: {

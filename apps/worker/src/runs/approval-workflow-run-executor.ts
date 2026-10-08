@@ -87,6 +87,7 @@ import {
   type WorkingCode,
   type AgentState,
   type AgentRunRequest,
+  type CodingBudgetOperation,
   contentHash,
   estimateModelInput,
   type VercelAiModelParameters,
@@ -151,7 +152,7 @@ import {
 
 import type { WorkerEnvironment } from "../config/env.js";
 import { IssueLocalizer } from "../localization/retrieval.js";
-import { navigateImplementation } from "../localization/implementation-navigation.js";
+import { queryRepositoryRelations } from "../localization/relation-query.js";
 import {
   RepositoryRelationGraph,
   RelationGraphSchema,
@@ -1088,7 +1089,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       );
       let scopeReplan: ScopeReplanState | undefined;
       let continuationRecoveryAvailable = true;
-      const continuationReserve = () => {
+      const continuationReserve = (operation: CodingBudgetOperation = "CODING") => {
         const source = JSON.stringify(
           [...continuation.current.values()].map((f) => ({
             path: f.path,
@@ -1134,6 +1135,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             })
           : undefined;
         const frontier = codingBranchFrontier({
+          operation,
           sharedFinal: {
             tokens: reserve.total,
             steps: 2,
@@ -1819,21 +1821,28 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           purpose: "IMPLEMENTATION",
           ...(plan.proposalVersion
             ? {
-                continuationTools: () =>
-                  scopeReplan
-                    ? continuation.afterReplan(
-                        testCommandCache.profile?.checks.length ?? 1,
-                        scopeReplan.files.map((file) => file.path),
-                      ).total
-                    : continuation.reserve(
-                        testCommandCache.profile?.checks.length ?? 1,
-                        !!localSnapshot,
-                      ).total,
+                continuationTools: (operation) =>
+                  operation === "SUBMIT_CURRENT"
+                    ? continuation.finalization(testCommandCache.profile?.checks.length ?? 1, {
+                        observeIdentity: false,
+                        ...(scopeReplan
+                          ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
+                          : {}),
+                      }).total
+                    : scopeReplan
+                      ? continuation.afterReplan(
+                          testCommandCache.profile?.checks.length ?? 1,
+                          scopeReplan.files.map((file) => file.path),
+                        ).total
+                      : continuation.reserve(
+                          testCommandCache.profile?.checks.length ?? 1,
+                          !!localSnapshot,
+                        ).total,
                 continuationReserve,
                 onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: implementationLease.mandatoryDownstreamSteps,
-                  downstreamTokens: continuationReserve().tokens,
+                  downstreamTokens: continuationReserve("SUBMIT_CURRENT").tokens,
                 },
               }
             : {}),
@@ -2090,6 +2099,17 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             details: { requestIssued: false },
           });
         const repairBaseSteps = metrics.steps;
+        const finalReviewTokens = repairContinuationReserve({
+          title: run.task.title,
+          description: run.task.description,
+          plan: plan.proposal ?? plan,
+          diagnostics: stableTaskContext ?? additionalContext,
+          source: JSON.stringify(currentSources),
+          repairOutput: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+          reviewOutput: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048,
+          includeRepair: false,
+          reviewRecoveryAvailable: continuationRecoveryAvailable,
+        }).total;
         const result = await this.runAgentPhase({
           codingSession,
           hostContinuation: {
@@ -2113,32 +2133,32 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           purpose,
           ...(plan.proposalVersion
             ? {
-                continuationTools: () =>
-                  scopeReplan
-                    ? continuation.afterReplan(
-                        testCommandCache.profile?.checks.length ?? 1,
-                        scopeReplan.files.map((file) => file.path),
-                      ).total
-                    : continuation.reserve(
-                        testCommandCache.profile?.checks.length ?? 1,
-                        !!localSnapshot,
-                      ).total,
-                continuationReserve,
+                continuationTools: (operation) =>
+                  operation === "SUBMIT_CURRENT"
+                    ? continuation.finalization(testCommandCache.profile?.checks.length ?? 1, {
+                        observeIdentity: true,
+                        ...(scopeReplan
+                          ? { restoredChangedPaths: scopeReplan.files.map((file) => file.path) }
+                          : {}),
+                      }).total
+                    : scopeReplan
+                      ? continuation.afterReplan(
+                          testCommandCache.profile?.checks.length ?? 1,
+                          scopeReplan.files.map((file) => file.path),
+                        ).total
+                      : continuation.reserve(
+                          testCommandCache.profile?.checks.length ?? 1,
+                          !!localSnapshot,
+                        ).total,
+                continuationReserve: (operation) => {
+                  const reserve = continuationReserve(operation);
+                  return { ...reserve, tokens: Math.max(reserve.tokens, finalReviewTokens) };
+                },
                 // Same session: retain only the reachable continuation and final checks.
                 onToolObservation: (name, result) => continuation.observe(name, result),
                 convergenceReserve: {
                   downstreamSteps: repairLease.mandatoryDownstreamSteps,
-                  downstreamTokens: repairContinuationReserve({
-                    title: run.task.title,
-                    description: run.task.description,
-                    plan: plan.proposal ?? plan,
-                    diagnostics: stableTaskContext ?? additionalContext,
-                    source: JSON.stringify(currentSources),
-                    repairOutput: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
-                    reviewOutput: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048,
-                    includeRepair: false,
-                    reviewRecoveryAvailable: await remainingReviewRecovery(),
-                  }).total,
+                  downstreamTokens: finalReviewTokens,
                 },
               }
             : {}),
@@ -4378,8 +4398,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     workspaceRevision?: number;
     executionPacket?: ExecutionPacket;
     packetSourceBytes?: number;
-    continuationTools?: () => number;
-    continuationReserve?: () => { tokens: number; steps: number; timeMs: number };
+    continuationTools?: AgentRunRequest["continuationTools"];
+    continuationReserve?: AgentRunRequest["continuationReserve"];
     onToolObservation?: (name: string, result: ToolExecutionResult) => void;
     convergenceReserve?: {
       downstreamSteps: number;
@@ -4943,23 +4963,16 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               };
             const started = Date.now(),
               { paths, symbols } = parsed.data as { paths: string[]; symbols?: string[] };
-            await relationGraph.inspect(paths, toolSignal, false);
-            const navigation = symbols?.length
-              ? await navigateImplementation({
-                  repositoryId: input.run.repository.id,
-                  baseCommitSha: relationGraph.snapshot().baseCommitSha,
-                  source: sandboxSource(input.sandbox, { maxFileBytes: 512 * 1024 }),
-                  graph: relationGraph,
-                  description: `${symbols.map((s) => `${s}()`).join(" ")}\n${input.run.task.title}\n${input.run.task.description}`,
-                  candidates: paths.map((path) => ({ path, symbol: symbols[0] })),
-                  signal: toolSignal,
-                  maxReads: 4,
-                  maxSourceBytes: 512 * 1024,
-                  maxSnippetBytes: 4096,
-                  maxWindows: 3,
-                })
-              : undefined;
-            for (const window of navigation?.windows ?? []) {
+            const query = await queryRepositoryRelations({
+              repositoryId: input.run.repository.id,
+              source: sandboxSource(input.sandbox, { maxFileBytes: 512 * 1024 }),
+              graph: relationGraph,
+              paths,
+              ...(symbols ? { symbols } : {}),
+              description: `${input.run.task.title}\n${input.run.task.description}`,
+              signal: toolSignal,
+            });
+            for (const window of query.implementationEvidence) {
               observedSources.push({
                 path: window.path,
                 code: window.snippet,
@@ -4974,16 +4987,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             return {
               ok: true,
               durationMs: Date.now() - started,
-              output: asJson({
-                ...relationGraph.issueView(paths, [], navigation ? 4096 : 8192, symbols),
-                ...(navigation
-                  ? {
-                      implementationEvidence: navigation.windows,
-                      missingInformation: navigation.missing,
-                      navigationMetrics: navigation.metrics,
-                    }
-                  : {}),
-              }),
+              output: asJson(query),
             };
           }
           const execute = async (): Promise<ToolExecutionResult> => {

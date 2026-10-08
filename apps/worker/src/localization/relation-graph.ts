@@ -156,6 +156,7 @@ const cache = new Map<string, RelationParse>();
 /** A partial static file/package/export graph. It never claims a runtime call graph or root cause. */
 export class RepositoryRelationGraph {
   private manifest = new Map<string, IndexEntry>();
+  private listing: { entries: IndexEntry[]; incomplete: boolean } | undefined;
   private configuration: Record<string, string> = {};
   private artifact: RelationGraphArtifact;
   private started = Date.now();
@@ -225,6 +226,10 @@ export class RepositoryRelationGraph {
       manifest = { entries: [], incomplete: true };
       this.reason("Graph manifest unavailable; ordinary evidence reads remain available");
     }
+    this.listing = {
+      entries: manifest.entries.filter((e) => graphPathAllowed(e.path)).slice(0, 50_000),
+      incomplete: manifest.incomplete || manifest.entries.length > 50_000,
+    };
     this.manifest = new Map(
       manifest.entries
         .filter((e) => e.kind === "FILE" && graphPathAllowed(e.path))
@@ -341,6 +346,11 @@ export class RepositoryRelationGraph {
       this.reason(`Graph source unreadable: ${path}`);
       return undefined;
     }
+  }
+  /** Reuse the graph's existing inventory; directory queries must not walk the repository. */
+  async manifestView(signal: AbortSignal) {
+    await this.initialize(signal);
+    return this.listing ?? { entries: [], incomplete: true };
   }
   async inspect(paths: readonly string[], signal: AbortSignal, expand = true) {
     await this.initialize(signal);

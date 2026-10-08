@@ -52,16 +52,27 @@ export class ContinuationTools {
 
   /** Preparation and restore have already consumed their capacity after new approval. */
   afterReplan(checks: number, restoredChangedPaths: readonly string[]) {
+    return this.finalization(checks, {
+      restoredChangedPaths,
+      observeIdentity: true,
+    });
+  }
+
+  /** Only operations still required after handing the current candidate to the Workflow. */
+  finalization(
+    checks: number,
+    input: { restoredChangedPaths?: readonly string[]; observeIdentity: boolean },
+  ) {
     const changed = new Set([
-      ...restoredChangedPaths,
+      ...(input.restoredChangedPaths ?? []),
       ...this.changed,
       ...(this.unknownMutation ? this.approved : []),
     ]);
     const operations = {
       // captureReplanCandidate: head/status, then baseline/current for each changed file.
-      checkpoint: 2 + 2 * changed.size,
+      checkpoint: input.restoredChangedPaths ? 2 + 2 * changed.size : 0,
       // continueCoding observes the new approved scope once after the Agent returns.
-      sourceIdentity: new Set(this.approved).size,
+      sourceIdentity: input.observeIdentity ? new Set(this.approved).size : 0,
       // The failed public profile has already been discovered before scope replanning.
       publicChecks: Math.max(0, checks),
       // Reuse the existing initial Review/delivery envelope; no second Review branch.

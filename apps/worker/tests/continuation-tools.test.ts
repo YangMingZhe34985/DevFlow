@@ -65,3 +65,19 @@ it("keeps base/clean checkpoint validation even for a resumed candidate with no 
     reviewReads: 8,
   });
 });
+
+it("submits without reserving an unchosen scope investigation and retains only pending host operations", () => {
+  const c = new ContinuationTools(["a.ts", "b.ts", "c.ts"]);
+  c.changed.add("a.ts");
+  c.changed.add("b.ts");
+  c.changed.add("c.ts");
+  expect(c.reserve(4, true).total).toBe(41);
+  expect(c.finalization(4, { observeIdentity: false })).toEqual({
+    operations: { checkpoint: 0, sourceIdentity: 0, publicChecks: 4, reviewReads: 8 },
+    total: 12,
+  });
+  expect(c.finalization(4, { observeIdentity: true }).total).toBe(15);
+  expect(c.finalization(4, { observeIdentity: true, restoredChangedPaths: ["a.ts"] })).toEqual(
+    c.afterReplan(4, ["a.ts"]),
+  );
+});

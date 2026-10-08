@@ -100,6 +100,9 @@ export interface AdaptiveStepBudgetController {
   ): ExtensionDecision | Promise<ExtensionDecision>;
 }
 
+/** Host admission for the next decision only; never approval to edit a new scope. */
+export type CodingBudgetOperation = "CODING" | "SUBMIT_CURRENT";
+
 export interface AgentRunRequest {
   /** One cumulative Observe/Edit/Test session; finishing hands control to host validation. */
   codingSession?: boolean;
@@ -111,8 +114,12 @@ export interface AgentRunRequest {
   contextMaxBytes?: number;
   /** Host reserve for mandatory downstream work. Editing correction and handoff are reserved locally. */
   convergenceReserve?: { downstreamSteps: number; downstreamTokens: number };
-  continuationTools?: () => number;
-  continuationReserve?: () => { tokens: number; steps: number; timeMs: number };
+  continuationTools?: (operation?: CodingBudgetOperation) => number;
+  continuationReserve?: (operation?: CodingBudgetOperation) => {
+    tokens: number;
+    steps: number;
+    timeMs: number;
+  };
   /** Absolute stage time is supplied by the host; applies to every execution path. */
   /** requestMs is an admission estimate, not a new per-request model timeout. */
   timeReserve?: { downstreamMs: number; requestMs: number };
@@ -281,26 +288,39 @@ export class DefaultAgentRuntime implements AgentRuntime {
     let authorizationHandoffUsed = state.executionRecovery?.authorizationHandoffUsed ?? false;
     let evidenceRefreshUsed = state.executionRecovery?.evidenceRefreshUsed ?? false;
     let submissionOnly = state.executionRecovery?.submissionOnly ?? false;
+    const hostVerificationCalls = new Set<string>();
     const closingReadAllowed = () =>
       !correctingEdit && !evidenceRefreshUsed && (context.closingReadPaths?.().length ?? 0) > 0;
     context = {
       ...context,
       authorizeTool: (call) => {
+        const hostVerification =
+          call.name === "gitDiff" &&
+          call.callId !== undefined &&
+          hostVerificationCalls.delete(call.callId);
         if (
           submissionOnly &&
           call.name !== "finishPhase" &&
           !(
             postPatch?.needsVerification &&
             call.name === "gitDiff" &&
-            Object.keys(objectValue(call.input) ?? {}).length === 0
+            (hostVerification || Object.keys(objectValue(call.input) ?? {}).length === 0)
           )
         )
           return "HOST_SUBMISSION_RESERVE: only finishPhase is available; preserve the candidate and report remaining work.";
-        const required = request.continuationTools?.() ?? 0;
+        const required =
+          request.continuationTools?.(
+            request.codingSession && submissionOnly ? "SUBMIT_CURRENT" : "CODING",
+          ) ?? 0;
         const remaining =
           (request.executionBudget?.maxToolCalls ?? Number.MAX_SAFE_INTEGER) -
           state.metrics.toolCalls;
-        if (required > 0 && remaining <= required && call.name !== "finishPhase")
+        if (
+          required > 0 &&
+          remaining <= required &&
+          call.name !== "finishPhase" &&
+          !hostVerification
+        )
           return "CONTINUATION_TOOL_RESERVE: finishPhase with current evidence and remaining gaps; preserve downstream operations.";
         if (authorizationHandoffUsed && call.name !== "finishPhase")
           return "HOST_AUTHORIZATION_HANDOFF: only finishPhase with the remaining gap or scope conflict is available.";
@@ -765,14 +785,61 @@ export class DefaultAgentRuntime implements AgentRuntime {
                     : ["replaceText", "applyPatch", "writeFile", "finishPhase"]
                 ).includes(t.name)),
           );
+          const budgetOperation = (): CodingBudgetOperation =>
+            request.codingSession && submissionOnly ? "SUBMIT_CURRENT" : "CODING";
+          let submissionProjected = false;
+          const projectSubmission = async () => {
+            submissionOnly = true;
+            availableTools = availableTools.filter((tool) => tool.name === "finishPhase");
+            if (!submissionProjected) {
+              projectedMessages = [
+                ...projectedMessages,
+                {
+                  role: "USER",
+                  content:
+                    "HOST_SUBMISSION_RESERVE: only finishPhase is now available. Hand off the current candidate immediately, or report INSUFFICIENT_EVIDENCE/SCOPE_CONFLICT with remaining work. A scope conflict requires a separate host resource check and new approval; this handoff grants no new write authority.",
+                },
+              ];
+              submissionProjected = true;
+            }
+            state = await checkpoint(context, {
+              ...state,
+              executionRecovery: {
+                ...state.executionRecovery,
+                pending: execution.editCorrectionPending,
+                used: execution.editCorrectionUsed,
+                explorationClosed,
+                handoffPending: closingDecisionPending,
+                authorizationHandoffUsed,
+                evidenceRefreshUsed,
+                submissionOnly,
+              },
+            });
+          };
+          if (submissionOnly) await projectSubmission();
           if (request.timeReserve) {
-            const downstreamTimeMs = Math.max(
-              request.timeReserve.downstreamMs,
-              request.continuationReserve?.().timeMs ?? 0,
-            );
+            const requiredTime = () =>
+              Math.max(
+                request.timeReserve!.downstreamMs,
+                request.continuationReserve?.(budgetOperation()).timeMs ?? 0,
+              );
+            let downstreamTimeMs = requiredTime();
+            const initialDownstreamTimeMs = downstreamTimeMs;
             // Standalone phases already subtract their fixed reserve. Coding retains an absolute deadline.
-            const additionalDownstreamMs = Math.max(0, downstreamTimeMs - fixedDownstreamMs);
-            const remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
+            let additionalDownstreamMs = Math.max(0, downstreamTimeMs - fixedDownstreamMs);
+            let remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
+            if (
+              request.codingSession &&
+              !submissionOnly &&
+              postPatch?.canSubmit &&
+              remainingTimeMs < request.timeReserve.requestMs
+            ) {
+              explorationClosed = true;
+              await projectSubmission();
+              downstreamTimeMs = requiredTime();
+              additionalDownstreamMs = Math.max(0, downstreamTimeMs - fixedDownstreamMs);
+              remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
+            }
             explorationClosed ||= remainingTimeMs < 3 * request.timeReserve.requestMs;
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
@@ -798,6 +865,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
             }
             const observation = {
               requestIssued: false,
+              operation: budgetOperation(),
+              releasedDownstreamMs: initialDownstreamTimeMs - downstreamTimeMs,
               explorationClosed,
               remainingTimeMs,
               additionalDownstreamMs,
@@ -824,15 +893,18 @@ export class DefaultAgentRuntime implements AgentRuntime {
           if (authorizationHandoffUsed)
             availableTools = availableTools.filter((t) => t.name === "finishPhase");
           if (request.convergenceReserve && !prePatch) {
-            const continuation = request.continuationReserve?.();
-            const downstreamTokens = Math.max(
-              request.convergenceReserve.downstreamTokens,
-              continuation?.tokens ?? 0,
-            );
+            let continuation = request.continuationReserve?.(budgetOperation());
+            const requiredDownstream = () =>
+              budgetOperation() === "SUBMIT_CURRENT" && continuation
+                ? continuation.tokens
+                : Math.max(request.convergenceReserve!.downstreamTokens, continuation?.tokens ?? 0);
+            let downstreamTokens = requiredDownstream();
+            const initialDownstreamTokens = downstreamTokens;
             const remainingTools =
               (request.executionBudget?.maxToolCalls ?? Number.MAX_SAFE_INTEGER) -
               state.metrics.toolCalls;
-            const downstreamTools = request.continuationTools?.() ?? 0;
+            let downstreamTools = request.continuationTools?.(budgetOperation()) ?? 0;
+            const initialDownstreamTools = downstreamTools;
             const inputTokens = estimateModelInput(projectedMessages, availableTools);
             const outputTokens = request.modelSettings?.maxOutputTokens ?? 8192;
             const nextTokens = inputTokens + outputTokens;
@@ -851,13 +923,22 @@ export class DefaultAgentRuntime implements AgentRuntime {
             const completionTokens = request.codingSession
               ? 0
               : estimateModelInput(projectedMessages, finishTools) + outputTokens;
-            const reserveTokens =
-              (execution.editCorrectionUsed || correctingEdit ? 0 : correctionTokens) +
-              completionTokens +
-              downstreamTokens;
+            const correctionReserve = () =>
+              budgetOperation() === "SUBMIT_CURRENT" ||
+              execution.editCorrectionUsed ||
+              correctingEdit
+                ? 0
+                : correctionTokens;
+            let reserveTokens = correctionReserve() + completionTokens + downstreamTokens;
+            // The host Coding lease already leaves mandatory Review decisions outside this session.
+            const unleasedDownstreamSteps = Math.max(
+              0,
+              (continuation?.steps ?? 0) -
+                (request.codingSession ? request.convergenceReserve.downstreamSteps : 0),
+            );
             explorationClosed ||=
               remainingTokens < nextTokens + reserveTokens ||
-              remainingSteps <= Math.max(2, (continuation?.steps ?? 0) + 2) ||
+              remainingSteps <= Math.max(2, unleasedDownstreamSteps + 2) ||
               remainingTools <= downstreamTools + 3;
             if (
               postPatch?.canSubmit &&
@@ -865,28 +946,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 remainingSteps <= 1 ||
                 remainingTools <= downstreamTools + 3)
             ) {
-              submissionOnly = true;
-              availableTools = finishTools;
-              projectedMessages = [
-                ...projectedMessages,
-                {
-                  role: "USER",
-                  content:
-                    "HOST_SUBMISSION_RESERVE: only finishPhase is now available. Hand off the current candidate immediately, or report INSUFFICIENT_EVIDENCE/SCOPE_CONFLICT with remaining work. Do not claim unfinished behavior is fixed.",
-                },
-              ];
-              state = await checkpoint(context, {
-                ...state,
-                executionRecovery: {
-                  pending: execution.editCorrectionPending,
-                  used: execution.editCorrectionUsed,
-                  explorationClosed,
-                  handoffPending: closingDecisionPending,
-                  authorizationHandoffUsed,
-                  evidenceRefreshUsed,
-                  submissionOnly,
-                },
-              });
+              await projectSubmission();
+              continuation = request.continuationReserve?.(budgetOperation());
+              downstreamTokens = requiredDownstream();
+              downstreamTools = request.continuationTools?.(budgetOperation()) ?? 0;
+              reserveTokens = correctionReserve() + completionTokens + downstreamTokens;
             }
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
@@ -917,8 +981,18 @@ export class DefaultAgentRuntime implements AgentRuntime {
               (explorationClosed && !submissionOnly && closingReadAllowed()
                 ? completionTokens + Math.ceil(16384 / 3)
                 : 0);
+            const requiredTools =
+              downstreamTools +
+              (budgetOperation() === "SUBMIT_CURRENT"
+                ? 1 + (postPatch?.needsVerification ? 1 : 0)
+                : 0);
             const observation = {
               requestIssued: false,
+              operation: budgetOperation(),
+              downstreamTokens,
+              releasedDownstreamTokens: initialDownstreamTokens - downstreamTokens,
+              releasedDownstreamTools: initialDownstreamTools - downstreamTools,
+              requiredTools,
               explorationClosed,
               estimatedInputTokens: inputTokens,
               configuredOutputTokens: outputTokens,
@@ -940,11 +1014,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
               occurredAt: new Date().toISOString(),
               payload: { convergencePreflight: jsonValue(observation) },
             });
-            if (required > remainingTokens)
+            if (required > remainingTokens || requiredTools > remainingTools)
               throw new DevflowError({
                 code: "EXECUTION_BUDGET_EXCEEDED",
                 message: "Cannot send stage request without consuming the downstream reserve.",
-                details: { ...observation, missingTokens: required - remainingTokens },
+                details: {
+                  ...observation,
+                  missingTokens: Math.max(0, required - remainingTokens),
+                  missingTools: Math.max(0, requiredTools - remainingTools),
+                },
               });
           }
           if (prePatch) {
@@ -1245,8 +1323,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
             )
         ) {
           const finishIndex = calls.findIndex((c) => c.name === "finishPhase");
+          const verificationId = randomUUID();
+          hostVerificationCalls.add(verificationId);
           calls.splice(finishIndex < 0 ? calls.length : finishIndex, 0, {
-            id: randomUUID(),
+            id: verificationId,
             name: "gitDiff",
             input: { maxBytes: 32768 },
           });
@@ -1266,6 +1346,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             explorationClosed,
             handoffPending: closingDecisionPending,
             authorizationHandoffUsed,
+            submissionOnly,
             evidenceRefreshUsed:
               evidenceRefreshUsed ||
               (explorationClosed && calls.some((c) => c.name === "readFile")),

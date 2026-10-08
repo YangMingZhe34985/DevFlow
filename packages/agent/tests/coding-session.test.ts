@@ -15,6 +15,7 @@ import {
   type AgentRunRequest,
   type FakeModelStep,
   type RunContext,
+  type CodingBudgetOperation,
 } from "../src/index.js";
 
 const decision = (content: string, outcome = "CHANGED") =>
@@ -536,4 +537,134 @@ it("projects duplicate pinned feedback by reference while keeping every diagnost
       : message,
   );
   expect(projectCodingSessionHistory(nonidentical)[1]).toEqual(nonidentical[1]);
+});
+
+async function pendingSubmissionFixture(overrides: Partial<AgentRunRequest> = {}) {
+  const submit = completed();
+  submit.toolCalls[0]!.input = { outcome: "CHANGED", summary: "Submit the current verified diff" };
+  const f = fixture([decision("candidate"), submit]);
+  await f.run();
+  const original = (await f.stateStore.load(f.context.runId))!;
+  const pending = continueCodingSession(original, feedback, f.request).state;
+  pending.executionRecovery = {
+    pending: false,
+    used: true,
+    evidenceRefreshUsed: true,
+    submissionOnly: true,
+    explorationClosed: true,
+  };
+  // Simulate a persisted decision boundary, keeping its existing deadline, history and quota.
+  await f.stateStore.save(pending);
+  const operations: CodingBudgetOperation[] = [];
+  const events: Record<string, unknown>[] = [];
+  f.context.emit = async (event) => {
+    events.push(event.payload as Record<string, unknown>);
+  };
+  const request: Partial<AgentRunRequest> = {
+    modelSettings: { maxOutputTokens: 8192 },
+    convergenceReserve: { downstreamSteps: 2, downstreamTokens: 95628 },
+    continuationReserve: (operation = "CODING") => {
+      operations.push(operation);
+      return operation === "SUBMIT_CURRENT"
+        ? { tokens: 43574, steps: 2, timeMs: 1000 }
+        : { tokens: 95628, steps: 5, timeMs: 10000 };
+    },
+    continuationTools: (operation) => (operation === "SUBMIT_CURRENT" ? 15 : 41),
+    executionBudget: {
+      stage: "CODING",
+      maxModelCalls: 10,
+      maxToolCalls: 50,
+      maxTotalTokens: 125758,
+    },
+    ...overrides,
+  };
+  return { ...f, pending, operations, events, request };
+}
+
+it("restored submission releases a stale optional frontier, keeps output and quotas, and stops once", async () => {
+  const f = await pendingSubmissionFixture();
+  const result = await f.run(f.request);
+  expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+  expect(f.operations.every((operation) => operation === "SUBMIT_CURRENT")).toBe(true);
+  const modelRequest = f.model.requests[1]!;
+  expect(modelRequest.tools.map((tool) => tool.name)).toEqual(["finishPhase"]);
+  expect(modelRequest.settings?.maxOutputTokens).toBe(8192);
+  expect(f.events.find((event) => event.convergencePreflight)).toMatchObject({
+    convergencePreflight: {
+      operation: "SUBMIT_CURRENT",
+      downstreamTokens: 43574,
+      downstreamTools: 15,
+    },
+  });
+  const saved = (await f.stateStore.load(f.context.runId))!;
+  expect(saved.executionRecovery).toMatchObject({
+    used: true,
+    evidenceRefreshUsed: true,
+    submissionOnly: true,
+  });
+  expect(saved.phaseDeadlineAt).toBe(f.pending.phaseDeadlineAt);
+  expect(saved.codingContinuations).toHaveLength(1);
+  expect(await f.run(f.request)).toEqual(result);
+  expect(f.model.requests).toHaveLength(2);
+});
+
+it.each(["TOKENS", "TOOLS", "TIME"] as const)(
+  "blocks even a submission when its real %s reserve does not fit",
+  async (resource) => {
+    const f = await pendingSubmissionFixture({
+      executionBudget: {
+        stage: "CODING",
+        maxModelCalls: 10,
+        maxToolCalls: resource === "TOOLS" ? 10 : 50,
+        maxTotalTokens: resource === "TOKENS" ? 43574 : 125758,
+      },
+      ...(resource === "TIME"
+        ? {
+            timeReserve: { downstreamMs: 1000, requestMs: 100 },
+            continuationReserve: () => ({ tokens: 43574, steps: 2, timeMs: 10000 }),
+          }
+        : {}),
+    });
+    const result = await f.run(f.request);
+    expect(result.error?.code).toBe("EXECUTION_BUDGET_EXCEEDED");
+    expect(result.error?.details).toMatchObject({
+      requestIssued: false,
+      operation: "SUBMIT_CURRENT",
+    });
+    expect(f.model.requests).toHaveLength(1);
+    expect(result.metrics.modelRequestsDispatched).toBe(1);
+  },
+);
+
+it("selects submission before an optional time branch would reject a current stable candidate", async () => {
+  let afterEdit = false;
+  const f = fixture(
+    [
+      fakeModelResponse({
+        toolCalls: [
+          { id: "edit", name: "writeFile", input: { path: "src/a.ts", content: "candidate" } },
+        ],
+      }),
+      completed(),
+    ],
+    {
+      timeReserve: { downstreamMs: 1000, requestMs: 100 },
+      convergenceReserve: { downstreamSteps: 2, downstreamTokens: 1000 },
+      continuationReserve: (operation) => ({
+        tokens: 1000,
+        steps: operation === "SUBMIT_CURRENT" ? 2 : 5,
+        timeMs: afterEdit && operation !== "SUBMIT_CURRENT" ? 10000 : 1000,
+      }),
+    },
+  );
+  const execute = f.context.executeTool;
+  f.context.executeTool = async (...args) => {
+    const result = await execute(...args);
+    if (args[1].name === "writeFile") afterEdit = true;
+    return result;
+  };
+  const result = await f.run();
+  expect(result.status).toBe("SUCCEEDED");
+  expect(f.model.requests).toHaveLength(2);
+  expect(f.model.requests[1]!.tools.map((tool) => tool.name)).toEqual(["finishPhase"]);
 });

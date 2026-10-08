@@ -1,4 +1,9 @@
-import { estimateModelInput, type ModelMessage, type ModelToolDescriptor } from "@devflow/agent";
+import {
+  estimateModelInput,
+  type CodingBudgetOperation,
+  type ModelMessage,
+  type ModelToolDescriptor,
+} from "@devflow/agent";
 import { repairContinuationReserve } from "./repair-reserve.js";
 import { estimatePlanOutputRecoveryReserve } from "./plan-agent.js";
 import { estimatePlanRequest } from "./plan-agent-context.js";
@@ -25,25 +30,35 @@ export function codingBranchFrontier(input: {
   continuing: CodingCapacity;
   replanning?: CodingCapacity;
   selectedBranch?: CodingBudgetBranch;
+  /** A handoff only needs final validation. A returned scope conflict is admitted separately. */
+  operation?: CodingBudgetOperation;
 }) {
   const shared = capacity(input.sharedFinal);
   const continuing = capacity(input.continuing);
   const replanning = input.replanning && capacity(input.replanning);
   if (input.selectedBranch === "REPLAN" && !replanning)
     throw new Error("A selected REPLAN branch requires its operation projection.");
+  const selectedBranch = input.operation === "SUBMIT_CURRENT" ? "CONTINUE" : input.selectedBranch;
   const selected =
-    input.selectedBranch === "CONTINUE"
+    selectedBranch === "CONTINUE"
       ? continuing
-      : input.selectedBranch === "REPLAN"
+      : selectedBranch === "REPLAN"
         ? replanning!
         : maximum(continuing, replanning ?? zero());
   return {
     accounting: "RESERVE_ONLY_RECHECK_ACTUAL_REQUEST" as const,
-    selectedBranch: input.selectedBranch ?? "UNDECIDED",
+    operation: input.operation ?? "CODING",
+    selectedBranch: selectedBranch ?? "UNDECIDED",
     sharedFinal: shared,
     continuing,
     ...(replanning ? { replanning } : {}),
     required: add(shared, selected),
+    released: {
+      tokens: Math.max(0, (replanning?.tokens ?? 0) - selected.tokens),
+      steps: Math.max(0, (replanning?.steps ?? 0) - selected.steps),
+      tools: Math.max(0, (replanning?.tools ?? 0) - selected.tools),
+      timeMs: Math.max(0, (replanning?.timeMs ?? 0) - selected.timeMs),
+    },
   };
 }
 

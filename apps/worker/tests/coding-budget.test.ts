@@ -72,6 +72,32 @@ it("preserves configured output and accounts for constructible input and explici
   expect(reserve.required.steps).toBe(1);
 });
 
+it("admits the E07 submission boundary without promising the unselected replan branch", () => {
+  const sharedFinal = { tokens: 43574, steps: 2, tools: 15, timeMs: 780000 };
+  const replanning = { tokens: 52054, steps: 3, tools: 26, timeMs: 240000 };
+  const common = {
+    sharedFinal,
+    continuing: { tokens: 0, steps: 0, tools: 0, timeMs: 0 },
+    replanning,
+  };
+  const coding = codingBranchFrontier({ ...common, operation: "CODING" });
+  const submission = codingBranchFrontier({ ...common, operation: "SUBMIT_CURRENT" });
+  expect(32838 + coding.required.tokens - 125638).toBe(2828);
+  expect(submission.required).toEqual(sharedFinal);
+  expect(32838 + submission.required.tokens).toBe(76412);
+  expect(submission.released).toEqual(replanning);
+  // A later actual conflict is still separately admitted from whatever capacity remains.
+  expect(
+    codingPlannerTokenLease({
+      remainingTokens: 50000,
+      downstreamTokens: sharedFinal.tokens,
+      configuredMaximumTokens: 60000,
+      requiredRequestTokens: 2671 + 2048 + 8192 + 25078,
+    }),
+  ).toMatchObject({ permitted: false, requestIssued: false });
+  expect(codingBranchFrontier({ ...common, operation: "CODING" })).toEqual(coding);
+});
+
 it("early replan includes the same full output recovery used by actual Planner preparation", async () => {
   const prepared = await new PlanAgent().prepare({
     title: continuation.title,

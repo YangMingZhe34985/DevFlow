@@ -30,6 +30,7 @@ export interface ImplementationWindow {
 }
 export interface NavigationResult {
   windows: ImplementationWindow[];
+  readPaths?: string[];
   relations?: {
     from: string;
     to: string;
@@ -110,6 +111,10 @@ export async function navigateImplementation(input: {
   maxLines?: number;
   /** Planner follow-up: explicit requested files take precedence over another speculative hop. */
   prioritizeCandidates?: boolean;
+  /** Tool queries already resolved from the graph inventory. Avoid repeated manifest IO. */
+  manifest?: Awaited<ReturnType<IndexSource["manifest"]>>;
+  /** Speculative recall stays inside the requested view; observed import edges may leave it. */
+  fallbackPaths?: readonly string[];
   behaviorNavigation?: boolean;
   /** SHA-verified earlier projection; reuse behavior names without rereading assertions. */
   observedWindows?: readonly { path: string; snippet: string }[];
@@ -143,7 +148,9 @@ export async function navigateImplementation(input: {
     c.symbol && !lexicalCommon.has(c.symbol.toLowerCase()) ? [c.symbol] : [],
   );
   const names = [...new Set([...focus, ...signals.symbols, ...candidateNames])].slice(0, 24);
-  const listing = await input.source.manifest(signal);
+  const listing = input.manifest ?? (await input.source.manifest(signal));
+  const fallbackPaths = input.fallbackPaths ? new Set(input.fallbackPaths) : undefined;
+  const mayRecall = (path: string) => !fallbackPaths || fallbackPaths.has(path);
   const entries = new Map<string, IndexEntry>();
   for (const raw of listing.entries.slice(0, 50_000)) {
     const parsed = EntrySchema.safeParse(raw);
@@ -162,6 +169,7 @@ export async function navigateImplementation(input: {
   await graph.inspect([], signal, false);
   const initialEdges = graph.snapshot().edges.length;
   const contentCache = new Map<string, { content: string; digest: string }>();
+  const readPaths: string[] = [];
   const requested = new Set(
     input.prioritizeCandidates
       ? (input.candidates ?? []).map((c) => c.path).filter((p) => entries.has(p))
@@ -219,7 +227,7 @@ export async function navigateImplementation(input: {
       reason,
     });
   };
-  for (const c of input.candidates ?? []) {
+  for (const [candidateIndex, c] of (input.candidates ?? []).entries()) {
     const candidateBoost =
       (c.symbol && candidateNames.includes(c.symbol)) ||
       sourceRole(c.path) === "ENTRY" ||
@@ -232,6 +240,7 @@ export async function navigateImplementation(input: {
       if (staticSourceLanguage(c.path)) {
         const peers = [...entries.keys()].filter(
           (p) =>
+            mayRecall(p) &&
             p !== c.path &&
             posix.basename(p) === posix.basename(c.path) &&
             sourceRole(p) === "IMPLEMENTATION",
@@ -252,7 +261,7 @@ export async function navigateImplementation(input: {
       enqueue(
         c.path,
         c.symbol ? [c.symbol, ...names] : names,
-        candidateBoost,
+        candidateBoost + (fallbackPaths ? 400 - candidateIndex * 100 : 0),
         0,
         c.reason ?? c.explanation ?? "Observed candidate",
       );
@@ -262,7 +271,7 @@ export async function navigateImplementation(input: {
       );
       const stem = normal(posix.basename(c.path).replace(/\.[^.]+$/u, ""));
       const alternatives = [...entries.keys()]
-        .filter((p) => normal(posix.basename(p).replace(/\.[^.]+$/u, "")) === stem)
+        .filter((p) => mayRecall(p) && normal(posix.basename(p).replace(/\.[^.]+$/u, "")) === stem)
         .sort((a, b) => basePriority(b) - basePriority(a) || a.localeCompare(b));
       for (const alternative of alternatives.slice(0, 3))
         enqueue(
@@ -278,7 +287,8 @@ export async function navigateImplementation(input: {
       }
     }
   }
-  for (const path of signals.paths) enqueue(path, names, 40, 0, "Public Issue path");
+  for (const path of signals.paths)
+    if (mayRecall(path)) enqueue(path, names, 40, 0, "Public Issue path");
   if (
     (input.behaviorNavigation || input.prioritizeCandidates) &&
     ![...(input.candidates ?? []), ...(input.observedWindows ?? [])].some((c) =>
@@ -288,6 +298,7 @@ export async function navigateImplementation(input: {
     const tests = [...entries.keys()]
       .filter(
         (p) =>
+          mayRecall(p) &&
           sourceRole(p) === "TEST" &&
           (/(?:^|\/)regression\//u.test(p) ||
             issueSearchTerms(signals).some(
@@ -309,6 +320,7 @@ export async function navigateImplementation(input: {
     for (const path of [...entries.keys()]
       .filter(
         (p) =>
+          mayRecall(p) &&
           codePath(p) &&
           sourceRole(p) === "IMPLEMENTATION" &&
           !/(?:^|\/)(?:third_party|third-party|external|deps)(?:\/|$)/u.test(p),
@@ -493,8 +505,9 @@ export async function navigateImplementation(input: {
         continue;
       }
       try {
-        const current = await input.source.read(item.path, signal);
+        readPaths.push(item.path);
         result.metrics.reads++;
+        const current = await input.source.read(item.path, signal);
         result.metrics.sourceBytes += Buffer.byteLength(current.content);
         const digest = hash(current.content);
         if (
@@ -990,6 +1003,7 @@ export async function navigateImplementation(input: {
       ...[...entries.keys()]
         .filter(
           (p) =>
+            mayRecall(p) &&
             codePath(p) &&
             !anchorPaths.has(p) &&
             !graph
@@ -1023,9 +1037,10 @@ export async function navigateImplementation(input: {
         result.metrics.sourceBytes + entry.sizeBytes > limits.bytes
       )
         break;
-      const read = await input.source.read(path, signal);
+      readPaths.push(path);
       consumerReads++;
       result.metrics.reads++;
+      const read = await input.source.read(path, signal);
       result.metrics.sourceBytes += Buffer.byteLength(read.content);
       if (
         read.truncated ||
@@ -1091,6 +1106,7 @@ export async function navigateImplementation(input: {
       "Consumers of observed definitions remain unverified; use bounded reference search when required by Issue behavior.",
     );
   result.metrics.windows = result.windows.length;
+  result.readPaths = readPaths;
   result.metrics.implementationWindows = result.windows.filter(
     (w) => w.kind === "IMPLEMENTATION",
   ).length;

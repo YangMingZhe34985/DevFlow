@@ -9,6 +9,7 @@ import type {
   ToolExecutor,
 } from "./contracts.js";
 import type { ToolPolicy, ToolPolicyDecision } from "./policy.js";
+import { toolInputValidationDetails } from "./input-validation.js";
 import { describeTool, type ToolRegistry } from "./registry.js";
 
 export class UnimplementedToolExecutor implements ToolExecutor {
@@ -118,11 +119,12 @@ export class DefaultToolExecutor implements ToolExecutor {
         new DevflowError({
           code: "VALIDATION_ERROR",
           message: `Invalid input for tool '${tool.name}'.`,
-          details: {
-            ...parsedInput.error.flatten(),
-            failureOrigin: "INPUT_VALIDATION",
-            category: "INVALID_ARGUMENT",
-          },
+          details: toolInputValidationDetails(
+            tool.name,
+            tool.inputSchema,
+            request.input,
+            parsedInput.error,
+          ),
         }),
         startedAt,
       );

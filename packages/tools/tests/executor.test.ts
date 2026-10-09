@@ -35,8 +35,8 @@ const sandbox = {
   async dispose() {},
 } satisfies SandboxSession;
 
-function createHarness(
-  tool: ToolDefinition<{ value: string }, { value: string }>,
+function createHarness<TInput, TOutput>(
+  tool: ToolDefinition<TInput, TOutput>,
   policy: ToolPolicy = new ExplicitToolPolicy(["READ"]),
 ) {
   const registry = new ToolRegistry();
@@ -106,6 +106,93 @@ describe("DefaultToolExecutor", () => {
       },
     });
     expect(events.map(({ type }) => type)).toEqual(["TOOL_CALL", "TOOL_RESULT"]);
+  });
+
+  it("rejects malformed relation arguments with their current schema, then executes an explicit correction", async () => {
+    const calls: unknown[] = [];
+    const tool = {
+      name: "queryRelations",
+      description: "Repository relationship query",
+      permission: "READ" as const,
+      timeoutMs: 100,
+      inputSchema: z.object({
+        paths: z.array(z.string().min(1).max(1024)).min(1).max(4),
+        symbols: z.array(z.string().min(1).max(256)).max(6).optional(),
+      }),
+      outputSchema: z.object({ evidence: z.array(z.string()) }),
+      async execute(input: { paths: string[]; symbols?: string[] }) {
+        calls.push(input);
+        return { evidence: input.paths };
+      },
+    };
+    const { executor, context, events } = createHarness(tool);
+    const malformed = {
+      paths:
+        '["src/scheduler.py"]<arg_key>symbols</arg_key><arg_value>["notify_success", "_complete_retry"]',
+    };
+    const original = structuredClone(malformed);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const result = await executor.execute({ name: tool.name, input: malformed }, context);
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          code: "VALIDATION_ERROR",
+          details: {
+            category: "INVALID_ARGUMENT",
+            toolExecuted: false,
+            recovery: {
+              kind: "CORRECT_TOOL_ARGUMENTS",
+              toolName: tool.name,
+              fieldIssues: [
+                {
+                  path: ["paths"],
+                  code: "invalid_type",
+                  expectedType: "array",
+                  receivedType: "string",
+                },
+              ],
+              argumentSchema: {
+                required: ["paths"],
+                properties: {
+                  paths: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 4 },
+                  symbols: { type: "array", items: { type: "string" }, maxItems: 6 },
+                },
+              },
+            },
+          },
+        },
+      });
+    }
+    expect(malformed).toEqual(original);
+    expect(calls).toHaveLength(0);
+    const corrected = {
+      paths: ["src/scheduler.py"],
+      symbols: ["notify_success", "_complete_retry"],
+    };
+    expect(await executor.execute({ name: tool.name, input: corrected }, context)).toMatchObject({
+      ok: true,
+      output: { evidence: ["src/scheduler.py"] },
+    });
+    expect(calls).toEqual([corrected]);
+    expect(events).toHaveLength(6);
+  });
+
+  it("does not offer argument recovery for denied calls, including malformed arguments", async () => {
+    let executed = false;
+    const { executor, context } = createHarness(
+      definition(async (input) => {
+        executed = true;
+        return input;
+      }),
+      new ExplicitToolPolicy([]),
+    );
+    const result = await executor.execute({ name: "sample", input: { value: 42 } }, context);
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "PERMISSION_DENIED", details: { category: "AUTHORIZATION_DENIED" } },
+    });
+    if (!result.ok) expect(result.error.details).not.toHaveProperty("recovery");
+    expect(executed).toBe(false);
   });
 
   it("enforces timeout even when a tool ignores its AbortSignal", async () => {

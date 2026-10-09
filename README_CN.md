@@ -4,6 +4,8 @@
 
 后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），版本继续保持 2.3.0。
 
+独立的[Tool Call Recovery 定向验收](docs/tool-call-recovery-e02-live-20261009.md)重新运行 E02 一次，公开验证、重新规划／新审批、同 Session 恢复、独立评分及 Review 均通过（**1/1**）。畸形参数恢复由原请求 Docker 回放验证，本次真实实验未重现该错误。这是后续冻结版本的单题结果，不是新的整批成功率。
+
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。
@@ -18,7 +20,7 @@ API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略
 - 修改前核对完整文件 SHA，支持精确文本替换和保护文件策略。
 - Review 保持无工具，可请求宿主进行有界补证和隔离的公开复现；确认的缺陷携带诊断任务、与当前 SHA 关联的证据和经校验的答复，返回同一 Coding Session。
 - 公开 build/typecheck/lint/test 验证 profile、源码诊断交接，以及需要新审批的一次有界范围重新规划。
-- 同一 Coding Session 在编辑、公开测试失败和 Review 反馈之间保留历史、检查点、工具策略及资源消费。重复观察不算新进展；编辑格式错误与输出纠正共享一次有界纠正额度。
+- 同一 Coding Session 在编辑、公开测试失败和 Review 反馈之间保留历史、检查点、工具策略及资源消费。重复观察不算新进展；编辑格式、工具参数和输出纠正共享一次有界纠正额度。
 - 稳定补丁仍可在批准范围内继续编辑。`finishPhase` 将候选交给 Workflow 强制执行最终验证；验证失败或明确的未完成事项，在剩余资源允许时返回同一会话。最终 Review 保持独立，见[当前 Coding 生命周期](docs/unified-coding-loop-20261008.md)。
 - Run 级 Resource Budget Scheduler：持久化准入与结算，按实际请求和重新规划操作清单估算资源；分别记录逻辑工具、内部执行及 IO，保持硬上限和受保护写入范围。
 

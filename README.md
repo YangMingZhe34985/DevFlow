@@ -4,6 +4,8 @@ Package version: **2.3.0**. Editing and failure repair share one persistent Codi
 
 The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. The package remains 2.3.0.
 
+The separate [Tool Call Recovery follow-up](docs/tool-call-recovery-e02-live-20261009.md) passed one fresh E02 full run, including public validation, replan/new approval, same-session recovery, independent scoring and Review (**1/1**). Malformed-argument recovery was verified by original-request Docker replay; the fresh run did not reproduce that error. This is a single-case result on a later frozen version, not a new cohort success rate.
+
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, approved planning, an iterative Coding Loop, deterministic final validation and independent review.
@@ -18,7 +20,7 @@ The API persists intent and queues work. The Worker owns execution; agents acces
 - Full-file SHA checks, precise text replacement and protected-file policies before code writes.
 - Tool-free Review with bounded host evidence and public reproductions; confirmed defects return to the same Coding Session with diagnostic tasks, SHA-linked evidence and checked answers.
 - Public build/typecheck/lint/test profiles, source-aware diagnostic handoff and one bounded scope replan requiring a new approval.
-- One Coding Session retains history, checkpoints, tool policy and resource consumption across edits and public test/review failures. Repeated observations cannot earn new progress; edit-format and output correction share one bounded credit.
+- One Coding Session retains history, checkpoints, tool policy and resource consumption across edits and public test/review failures. Repeated observations cannot earn new progress; edit-format, tool-argument and output correction share one bounded credit.
 - A stable patch remains editable within approval. `finishPhase` yields to Workflow-owned final validation; failures or explicit unfinished work can return to the same session within the remaining limits. Final Review remains independent. See [the current Coding lifecycle](docs/unified-coding-loop-20261008.md).
 - A Run-scoped Resource Budget Scheduler with persisted admission/settlement, actual-request estimates and operation-based replan reservations. Logical tools, internal execution and IO have separate accounting; hard limits and protected write scope remain enforced.
 

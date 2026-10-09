@@ -165,6 +165,7 @@ import {
   ExplicitToolPolicy,
   registerCoreTools,
   ToolRegistry,
+  toolInputValidationDetails,
   type ToolDescriptor,
   type ToolExecutionRequest,
   type ToolExecutionResult,
@@ -5431,7 +5432,13 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 durationMs: 0,
                 error: new DevflowError({
                   code: "VALIDATION_ERROR",
-                  message: "queryRelations requires up to four repository paths.",
+                  message: "Invalid input for tool 'queryRelations'.",
+                  details: toolInputValidationDetails(
+                    request.name,
+                    relationTool.inputSchema,
+                    request.input,
+                    parsed.error,
+                  ),
                 }).toJSON(),
               };
             const started = Date.now(),

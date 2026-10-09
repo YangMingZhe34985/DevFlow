@@ -216,15 +216,17 @@ it("preserves the original path during parameter correction without granting a s
     [
       toolCall("readFile", { path: sourcePath, maxBytes: 200000 }),
       toolCall("readFile", { path: "src/other.ts", maxBytes: 16384 }),
-      async (request) => {
-        expect(JSON.stringify(request.messages)).toContain("PROTOCOL_CORRECTION_SCOPE");
-        expect(JSON.stringify(request.messages)).not.toContain("HOST_AUTHORIZATION_HANDOFF");
-        return finish();
+      () => {
+        throw new Error("An unsuccessful correction cannot earn a third decision.");
       },
     ],
     [sourcePath, "src/other.ts"],
   );
-  expect((await f.run()).status).toBe("SUCCEEDED");
+  expect((await f.run()).error?.code).toBe("AGENT_STALLED");
+  expect(f.model.requests).toHaveLength(2);
+  expect(JSON.stringify((await f.store.load(f.context.runId))?.messages)).toContain(
+    "PROTOCOL_CORRECTION_SCOPE",
+  );
   expect(f.readInputs).toHaveLength(0);
   expect((await f.store.load(f.context.runId))?.executionRecovery?.evidenceRefreshUsed).toBe(false);
 });

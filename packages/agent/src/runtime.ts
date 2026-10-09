@@ -35,7 +35,11 @@ import type {
   StepId,
   TaskSpec,
 } from "@devflow/shared";
-import type { ToolExecutionRequest, ToolExecutionResult } from "@devflow/tools";
+import {
+  toolInputValidationDetails,
+  type ToolExecutionRequest,
+  type ToolExecutionResult,
+} from "@devflow/tools";
 
 import type {
   LanguageModelPort,
@@ -299,6 +303,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
         sourceProgress.observe(message.content, execution.workspaceRevision);
     const originalAuthorize = context.authorizeTool;
     let correctingEdit = false;
+    let protocolCorrectionCalls = 0;
     let explorationClosed = state.executionRecovery?.explorationClosed ?? false;
     let closingDecisionPending = state.executionRecovery?.handoffPending ?? false;
     let authorizationHandoffUsed = state.executionRecovery?.authorizationHandoffUsed ?? false;
@@ -360,6 +365,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
         if (protocolCorrection) {
           if (call.name !== execution.correctionTool)
             return "PROTOCOL_CORRECTION_REQUIRED: only correct the failed tool call or finishPhase; no new exploration.";
+          if (protocolCorrectionCalls++ > 0)
+            return runtimeRejection(
+              "PROTOCOL_CORRECTION_BATCH_LIMIT: one corrected tool call is allowed in this decision; finishPhase may follow a successful correction.",
+              "INVALID_ARGUMENT",
+            );
           const before = objectValue(JSON.parse(execution.correctionInput ?? "{}")),
             after = objectValue(call.input);
           if (
@@ -437,6 +447,13 @@ export class DefaultAgentRuntime implements AgentRuntime {
 
     try {
       while (true) {
+        if (execution.editCorrectionPending && execution.editCorrectionUsed)
+          throw new DevflowError({
+            code: "AGENT_STALLED",
+            message:
+              "TOOL_PROTOCOL_CORRECTION_INTERRUPTED: allocated correction has no committed result; do not reopen ordinary tools or renew its credit.",
+            details: { correctionUsed: true, requestIssued: false },
+          });
         if (Date.now() >= phaseDeadlineAt)
           throw new DevflowError({
             code: "TIMEOUT",
@@ -494,8 +511,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
         const stepId = randomUUID();
         closingDecisionPending = false;
         correctingEdit = execution.editCorrectionPending;
+        protocolCorrectionCalls = 0;
         if (correctingEdit) {
-          execution.editCorrectionPending = false;
+          // Keep the existing pending+used fields as an in-flight marker until
+          // the complete decision is checkpointed. A crash cannot reopen tools.
+          execution.editCorrectionPending = execution.correctionReason === "PROTOCOL_INVALID";
           execution.editCorrectionUsed = true;
         }
         state = await checkpoint(context, {
@@ -548,7 +568,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
         }
         for (let attempt = 0; attempt <= request.maxRetries; attempt += 1) {
           throwIfAborted(signal, context.signal, deadlineSignal);
-          assertExecutionBudget(request, "modelCalls", state.metrics.modelCalls + 1);
+          assertExecutionBudget(request, "modelCalls", state.metrics.modelCalls + 1, false);
           const prePatch =
             request.prePatch?.active === true && !postPatch?.active ? request.prePatch : undefined;
           if (!prePatch) {
@@ -1641,6 +1661,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
         for (const executed of executedCalls) {
           messages.push(toolResultMessage(executed.call, executed.result));
         }
+        if (correctingEdit && execution.correctionReason === "PROTOCOL_INVALID")
+          execution.editCorrectionPending = false;
         const cachedToolCalls = executedCalls.filter(({ cached }) => cached).length;
         const toolExecutions = executedCalls.filter(({ executed }) => executed).length;
         const actualToolLatencyMs = executedCalls.reduce(
@@ -1676,30 +1698,39 @@ export class DefaultAgentRuntime implements AgentRuntime {
               "HOST_AUTHORIZATION_HANDOFF: the host denied further action. Use the next budgeted decision only to finishPhase with current evidence and SCOPE_CONFLICT or INSUFFICIENT_EVIDENCE. No new reads or edits; authorization denial is not a parameter correction.",
           });
         }
-        const protocolFailure = request.repairMode
-          ? executedCalls.find(
-              ({ call, result }) =>
-                !result.ok &&
-                !["APPROVAL_REQUIRED", "CONFLICT"].includes(result.error.code) &&
-                !["HOST_AUTHORIZATION", "HOST_EXPLORATION"].includes(
-                  String(objectValue(result.error.details)?.failureOrigin),
-                ) &&
-                (objectValue(result.error.details)?.category === "INVALID_ARGUMENT" ||
-                  (call.name === "finishPhase" &&
-                    /finishPhase|findingId|evidenceRefs/u.test(result.error.message)) ||
-                  (["readFile", "batchReadFiles", "readEvidenceArtifact"].includes(call.name) &&
-                    (result.error.code === "VALIDATION_ERROR" ||
-                      /READ_INVALID_RANGE|startLine|endLine|Unknown public repair evidence section/u.test(
-                        result.error.message,
-                      )))),
-            )
-          : undefined;
+        const protocolFailure =
+          request.repairMode || request.codingSession
+            ? executedCalls.find(
+                ({ call, result }) =>
+                  !result.ok &&
+                  !["APPROVAL_REQUIRED", "PERMISSION_DENIED", "CONFLICT"].includes(
+                    result.error.code,
+                  ) &&
+                  !["HOST_AUTHORIZATION", "HOST_EXPLORATION"].includes(
+                    String(objectValue(result.error.details)?.failureOrigin),
+                  ) &&
+                  (objectValue(result.error.details)?.category === "INVALID_ARGUMENT" ||
+                    (result.error.code === "VALIDATION_ERROR" &&
+                      objectValue(result.error.details)?.failureOrigin === "INPUT_VALIDATION") ||
+                    (call.name === "finishPhase" &&
+                      /finishPhase|findingId|evidenceRefs/u.test(result.error.message)) ||
+                    (["readFile", "batchReadFiles", "readEvidenceArtifact"].includes(call.name) &&
+                      (result.error.code === "VALIDATION_ERROR" ||
+                        /READ_INVALID_RANGE|startLine|endLine|Unknown public repair evidence section/u.test(
+                          result.error.message,
+                        )))),
+              )
+            : undefined;
         if (protocolFailure) {
           if (execution.editCorrectionUsed)
             throw new DevflowError({
               code: "AGENT_STALLED",
-              message: "REPAIR_PROTOCOL_CORRECTION_EXHAUSTED: failed fields remain unresolved.",
-              details: { tool: protocolFailure.call.name, requestIssued: true },
+              message: "TOOL_PROTOCOL_CORRECTION_EXHAUSTED: failed fields remain unresolved.",
+              details: {
+                tool: protocolFailure.call.name,
+                correctionUsed: true,
+                requestIssued: true,
+              },
             });
           execution.editCorrectionPending = true;
           execution.correctionReason = "PROTOCOL_INVALID";
@@ -1714,6 +1745,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
 
         if (
           !execution.editCorrectionUsed &&
+          !execution.editCorrectionPending &&
           normalCalls.some(({ call, result }) => {
             if (call.name !== "applyPatch") return false;
             const failure = objectValue(
@@ -1746,7 +1778,8 @@ export class DefaultAgentRuntime implements AgentRuntime {
                     ? (objectValue(call.input)!.path as string)
                     : undefined,
                 )
-              : !compatibilityObservations.has(identity);
+              : (!(request.repairMode || request.codingSession) || result.ok) &&
+                !compatibilityObservations.has(identity);
           compatibilityObservations.add(identity);
           if (observed) {
             if (result.ok) execution.evidenceDiscoveries++;
@@ -1784,13 +1817,17 @@ export class DefaultAgentRuntime implements AgentRuntime {
         if (observedDiffFingerprint !== undefined) {
           execution.progressFingerprint = observedDiffFingerprint;
         }
-        const repeatedWithoutProgress =
-          normalCalls.length > 0 &&
-          (normalCalls.every(({ cached }) => cached) ||
-            (!madeWorkspaceProgress && !newEvidence) ||
-            (!madeWorkspaceProgress &&
-              normalCalls.some(({ result }) => result.mutation !== undefined)));
         const submitted = executedCalls.some(({ control, result }) => control && result.ok);
+        const repeatedWithoutProgress =
+          !submitted &&
+          ((normalCalls.length > 0 &&
+            (normalCalls.every(({ cached }) => cached) ||
+              (!madeWorkspaceProgress && !newEvidence) ||
+              (!madeWorkspaceProgress &&
+                normalCalls.some(({ result }) => result.mutation !== undefined)))) ||
+            ((request.codingSession || request.repairMode) &&
+              normalCalls.length === 0 &&
+              executedCalls.some(({ result }) => !result.ok)));
         state = await checkpoint(context, {
           ...state,
           phase: "CALLING_TOOL",
@@ -1802,12 +1839,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           },
         });
 
-        if (
-          submitted ||
-          madeWorkspaceProgress ||
-          !repeatedWithoutProgress ||
-          execution.editCorrectionPending
-        ) {
+        if (submitted || madeWorkspaceProgress || !repeatedWithoutProgress) {
           execution.noProgressStreak = 0;
         } else {
           execution.noProgressStreak += 1;
@@ -1825,6 +1857,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
               content:
                 "Convergence warning: the previous calls produced no new evidence or workspace change. Do not repeat unchanged reads, failed calls or no-op edits; change strategy or finish with the unresolved gap.",
             });
+          } else if (execution.editCorrectionPending) {
+            // The failed decision still counts as no progress. One persisted, budgeted
+            // correction can resolve it; it does not reset the streak or reopen exploration.
           } else if (postPatch) {
             throw new DevflowError({
               code: "AGENT_STALLED",
@@ -2358,11 +2393,12 @@ async function executeOneToolInner(
           code: "VALIDATION_ERROR",
           message: `Invalid input for the current '${call.name}' contract.`,
           retryable: false,
-          details: {
-            failureOrigin: "INPUT_VALIDATION",
-            category: "INVALID_ARGUMENT",
-            ...parsed.error.flatten(),
-          },
+          details: toolInputValidationDetails(
+            call.name,
+            descriptor.inputSchema,
+            call.input,
+            parsed.error,
+          ),
         }),
         metadata,
         cached: false,
@@ -3054,6 +3090,7 @@ function assertExecutionBudget(
   request: AgentRunRequest,
   budgetType: "modelCalls" | "toolCalls" | "totalTokens",
   observed: number,
+  requestIssued?: boolean,
 ): void {
   const budget = request.executionBudget;
   if (budget === undefined) return;
@@ -3067,7 +3104,14 @@ function assertExecutionBudget(
   throw new DevflowError({
     code: "EXECUTION_BUDGET_EXCEEDED",
     message: `${budget.stage} exceeded the ${budgetType} execution budget.`,
-    details: { stage: budget.stage, budgetType, limit, observed },
+    details: {
+      stage: budget.stage,
+      budgetType,
+      limit,
+      observed,
+      missing: observed - limit,
+      ...(requestIssued === undefined ? {} : { requestIssued }),
+    },
   });
 }
 

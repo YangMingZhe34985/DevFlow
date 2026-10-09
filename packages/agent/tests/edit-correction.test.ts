@@ -161,7 +161,7 @@ it("does not give a second correction after another invalid patch", async () => 
     },
     f.context,
   );
-  expect(result.error?.code).toBe("NO_PROGRESS");
+  expect(result.error?.code).toBe("AGENT_STALLED");
   expect(model.requests).toHaveLength(2);
 });
 it("blocks an unaffordable correction before sending a provider request", async () => {

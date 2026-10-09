@@ -6,6 +6,8 @@ The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed ori
 
 The separate [Tool Call Recovery follow-up](docs/tool-call-recovery-e02-live-20261009.md) passed one fresh E02 full run, including public validation, replan/new approval, same-session recovery, independent scoring and Review (**1/1**). Malformed-argument recovery was verified by original-request Docker replay; the fresh run did not reproduce that error. This is a single-case result on a later frozen version, not a new cohort success rate.
 
+On that unchanged production Runtime, the later [E05/E06/E08/E10 directed validation](docs/four-case-validation-20261009.md) strictly passed **1/4 (E08)**. E05 retained a public-test failure, E06 stopped with insufficient implementation evidence, and E10 replanned/resumed but stopped at the tool limit with unresolved failures. These are separate case results; E10 still has not met the v2.4 gate.
+
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, approved planning, an iterative Coding Loop, deterministic final validation and independent review.

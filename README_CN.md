@@ -6,6 +6,8 @@
 
 独立的[Tool Call Recovery 定向验收](docs/tool-call-recovery-e02-live-20261009.md)重新运行 E02 一次，公开验证、重新规划／新审批、同 Session 恢复、独立评分及 Review 均通过（**1/1**）。畸形参数恢复由原请求 Docker 回放验证，本次真实实验未重现该错误。这是后续冻结版本的单题结果，不是新的整批成功率。
 
+同一生产 Runtime 的后续[E05/E06/E08/E10 定向验证](docs/four-case-validation-20261009.md)严格通过 **1/4（E08）**。E05 原测试仍失败，E06 因实现证据不足停止，E10 已重新规划并恢复但仍有失败、最终停在工具上限。各批结果分别保留，E10 仍未达到 v2.4 条件。
+
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。

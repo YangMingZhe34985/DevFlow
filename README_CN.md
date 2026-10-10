@@ -1,12 +1,14 @@
-# DevFlow 2.3
+# DevFlow 2.3.1
 
-包版本保持 **2.3.0**。代码编辑与失败修复共用持久化的 Coding Session。Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，**未达到 v2.4 升级条件**。见[资源调度架构](docs/resource-budget-scheduler.md)、[本轮结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
+当前包版本 **2.3.1**。代码编辑与失败修复共用持久化的 Coding Session。Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，**未达到 v2.4 升级条件**。见[资源调度架构](docs/resource-budget-scheduler.md)、[本轮结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
 
-后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），版本继续保持 2.3.0。
+后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），该实验使用包版本 2.3.0。
 
 独立的[Tool Call Recovery 定向验收](docs/tool-call-recovery-e02-live-20261009.md)重新运行 E02 一次，公开验证、重新规划／新审批、同 Session 恢复、独立评分及 Review 均通过（**1/1**）。畸形参数恢复由原请求 Docker 回放验证，本次真实实验未重现该错误。这是后续冻结版本的单题结果，不是新的整批成功率。
 
 同一生产 Runtime 的后续[E05/E06/E08/E10 定向验证](docs/four-case-validation-20261009.md)严格通过 **1/4（E08）**。E05 原测试仍失败，E06 因实现证据不足停止，E10 已重新规划并恢复但仍有失败、最终停在工具上限。各批结果分别保留，E10 仍未达到 v2.4 条件。
+
+**2.3.1 补丁版本**整合已验证的资源调度、确定性上下文投影和有界工具参数恢复改进；详见[当前版本技术报告](docs/technical-report-v2.3.1-20261010.md)。历史实验版本与结果原样保留，本次版本整理不等于新增真实验收。
 
 [中文](README_CN.md) | [English](README.md)
 

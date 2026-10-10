@@ -1,6 +1,6 @@
 # DevFlow 架构说明
 
-当前开发版本为 v2.3，代码修改和失败修复共用一个持久化 Coding Session。流程、验收结果及剩余预算阻断见 [Unified Coding Loop](unified-coding-loop-20261008.md)，生产契约见 [v2 workflow](v2-workflow.md)，模型接入见 [stage models](stage-models.md)。历史阶段标签和复杂度字段保持兼容，不代表新的 Agent 生命周期或 Planner 必填输出。
+当前版本为 v2.3.1（[技术报告](technical-report-v2.3.1-20261010.md)），代码修改和失败修复共用一个持久化 Coding Session。流程、验收结果及剩余预算阻断见 [Unified Coding Loop](unified-coding-loop-20261008.md)，生产契约见 [v2 workflow](v2-workflow.md)，模型接入见 [stage models](stage-models.md)。历史阶段标签和复杂度字段保持兼容，不代表新的 Agent 生命周期或 Planner 必填输出。
 
 ## 1. 设计目标
 

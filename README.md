@@ -1,12 +1,14 @@
-# DevFlow 2.3
+# DevFlow 2.3.1
 
-Package version: **2.3.0**. Editing and failure repair share one persistent Coding Session. The Resource Budget Scheduler development batch strictly passed **1/4** cases (E07). E10 now dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; the **v2.4 acceptance gate was not met**. See [the scheduler architecture](docs/resource-budget-scheduler.md), [current results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
+Package version: **2.3.1**. Editing and failure repair share one persistent Coding Session. The Resource Budget Scheduler development batch strictly passed **1/4** cases (E07). E10 now dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; the **v2.4 acceptance gate was not met**. See [the scheduler architecture](docs/resource-budget-scheduler.md), [current results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
 
-The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. The package remains 2.3.0.
+The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. That experiment used package version 2.3.0.
 
 The separate [Tool Call Recovery follow-up](docs/tool-call-recovery-e02-live-20261009.md) passed one fresh E02 full run, including public validation, replan/new approval, same-session recovery, independent scoring and Review (**1/1**). Malformed-argument recovery was verified by original-request Docker replay; the fresh run did not reproduce that error. This is a single-case result on a later frozen version, not a new cohort success rate.
 
 On that unchanged production Runtime, the later [E05/E06/E08/E10 directed validation](docs/four-case-validation-20261009.md) strictly passed **1/4 (E08)**. E05 retained a public-test failure, E06 stopped with insufficient implementation evidence, and E10 replanned/resumed but stopped at the tool limit with unresolved failures. These are separate case results; E10 still has not met the v2.4 gate.
+
+The **2.3.1 patch release** packages the verified scheduler, deterministic context projection and bounded tool-call recovery improvements. See the [current technical report](docs/technical-report-v2.3.1-20261010.md) for architecture, validation and remaining limitations. Historical experiment versions and results are preserved.
 
 [中文](README_CN.md) | [English](README.md)
 

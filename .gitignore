@@ -80,3 +80,6 @@ codex.md
 /scripts/review-length-recovery-live.mjs
 /scripts/build-historical-benchmark.mjs
 /scripts/summarize-*.mjs
+
+# Personal resume documents
+/docs/*简历*.docx

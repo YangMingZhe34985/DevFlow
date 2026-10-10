@@ -12,6 +12,8 @@
 
 [中文](README_CN.md) | [English](README.md)
 
+**项目复习入口：[整体技术报告与源码阅读指南](docs/project-study-guide-v2.3.1.md)**。从完整任务流转开始，介绍重点模块的内部机制、接口、设计取舍和源码入口，并提供自测问题。
+
 DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。
 
 API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略约束的工具操作 Docker 沙箱中的代码。Task 锁定不可变基准 commit，Run 保存事件、源码引用、补丁、指标和预算。

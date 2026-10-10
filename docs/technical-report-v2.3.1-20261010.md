@@ -2,6 +2,8 @@
 
 日期：2026-10-10。本文描述当前生产代码、公开配置及已有冻结实验；原始实验请求、候选、账单和私有评分材料不随仓库发布。
 
+用于系统复习各模块的输入、内部机制、调用链及设计取舍，请阅读[项目整体技术报告：模块机制与源码复习](project-study-guide-v2.3.1.md)。本文主要保留版本状态与验收依据。
+
 ## 1. 版本定位与结论
 
 v2.3.1 是 v2.3 的补丁版本，整合 Unified Coding Loop 后已验证的 Resource Budget Scheduler、Context Projection Optimizer、动态工具契约及有界参数纠错。此次整理统一包版本和文档，不改变 Agent 行为，也没有新增付费实验。
@@ -14,7 +16,7 @@ v2.3.1 是 v2.3 的补丁版本，整合 Unified Coding Loop 后已验证的 Res
 
 ```mermaid
 flowchart TB
-  UI[Web / CLI] --> API[NestJS API]
+  UI[Web 工作台] --> API[NestJS API]
   API --> DB[(PostgreSQL / Prisma)]
   API --> Q[Redis / BullMQ]
   Q --> W[Worker / Workflow]
@@ -40,7 +42,7 @@ flowchart TB
 | `apps/web`                     | Next.js 界面、任务与 Run 状态、事件及审批展示           |
 | `apps/api`                     | NestJS REST/SSE、意图持久化、查询与队列派发             |
 | `apps/worker`                  | 工作流编排、阶段绑定、诊断/证据交接、预算和恢复         |
-| `apps/cli`                     | 命令行入口和任务操作                                    |
+| `apps/cli`                     | 直接组合 Agent Runtime、工具和 Sandbox 的本地开发入口   |
 | `packages/agent`               | 模型端口、工具调用 Runtime、Coding Session 与上下文投影 |
 | `packages/tools` / `sandbox`   | 工具契约、参数校验、权限及隔离执行                      |
 | `packages/workflow` / `shared` | 工作流与共享领域契约                                    |

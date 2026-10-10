@@ -12,6 +12,8 @@ The **2.3.1 patch release** packages the verified scheduler, deterministic conte
 
 [中文](README_CN.md) | [English](README.md)
 
+For a module-by-module explanation of the current implementation, read the [project architecture study guide (Chinese)](docs/project-study-guide-v2.3.1.md). It covers end-to-end execution, runtime internals, design tradeoffs and source reading paths.
+
 DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, approved planning, an iterative Coding Loop, deterministic final validation and independent review.
 
 The API persists intent and queues work. The Worker owns execution; agents access repository code through policy-controlled tools in Docker sandboxes. Tasks pin an immutable base commit, and runs retain events, source references, diff artifacts and budgets.

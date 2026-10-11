@@ -137,6 +137,31 @@ function sandbox() {
 }
 
 describe("Resource Budget Scheduler execution boundary", () => {
+  it("prices pre-evidence continuation quotes without consuming the reservation", async () => {
+    const { runtime, scheduler } = await fixture({ costMicros: 100_000 });
+    runtime.model(new FakeLanguageModel([]), {
+      stage: "LOCALIZATION",
+      outputTokens: 4096,
+      timeoutMs: 1000,
+      price,
+      continuationMicrosPerMillionTokens: 28_000_000,
+    });
+    await expect(
+      runtime.checkContinuation({ tokens: 1000, modelCalls: 1 }, "evidence-next"),
+    ).resolves.toBeUndefined();
+    await expect(
+      runtime.checkContinuation({ tokens: 10000, modelCalls: 1 }, "evidence-too-costly"),
+    ).rejects.toMatchObject({ code: "EXECUTION_BUDGET_EXCEEDED" });
+    const quote = await scheduler.quote({
+      kind: "OPERATION",
+      id: "uncharged",
+      requirement: "REQUIRED",
+      state: "PENDING",
+      resources: { costMicros: 100000 },
+      costStatus: "PRICED",
+    });
+    expect(quote.fits).toBe(true);
+  });
   it("refuses a request that fits alone but would spend the necessary continuation", async () => {
     const required = estimatePlanRequest(request).estimatedInputTokens + 16384;
     const { runtime } = await fixture({ tokens: required + 1999 });

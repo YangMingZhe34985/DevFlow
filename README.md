@@ -1,5 +1,9 @@
 # DevFlow 2.3.1
 
+The `codex/prg-v24` branch adds experimental Progressive Repository Graph localization.
+See [implementation, free acceptance and limits](docs/prg-implementation.md). Paid PRG
+experiments have not started; the package remains **2.3.1** and the default mode is `legacy`.
+
 Package version: **2.3.1**. Editing and failure repair share one persistent Coding Session. The Resource Budget Scheduler development batch strictly passed **1/4** cases (E07). E10 now dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; the **v2.4 acceptance gate was not met**. See [the scheduler architecture](docs/resource-budget-scheduler.md), [current results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
 
 The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. That experiment used package version 2.3.0.

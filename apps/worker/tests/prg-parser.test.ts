@@ -141,4 +141,21 @@ describe("PRG four-language facts", () => {
       "512 KiB",
     );
   });
+  it.each([
+    [
+      "pkg/use.py",
+      "import service\ndef run():\n    return service.check()\n",
+      ["vendor/service.py"],
+    ],
+    ["pkg/A.java", "package pkg; import other.Service; class A {}", ["wrong/other/Service.java"]],
+    ["src/use.cpp", "#include <service.h>\nint run() { return 1; }", ["other/service.h"]],
+  ])(
+    "does not upgrade unique path suffixes to verified import targets: %s",
+    async (path, content, candidates) => {
+      const syntax = await parsePrgSyntax(path, content, signal);
+      const unit = sourceUnitFromSyntax(path, content, [path, ...candidates], syntax);
+      expect(unit.dependencies.length).toBeGreaterThan(0);
+      expect(unit.dependencies.every((d) => d.resolution !== "RESOLVED")).toBe(true);
+    },
+  );
 });

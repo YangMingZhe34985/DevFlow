@@ -8,6 +8,14 @@ import {
 /** Reservations are capacity, not charged tokens. Recheck at each stage boundary. */
 export function localizationLease(input: {
   dynamic?: boolean;
+  deadlines?: {
+    planner: number;
+    coding: number;
+    validation: number;
+    review: number;
+    recovery: number;
+    finalize: number;
+  };
   remainingTokens: number;
   title: string;
   description: string;
@@ -53,7 +61,21 @@ export function localizationLease(input: {
     id,
     requirement: "REQUIRED",
     state: "PENDING",
-    resources: { inputTokens: requestInput, outputTokens, modelCalls: 1, steps: 1 },
+    resources: {
+      inputTokens: requestInput,
+      outputTokens,
+      modelCalls: 1,
+      steps: 1,
+      ...(input.dynamic && input.deadlines
+        ? {
+            timeMs: id.startsWith("planner:")
+              ? input.deadlines.planner
+              : id.startsWith("coding:")
+                ? input.deadlines.coding
+                : 0,
+          }
+        : {}),
+    },
   });
   const sequence = (
     id: string,
@@ -73,13 +95,38 @@ export function localizationLease(input: {
     plannerOperations,
     codingOperations,
     continuation.operationPlan,
+    ...(input.dynamic && input.deadlines
+      ? [
+          {
+            kind: "OPERATION" as const,
+            id: "localization:validation-review-finalize-operations",
+            requirement: "REQUIRED" as const,
+            state: "PENDING" as const,
+            resources: {
+              timeMs:
+                input.deadlines.validation +
+                input.deadlines.review +
+                input.deadlines.recovery +
+                input.deadlines.finalize,
+              logicalToolCalls: 4,
+            },
+          },
+        ]
+      : []),
   ]);
-  const localizationOperationPlan = sequence("localization:four-request-ceiling", [
-    request("localization:decision", input.outputs.localization),
-    request("localization:exploration-decision", input.outputs.localization),
-    request("localization:final", input.outputs.localization),
-    request("localization:existing-recovery", input.outputs.localization),
-  ]);
+  const localizationOperationPlan = sequence(
+    input.dynamic ? "localization:next-decision-and-recovery" : "localization:four-request-ceiling",
+    [
+      request("localization:decision", input.outputs.localization),
+      ...(input.dynamic
+        ? []
+        : [
+            request("localization:exploration-decision", input.outputs.localization),
+            request("localization:final", input.outputs.localization),
+          ]),
+      request("localization:existing-recovery", input.outputs.localization),
+    ],
+  );
   const planner = estimateOperationPlan(plannerOperations).resources.tokens;
   const execute = estimateOperationPlan(codingOperations).resources.tokens;
   const downstream = estimateOperationPlan(downstreamOperationPlan).resources.tokens;
@@ -101,6 +148,7 @@ export function localizationLease(input: {
     oneExploration: perRequest,
     explorationAffordable: available >= 3 * perRequest,
     downstreamOperationPlan,
+    downstreamResources: estimateOperationPlan(downstreamOperationPlan).resources,
     localizationOperationPlan,
     accounting: "RESERVE_ONLY_RECHECK_ACTUAL_REQUEST" as const,
   };

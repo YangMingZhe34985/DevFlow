@@ -100,6 +100,7 @@ export interface TaskStore {
 }
 
 export interface RunRecord {
+  localizationMode?: "legacy" | "legacy-dynamic" | "prg";
   id: RunId;
   taskId: string;
   idempotencyKey?: string;
@@ -128,6 +129,7 @@ export interface RunExecutionRecord extends RunRecord {
 }
 
 export interface CreateRunInput {
+  localizationMode?: "legacy" | "legacy-dynamic" | "prg" | undefined;
   taskId: string;
   idempotencyKey?: string | undefined;
   modelProvider?: string | undefined;

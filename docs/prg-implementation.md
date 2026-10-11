@@ -60,6 +60,114 @@ model requests with five fresh reads, duplicate/no-progress stops, resume with o
 consumption, unknown dispatch refusal and pre-IO downstream rejection. Worker-wide
 admission, mode freezing and production handoff are implemented in batch D.
 
+## Batch D — production integration
+
+`localizationMode` is an optional create-Run/API/benchmark runtime configuration field:
+
+```json
+{ "taskId": "<existing-task-id>", "localizationMode": "prg" }
+```
+
+Omission means `legacy`. `legacy-dynamic` retains the old retrieval path while sharing
+dynamic admission with `prg`. Mode is written atomically into Run metadata; idempotency
+and benchmark resume reject changes. No database migration is needed. Planner proposals,
+Coding tools and approval contracts remain compatible.
+
+```mermaid
+flowchart LR
+  S[Immutable manifest] --> A[Repository Atlas]
+  A --> F[Complete candidate frontier]
+  F --> L[Existing Localization Agent]
+  L --> Q[Scheduler admission]
+  Q --> B[Bounded retrieval and navigation]
+  B --> G[SHA-bound syntax and relations]
+  G --> E[Evidence archive and projection]
+  E --> L
+  E --> P[Existing Planner and approval]
+  G --> C[Coding / Replan / Review host evidence]
+  L --> K[Investigation checkpoint]
+```
+
+Initial path/symbol/content retrieval still uses the existing index. PRG adds a complete
+frontier, module/directory aggregation and incremental content search. Queries interleave
+public tests and source candidates; acquired content answers later queries without
+physical rereads. Region responsibilities remain `INFERRED`. Only observed descriptor
+files establish module boundaries. Bounded model views do not discard the host frontier.
+
+Navigation reserves consumer capacity, handles public tests in four languages and keeps
+header/implementation pairing as an unverified hypothesis. Whole records, SHA and visible
+ranges pass through existing Planner inputs. Shared graph queries add optional PRG facts
+only in PRG mode; artifacts carry that mode into Coding and host evidence collection.
+
+Pre-evidence checks include the next judgment and downstream capacity, using the same
+configured token-price bound as actual request admission. Quotes do not consume resources.
+Source IO, parsing and persisted index access enter the Run ledger separately from logical
+tools. Known budget stops save evidence and reasons; unknown actions are not replayed.
+Verified immutable source caches rebuild graph facts on recovery. An inspected marker
+without recoverable current content cannot hide a candidate.
+
+## Free acceptance and remaining limitations
+
+| Check                                                                                    | Result                                                    |
+| ---------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| Full default suite                                                                       | 1,020 passed; 38 environment-gated/optional tests skipped |
+| lint / typecheck / build                                                                 | Passed                                                    |
+| Existing Workflow/approval/Coding Docker checks                                          | 8/8                                                       |
+| Sandbox and large-file Docker checks                                                     | 5/5                                                       |
+| Pinned Python/Java/C++ grammars in read-only, network-disabled Linux Docker              | 3/3                                                       |
+| Dedicated PostgreSQL mode freezing, admission/settlement and approval recovery           | 3/3                                                       |
+| Actual Worker request projection, generic fixture and optional E05/E06/E10 public replay | Four controlled scenarios; no paid models                 |
+
+Public reproduction steps supply the replay queries; expected paths are not supplied to
+navigation. A generic fixture verifies assertions, implementation and consumer in the
+same actual Worker requests. The dataset replay exercises more than four Localization
+decisions and reaches approval with scripted models. This proves orchestration and
+evidence reachability, **not correct root-cause selection, repair or strict acceptance**.
+
+An additional old P11 six-scenario integration was attempted and **failed**: its 45-second
+fixture deadline cannot admit the configured 180-second Planner request. Both timeout
+selection and fixture deadline exist at baseline `57f025b`; the baseline was inspected,
+not rerun. No production limit was raised to make this fixture pass. Its configuration
+compatibility remains a separate unresolved acceptance item.
+
+Important limits:
+
+- Atlas completeness refers only to the allowed manifest. Syntax, reverse consumers and
+  behavioral coverage are independently partial; complete structure does not prove recall.
+- Tree-sitter provides syntax, not compiler type resolution. Call/reference locations have
+  unresolved targets. Python absolute import paths, Java classpath, C++ include configuration,
+  overloads, macros and dynamic dispatch are not verified by filename uniqueness. Explicit
+  relative imports/local includes have narrower static evidence. Header/implementation
+  pairs remain hypotheses.
+- E06 public replay reaches headers, tests and segment implementation; it does not establish
+  that every compaction/reopen consumer is visible. E05/E10 also do not prove a complete
+  causal chain. Missing behavior remains investigable under budget.
+- Per-operation/source/request limits remain. Required whole records that do not fit cause
+  an explicit stop. Dynamic allocation does not guarantee a number of model calls.
+- Safe evidence checkpoints resume original consumption. A crash after dispatch but before
+  a confirmed checkpoint can stop conservatively even if remote work finished; it never
+  resets usage or automatically repeats that action.
+- No LSP, repository-script graph builder, compiler plugin, vector database, whole-repository
+  LLM summary or new write authority was added.
+
+## Configuration before paid testing
+
+Local stage settings were inspected without publishing credentials and left unchanged.
+All stages inherit the existing Bailian-compatible provider:
+
+| Stage              | Model                | Thinking        | Output / context tokens |
+| ------------------ | -------------------- | --------------- | ----------------------- |
+| Localization       | deepseek-v4.1-flash  | disabled / none | 4,096 / 32,000          |
+| Planner            | deepseek-v4-pro-0813 | enabled / high  | 8,192 / 32,000          |
+| Unified Coding     | glm-5.3              | enabled / low   | 8,192 / 32,000          |
+| Independent Review | deepseek-v4-pro-0813 | enabled / high  | 16,384 / 64,000         |
+
+Legacy Repair settings remain readable; all unified iterations use the Coding binding.
+Experimental manifests must retain 75 logical tools, 25 steps, 250,000 tokens, 1,500,000 ms,
+unchanged public validation and independent scoring. Use separate repository/cache
+namespaces for cold comparison arms; report warm reuse separately. Do not clear caches
+or switch modes in a running investigation.
+
 ## Release and paid-test gate
 
 Keep version 2.3.1 throughout implementation. Complete free engineering acceptance,
@@ -69,3 +177,10 @@ follow only for strictly successful or materially advancing cases. No private sc
 answers enter retrieval or model context. The cumulative authorized ceiling is ¥175;
 reload the ledger before experiments. One strictly passing PRG case plus engineering
 acceptance is the agreed v2.4.0 gate, not proof of general success rate or attribution.
+
+This implementation issued **zero paid requests**. Retained campaign accounting is
+**¥154.664838 / ¥175**, leaving **¥20.335162**, including existing unknown fee bounds.
+The next case needs at least ¥4 available plus per-request admission. PRG E05 → E06 → E10
+real runs remain **not run** pending the user's subsequent instruction. Successful or
+materially advancing cases receive `legacy-dynamic` controls; one success does not establish
+overall stability or isolate the contribution of PRG from dynamic allocation.

@@ -6,6 +6,7 @@ import {
   type RepositoryRelationGraph,
 } from "./relation-graph.js";
 import { staticSourceLanguage } from "./source-units.js";
+import { queryPrgFacts } from "./prg-facts.js";
 
 type Manifest = Awaited<ReturnType<IndexSource["manifest"]>>;
 const codePath = (path: string) =>
@@ -217,6 +218,9 @@ export async function queryRepositoryRelations(input: {
   ]);
   view.relatedTests = view.relatedTests.filter((path) => relatedPaths.has(path));
   const output = {
+    ...(input.graph.snapshot().prg
+      ? { prg: queryPrgFacts(input.graph.snapshot(), resolved.seeds, input.symbols) }
+      : {}),
     ...view,
     pathResolution: resolved.pathResolution,
     actualScope: {
@@ -243,7 +247,10 @@ export async function queryRepositoryRelations(input: {
       );
     }
     output.omittedRecords++;
-    if (output.files.length > 1) output.files.pop();
+    if (output.prg?.facts.length) {
+      output.prg.facts.pop();
+      output.prg.omitted++;
+    } else if (output.files.length > 1) output.files.pop();
     else if (output.missingInformation.length > 3) output.missingInformation.pop();
     else if (output.relations.length > 2) output.relations.pop();
     else if (output.limitations.length > 1) output.limitations.pop();

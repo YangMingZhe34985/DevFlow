@@ -1,8 +1,10 @@
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { posix } from "node:path";
 import { Worker } from "node:worker_threads";
 import { z } from "zod";
 import { hash } from "./contracts.js";
+import { resourceBudgetContext } from "../runs/resource-budget-runtime.js";
 import { acquireParser } from "./parser.js";
 import { parseStaticSource, staticSourceLanguage, type SourceUnit } from "./source-units.js";
 
@@ -79,7 +81,7 @@ const {parentPort,workerData:d}=require('node:worker_threads');
 })().catch(e=>{throw e;});
 `;
 
-export async function parsePrgSyntax(
+async function parsePrgSyntaxUnaccounted(
   path: string,
   content: string,
   signal: AbortSignal,
@@ -131,6 +133,18 @@ export async function parsePrgSyntax(
   }
 }
 
+export async function parsePrgSyntax(
+  path: string,
+  content: string,
+  signal: AbortSignal,
+): Promise<SyntaxFacts> {
+  const runtime = resourceBudgetContext.getStore();
+  const parse = () => parsePrgSyntaxUnaccounted(path, content, signal);
+  return runtime
+    ? runtime.internal("prg:parse", { toolExecutions: 1, timeMs: 8000 }, parse)
+    : parse();
+}
+
 /** AST validates declarations and dependency locations. Existing manifest resolver supplies
  * navigation candidates only; dynamic binding/overload resolution is deliberately not claimed. */
 export function sourceUnitFromSyntax(
@@ -140,11 +154,41 @@ export function sourceUnitFromSyntax(
   syntax: SyntaxFacts,
 ): SourceUnit {
   const lexical = parseStaticSource(path, content, paths)!;
-  const imports = lexical.dependencies.filter(
-    (d) =>
-      d.kind === "IMPORT" &&
-      syntax.imports.some((i) => i.startLine <= d.line && i.endLine >= d.line),
-  );
+  const imports = lexical.dependencies
+    .filter(
+      (d) =>
+        d.kind === "IMPORT" &&
+        syntax.imports.some((i) => i.startLine <= d.line && i.endLine >= d.line),
+    )
+    .map((dependency) => {
+      // A unique suffix match does not establish Python sys.path, Java classpath,
+      // or C++ include-search/conditional configuration. Retain it as navigation.
+      const declaration =
+        syntax.imports.find((i) => i.startLine <= dependency.line && i.endLine >= dependency.line)
+          ?.text ?? "";
+      const explicitRelative =
+        lexical.language === "Python" && dependency.specifier.startsWith(".");
+      const localInclude =
+        lexical.language === "C++" &&
+        /^#\s*include\s*"/u.test(declaration.trim()) &&
+        !/^\s*#\s*(?:if|ifdef|ifndef|define)\b/mu.test(content) &&
+        dependency.paths[0] ===
+          posix.normalize(posix.join(posix.dirname(path), dependency.specifier));
+      return dependency.resolution === "RESOLVED" && !explicitRelative && !localInclude
+        ? {
+            ...dependency,
+            resolution: "UNRESOLVED" as const,
+            provenance: `${dependency.provenance}; import search configuration not verified`,
+          }
+        : dependency;
+    });
+  const implementationPairs = lexical.dependencies
+    .filter((d) => d.kind === "IMPLEMENTATION_PAIR")
+    .map((d) => ({
+      ...d,
+      resolution: "UNRESOLVED" as const,
+      provenance: `${d.provenance}; filename pairing hypothesis, not an AST-proven target`,
+    }));
   return {
     ...lexical,
     sha256: hash(content),
@@ -154,7 +198,7 @@ export function sourceUnitFromSyntax(
       forwarding: false,
       calls: syntax.calls.filter((c) => c.line >= d.bodyStartLine && c.line <= d.endLine),
     })),
-    dependencies: syntax.status === "PARSED" ? imports : [],
+    dependencies: syntax.status === "PARSED" ? [...imports, ...implementationPairs] : [],
     unknown: [
       ...lexical.unknown,
       "Syntax references/call sites do not prove resolved runtime targets.",

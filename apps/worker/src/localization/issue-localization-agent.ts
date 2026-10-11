@@ -214,6 +214,8 @@ export class IssueLocalizationAgent {
       ? Number.MAX_SAFE_INTEGER
       : LOCALIZATION_READ_LIMITS.maxReadAttempts;
     const maxSearches = dynamic ? Number.MAX_SAFE_INTEGER : 2;
+    // Run IO admission, not the legacy stage-wide byte allowance, bounds dynamic investigation.
+    const sourceByteLimit = dynamic ? Number.MAX_SAFE_INTEGER : 2 * 1024 * 1024;
     const signal = AbortSignal.any([input.signal, AbortSignal.timeout(input.timeoutMs ?? 120_000)]);
     const metrics = {
       modelCalls: 0,
@@ -263,7 +265,6 @@ export class IssueLocalizationAgent {
     let hypotheses: { explanation: string; query: string }[] = [...(resume?.hypotheses ?? [])];
     let phase: LocalizationInvestigationState["phase"] = resume?.phase ?? "READY";
     let actionId: string | null = resume?.actionId ?? null;
-    let graph: RepositoryRelationGraph | undefined;
     const readCache = new Map<string, { content: string; truncated: boolean }>(resume?.sourceCache);
     const checkpoint = async (state: Record<string, unknown>) => {
       const investigation: LocalizationInvestigationState | undefined = dynamic
@@ -304,6 +305,31 @@ export class IssueLocalizationAgent {
         ...(investigation ? { investigation: structuredClone(investigation) } : {}),
       });
     };
+    const admitEvidence = async (
+      request: Parameters<NonNullable<typeof input.beforeEvidence>>[0],
+    ) => {
+      try {
+        await input.beforeEvidence?.(request);
+        return true;
+      } catch (error) {
+        if (
+          !(error instanceof DevflowError) ||
+          !["EXECUTION_BUDGET_EXCEEDED", "INSUFFICIENT_EVIDENCE"].includes(error.code)
+        )
+          throw error;
+        exitReason = "INSUFFICIENT_EVIDENCE";
+        uncertainty.push(`Evidence operation was not issued: ${error.message}`);
+        phase = "STOPPED";
+        actionId = null;
+        await checkpoint({
+          status: "PREFLIGHT_BLOCKED",
+          requestIssued: false,
+          operation: request,
+          reason: error.details,
+        });
+        return false;
+      }
+    };
     const add = (items: EvidenceItem[]) => {
       for (const item of items) {
         if (
@@ -332,6 +358,7 @@ export class IssueLocalizationAgent {
             message: "Localization evidence archive exceeds its bounded retrieval/read capacity.",
           });
         catalogue.set(id, item);
+        if (dynamic && behaviorEvidence(item)) anchors.add(id);
         if (item.retrievalSource.includes("agent-directed-read")) {
           latestReads.add(id);
           anchors.add(id);
@@ -367,7 +394,7 @@ export class IssueLocalizationAgent {
     const accountRead = async (bytes: number) => {
       metrics.readBytes += bytes;
       await input.onRead?.(bytes);
-      if (metrics.readBytes > 2 * 1024 * 1024)
+      if (metrics.readBytes > sourceByteLimit)
         throw new DevflowError({
           code: "INSUFFICIENT_EVIDENCE",
           message: "Localization source byte budget exceeded.",
@@ -378,6 +405,25 @@ export class IssueLocalizationAgent {
       /^(?:[0-9a-f]{64}|github:[^@]+@[0-9a-f]{40,64}|git:[0-9a-f]{40,64})$/iu.test(
         input.source.identity ?? "",
       );
+    if (resume) {
+      for (const [path, file] of readCache) {
+        const entry = await input.source.lookup?.(path, signal);
+        if (!immutable || !entry?.contentHash) {
+          readCache.delete(path);
+          continue;
+        }
+        if (
+          entry.kind !== "FILE" ||
+          entry.contentHash !== hash(file.content) ||
+          entry.sizeBytes !== Buffer.byteLength(file.content)
+        )
+          throw new DevflowError({
+            code: "INSUFFICIENT_EVIDENCE",
+            message: "Saved source cache differs from the current immutable manifest.",
+            details: { stopReason: "LOCALIZATION_RESUME_UNCERTAIN", requestIssued: false },
+          });
+      }
+    }
     const observedSource: IndexSource = {
       ...input.source,
       async read(path, readSignal) {
@@ -393,7 +439,7 @@ export class IssueLocalizationAgent {
           return cached;
         }
         const entry = await input.source.lookup?.(path, readSignal);
-        if (entry && metrics.readBytes + entry.sizeBytes > 2 * 1024 * 1024)
+        if (entry && metrics.readBytes + entry.sizeBytes > sourceByteLimit)
           throw new DevflowError({
             code: "INSUFFICIENT_EVIDENCE",
             message:
@@ -413,17 +459,22 @@ export class IssueLocalizationAgent {
         return file;
       },
     };
-    graph = input.buildGraph
+    const graph = input.buildGraph
       ? new RepositoryRelationGraph({
           repositoryId: input.repositoryId,
           baseCommitSha: input.baseCommitSha,
           source: observedSource,
-          maxReadBytes: 1024 * 1024,
+          maxReadBytes: dynamic ? Number.MAX_SAFE_INTEGER : 1024 * 1024,
           prg: mode === "prg",
           ...(input.factStore ? { factStore: input.factStore } : {}),
           ...(resume?.graph ? { baseline: resume.graph } : {}),
         })
       : undefined;
+    if (graph && resume) {
+      // Restore only cache entries just checked against the immutable current manifest.
+      // Rebinding may parse, but never pretends a cached source is a new physical read.
+      for (const [path, file] of readCache) await graph.observe(path, file.content, signal);
+    }
     const seeds = [...new Set((input.evidence?.evidence ?? []).map((e) => e.path))];
     if (graph && seeds.length && !resume) {
       await graph.inspect(seeds.slice(0, 4), signal, false);
@@ -451,6 +502,7 @@ export class IssueLocalizationAgent {
         source,
         graph,
         behaviorNavigation: true,
+        reserveConsumers: mode === "prg",
         signal,
         description: `${input.title}\n${input.description}`,
         candidates: [...catalogue.values()].map((e) => ({
@@ -460,7 +512,7 @@ export class IssueLocalizationAgent {
           endLine: e.endLine,
           reason: e.reason,
         })),
-        maxSourceBytes: Math.max(0, 2 * 1024 * 1024 - metrics.readBytes),
+        maxSourceBytes: Math.min(1024 * 1024, Math.max(0, sourceByteLimit - metrics.readBytes)),
       });
       Object.assign(metrics, {
         navigationReads: navigation.metrics.reads,
@@ -652,7 +704,11 @@ export class IssueLocalizationAgent {
           }),
         ) / 3,
       );
-    for (let round = decisions; metrics.modelCalls < maxCalls && phase !== "STOPPED"; round++) {
+    investigation: for (
+      let round = decisions;
+      metrics.modelCalls < maxCalls && phase !== "STOPPED";
+      round++
+    ) {
       const progressBefore = progressKeys.size;
       const remainingCalls = maxCalls - metrics.modelCalls;
       let finalOnly =
@@ -998,11 +1054,14 @@ export class IssueLocalizationAgent {
         const query = hypothesis.query.trim();
         if (metrics.searches >= maxSearches || seenQueries.has(queryKey(query))) continue;
         seenQueries.add(queryKey(query));
-        await input.beforeEvidence?.({
-          kind: "SEARCH",
-          estimatedNextInputTokens: estimatedInput,
-          outputTokens: configuredOutput,
-        });
+        if (
+          !(await admitEvidence({
+            kind: "SEARCH",
+            estimatedNextInputTokens: estimatedInput,
+            outputTokens: configuredOutput,
+          }))
+        )
+          break investigation;
         phase = "IO_RESERVED";
         actionId = `search:${hash(query)}`;
         await checkpoint({ status: "IO_RESERVED", requestIssued: false });
@@ -1010,6 +1069,59 @@ export class IssueLocalizationAgent {
         metrics.searches++;
         const pack = await input.retrieve(`${input.title}\n${query}`, source, signal);
         add(pack?.evidence ?? []);
+        if (mode === "prg" && graph && pack?.evidence.length) {
+          if (
+            !(await admitEvidence({
+              kind: "SEARCH",
+              estimatedNextInputTokens:
+                estimatedInput + Math.ceil(Buffer.byteLength(JSON.stringify(pack.evidence)) / 3),
+              outputTokens: configuredOutput,
+            }))
+          )
+            break investigation;
+          const navigation = await navigateImplementation({
+            repositoryId: input.repositoryId,
+            baseCommitSha: input.baseCommitSha,
+            source,
+            graph,
+            signal,
+            description: `${input.title}\n${input.description}\n${query}`,
+            candidates: pack.evidence.map((e) => ({
+              path: e.path,
+              symbol: e.symbol,
+              startLine: e.startLine,
+              endLine: e.endLine,
+              reason: e.reason,
+            })),
+            prioritizeCandidates: true,
+            behaviorNavigation: true,
+            reserveConsumers: true,
+            maxReads: 4,
+            maxSourceBytes: Math.min(512 * 1024, Math.max(0, sourceByteLimit - metrics.readBytes)),
+          });
+          navigationMissing = navigation.missing;
+          observations.push(...navigation.observations.slice(-4), ...navigation.missing.slice(-4));
+          add(
+            navigation.windows.map((w) => ({
+              ...w,
+              repositoryId: input.repositoryId,
+              baseCommitSha: input.baseCommitSha,
+              viewRevision: input.source.identity ?? "immutable",
+              retrievalSource: ["symbol-navigation", "prg-behavior"],
+              score: w.kind === "IMPLEMENTATION" ? 1 : 0.5,
+              language: w.path.split(".").at(-1) ?? "text",
+              module: w.path.split("/").slice(0, -1).join("/"),
+              fileType: isTestFile(w.path) ? "TEST" : "SOURCE",
+              parseStatus: w.parser === "LEXICAL_STATIC" ? "LEXICAL" : "PARSED",
+              signature: null,
+              directImports: [],
+              truncated: true,
+            })),
+          );
+          implementationEvidence = [...catalogue.values()]
+            .filter((e) => e.fileType === "SOURCE")
+            .map((e) => ({ ...e, explanation: e.reason }));
+        }
         observations.push(
           `Search hypothesis: ${hypothesis.explanation}; ${pack?.evidence.length ?? 0} evidence regions, incomplete=${pack?.incomplete ?? true}.`,
         );
@@ -1048,6 +1160,18 @@ export class IssueLocalizationAgent {
           reject("READ_INVALID_RANGE", "endLine must be at least startLine");
           continue;
         }
+        if (
+          !(await admitEvidence({
+            kind: "READ",
+            path,
+            estimatedNextInputTokens: estimatedInput,
+            outputTokens: configuredOutput,
+          }))
+        )
+          break investigation;
+        phase = "IO_RESERVED";
+        actionId = `read:${key}`;
+        await checkpoint({ status: "IO_RESERVED", requestIssued: false });
         const entry = await source.lookup?.(path, signal);
         if (!entry || entry.kind !== "FILE") {
           reject("READ_SOURCE_UNAVAILABLE", "path is not a regular source file");
@@ -1060,22 +1184,13 @@ export class IssueLocalizationAgent {
           );
           continue;
         }
-        if (metrics.readBytes + entry.sizeBytes > 2 * 1024 * 1024) {
+        if (metrics.readBytes + entry.sizeBytes > sourceByteLimit) {
           reject(
             "READ_SOURCE_BUDGET",
             "full-source verification cannot fit the remaining byte budget",
           );
           continue;
         }
-        await input.beforeEvidence?.({
-          kind: "READ",
-          path,
-          estimatedNextInputTokens: estimatedInput,
-          outputTokens: configuredOutput,
-        });
-        phase = "IO_RESERVED";
-        actionId = `read:${key}`;
-        await checkpoint({ status: "IO_RESERVED", requestIssued: false });
         await input.onInspect?.();
         metrics.reads++;
         const file = await source.read(path, signal);

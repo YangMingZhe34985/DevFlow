@@ -64,7 +64,7 @@ export async function buildRepositoryAtlas(input: {
   source: IndexSource;
   scope: string;
   signal: AbortSignal;
-  store?: RepositoryIndexStore;
+  store?: RepositoryIndexStore | undefined;
 }): Promise<RepositoryAtlas> {
   const metrics = { manifestCalls: 0, sourceReads: 0, cacheHits: 0, excluded: 0 };
   const scope = `${input.scope}:${ATLAS_VERSION}`;
@@ -127,7 +127,7 @@ export async function buildRepositoryAtlas(input: {
       entries.push(entry);
     }
     entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-    manifest = { entries, incomplete };
+    manifest = ManifestSchema.parse({ entries, incomplete });
     // Publish immutable complete shards before root. Partial/overlay results never poison shared facts.
     if (!incomplete && immutable(input.source) && input.store) {
       const shards: string[] = [];

@@ -32,6 +32,7 @@ import { DATABASE, RUN_QUEUE } from "../../infrastructure/tokens.js";
 import { RunEventStreamService } from "./run-event-stream.service.js";
 
 const CreateRunSchema = z.strictObject({
+  localizationMode: z.enum(["legacy", "legacy-dynamic", "prg"]).optional(),
   taskId: IdSchema,
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
   modelProvider: z.string().trim().min(1).max(100).optional(),

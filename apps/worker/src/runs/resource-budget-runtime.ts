@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentStateStore, LanguageModelPort } from "@devflow/agent";
 import type { SandboxSession } from "@devflow/sandbox";
 import { DevflowError } from "@devflow/shared";
+import type { RepositoryIndexStore } from "@devflow/database";
 import type { IndexSource } from "../localization/contracts.js";
 import { estimatePlanRequest } from "./plan-agent-context.js";
 import type {
@@ -32,8 +33,10 @@ export function recordDecisionResourceWork(steps: number): void {
 export class ResourceBudgetRuntime {
   private queued: Promise<void> = Promise.resolve();
   private queueError: unknown;
+  private continuationRate: number | undefined;
   private readonly wrappedSources = new WeakMap<IndexSource, IndexSource>();
   private readonly wrappedSandboxes = new WeakMap<SandboxSession, SandboxSession>();
+  private readonly wrappedIndexes = new WeakMap<RepositoryIndexStore, RepositoryIndexStore>();
 
   constructor(
     readonly scheduler: ResourceBudgetScheduler,
@@ -129,6 +132,64 @@ export class ResourceBudgetRuntime {
     if (!quote.fits) throw blocked(label, quote);
   }
 
+  /** Price capacity using the same configured bound as actual model admission.
+   * This is a quote, never consumption or a substitute for request admission. */
+  async checkContinuation(resources: Partial<ResourceVector>, label: string): Promise<void> {
+    const tokens = resources.tokens ?? 0;
+    const priced =
+      tokens === 0 || resources.costMicros !== undefined || this.continuationRate !== undefined;
+    await this.check(
+      {
+        ...operation(label, {
+          ...resources,
+          ...(tokens > 0 &&
+          resources.costMicros === undefined &&
+          this.continuationRate !== undefined
+            ? { costMicros: Math.ceil((tokens * this.continuationRate) / 1_000_000) }
+            : {}),
+        }),
+        costStatus: priced ? "PRICED" : "UNPRICED",
+      },
+      label,
+    );
+  }
+
+  /** Trusted host work (parser/database), separate from model logical tool calls. */
+  async internal<T>(
+    label: string,
+    estimate: Partial<ResourceVector>,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    return this.io(label, estimate, run);
+  }
+
+  indexStore(store: RepositoryIndexStore): RepositoryIndexStore {
+    const prior = this.wrappedIndexes.get(store);
+    if (prior) return prior;
+    const wrapped: RepositoryIndexStore = {
+      get: (scope, key) =>
+        this.io(
+          "prg:index-get",
+          { toolExecutions: 1, ioReads: 1, ioBytes: 1024 * 1024, timeMs: 5000 },
+          () => store.get(scope, key),
+          (value) => ({ ioBytes: Buffer.byteLength(JSON.stringify(value ?? null)) }),
+        ),
+      publish: (scope, key, value) =>
+        this.io(
+          "prg:index-publish",
+          {
+            toolExecutions: 1,
+            ioWrites: 1,
+            ioBytes: Buffer.byteLength(JSON.stringify(value)),
+            timeMs: 5000,
+          },
+          () => store.publish(scope, key, value),
+        ),
+    };
+    this.wrappedIndexes.set(store, wrapped);
+    return wrapped;
+  }
+
   private async admit(id: string, plan: ResourceBudgetOperationPlan): Promise<void> {
     const reserved = await this.scheduler.reserve(id, plan);
     if (!reserved.reserved) {
@@ -156,6 +217,7 @@ export class ResourceBudgetRuntime {
       continuationMicrosPerMillionTokens?: number;
     },
   ): LanguageModelPort {
+    this.continuationRate = options.continuationMicrosPerMillionTokens;
     return {
       ...(model.prepareRequest ? { prepareRequest: model.prepareRequest.bind(model) } : {}),
       generate: async (request, requestOptions) => {

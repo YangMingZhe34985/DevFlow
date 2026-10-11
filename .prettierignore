@@ -35,3 +35,5 @@ scripts/localization-graph-fix-replay.mjs
 scripts/review-length-recovery-live.mjs
 scripts/build-historical-benchmark.mjs
 scripts/summarize-*.mjs
+# Preserve the original user-authored algorithm proposal byte-for-byte.
+PRG：Progressive Repository Graph 算法设计.md

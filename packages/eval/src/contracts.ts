@@ -47,6 +47,7 @@ export const BenchmarkRuntimeConfigurationSchema = z
     maxSteps: z.number().int().min(1).max(200).optional(),
     maxTestRetries: z.number().int().min(0).max(20).optional(),
     maxReviewRetries: z.number().int().min(0).max(10).optional(),
+    localizationMode: z.enum(["legacy", "legacy-dynamic", "prg"]).optional(),
     publicVerificationProfile: PublicVerificationProfileSchema.optional(),
   })
   .strict();

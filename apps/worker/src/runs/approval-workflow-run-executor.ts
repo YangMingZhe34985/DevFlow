@@ -1,4 +1,10 @@
 import { ContinuationTools } from "./continuation-tools.js";
+import { buildRepositoryAtlas, atlasSource } from "../localization/repository-atlas.js";
+import { BehaviorRetriever } from "../localization/behavior-retriever.js";
+import {
+  validateInvestigationResume,
+  type LocalizationInvestigationState,
+} from "../localization/investigation-state.js";
 import { ResourceBudgetScheduler } from "./resource-budget-scheduler.js";
 import {
   ResourceBudgetRuntime,
@@ -464,9 +470,32 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       // Freeze LOCAL input before the approval wait so host edits made while a plan
       // is being reviewed cannot change what the approved run eventually executes.
       const localizationArtifacts = await this.database.artifacts.list(run.id);
+      const localizationMode = run.localizationMode ?? "legacy";
+      const dynamicLocalization = localizationMode !== "legacy";
+      const latestInvestigation = dynamicLocalization
+        ? localizationArtifacts.findLast((a) => a.name === "localization-investigation-v1.json")
+        : undefined;
+      const savedInvestigation = latestInvestigation?.content
+        ? (JSON.parse(latestInvestigation.content) as {
+            investigation?: LocalizationInvestigationState;
+            planningEvidence?: EvidencePack;
+          })
+        : undefined;
+      if (
+        latestInvestigation &&
+        !savedInvestigation?.investigation &&
+        !localizationArtifacts.some((a) => a.name === "issue-localization-agent-plan-v1.json")
+      )
+        throw new DevflowError({
+          code: "INSUFFICIENT_EVIDENCE",
+          message:
+            "Interrupted PRG initialization has no safe investigation boundary; original resource consumption is retained.",
+          details: { stopReason: "LOCALIZATION_RESUME_UNCERTAIN", requestIssued: false },
+        });
       if (
         localizationArtifacts.some((a) => a.name === "localization-consumption-v1.json") &&
-        !localizationArtifacts.some((a) => a.name === "issue-localization-agent-plan-v1.json")
+        !localizationArtifacts.some((a) => a.name === "issue-localization-agent-plan-v1.json") &&
+        !savedInvestigation?.investigation
       ) {
         await this.database.events.append({
           runId: run.id,
@@ -495,7 +524,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             },
             planSignal,
           );
-      const planningSource =
+      let planningSource =
         resourceBudgetContext
           .getStore()
           ?.source(rawPlanningSource, planningSnapshot !== undefined) ?? rawPlanningSource;
@@ -505,22 +534,52 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           code: "INSUFFICIENT_EVIDENCE",
           message: "Agent planning requires an immutable repository identity.",
         });
-      const planningEvidence = await this.retrieveEvidence(
-        run,
-        planningSource,
-        0,
-        planSignal,
-        "PLAN",
-        Math.max(
+      const resumeInvestigation = savedInvestigation?.investigation
+        ? validateInvestigationResume(
+            savedInvestigation.investigation,
+            planningSource.identity,
+            planningBaseCommit,
+            localizationMode,
+          )
+        : undefined;
+      const atlas =
+        localizationMode === "prg"
+          ? await buildRepositoryAtlas({
+              source: planningSource,
+              scope: run.repository.id,
+              store: this.prgIndexStore(),
+              signal: planSignal,
+            })
+          : undefined;
+      if (atlas) planningSource = atlasSource(planningSource, atlas);
+      const planningEvidence =
+        savedInvestigation?.planningEvidence ??
+        (await this.retrieveEvidence(
+          run,
+          planningSource,
           0,
-          this.environment.DEVFLOW_MAX_TOTAL_TOKENS - metrics.tokenUsage.totalTokens - 8192,
-        ),
-      );
-      recordToolWork(metrics, "PLAN", {
-        calls: 1,
-        executions: planningEvidence.metrics.toolExecutions,
-        latencyMs: planningEvidence.metrics.wallMs,
-      });
+          planSignal,
+          "PLAN",
+          Math.max(
+            0,
+            this.environment.DEVFLOW_MAX_TOTAL_TOKENS - metrics.tokenUsage.totalTokens - 8192,
+          ),
+        ));
+      if (atlas)
+        planningEvidence.prg = {
+          atlasIdentity: atlas.identity,
+          coverage: atlas.coverage,
+          frontierSize: atlas.entries.length,
+          inspectedFiles:
+            planningEvidence.metrics.filesInspected ??
+            new Set(planningEvidence.evidence.map((e) => e.path)).size,
+        };
+      if (!savedInvestigation?.planningEvidence)
+        recordToolWork(metrics, "PLAN", {
+          calls: 1,
+          executions: planningEvidence.metrics.toolExecutions,
+          latencyMs: planningEvidence.metrics.wallMs,
+        });
       if (run.currentStage === "START") {
         await this.database.events.append({
           runId: run.id,
@@ -558,6 +617,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         metrics,
       );
       const localizationBudget = localizationLease({
+        dynamic: dynamicLocalization,
+        deadlines: {
+          planner: this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
+          coding: 60000,
+          validation: Math.min(planTiming.timeoutMs, 300000),
+          review: this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS,
+          recovery: this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS,
+          finalize: this.environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
+        },
         remainingTokens: planBudget.remainingTotalTokens(metrics),
         title: run.task.title,
         description: run.task.description,
@@ -593,7 +661,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             (event) =>
               event.type === "LLM_REQUEST" && recordValue(event.payload).purpose === "LOCALIZATION",
           );
-        if (legacyConsumption || prior.some((a) => a.name === "localization-consumption-v1.json"))
+        if (
+          !resumeInvestigation &&
+          (legacyConsumption || prior.some((a) => a.name === "localization-consumption-v1.json"))
+        )
           throw new DevflowError({
             code: "INSUFFICIENT_EVIDENCE",
             message:
@@ -604,20 +675,67 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           await this.database.artifacts.create({
             runId: run.id,
             kind: "OTHER",
-            name: "localization-consumption-v1.json",
+            name: dynamicLocalization
+              ? "localization-investigation-v1.json"
+              : "localization-consumption-v1.json",
             mimeType: "application/json",
             content: JSON.stringify({
               version: 1,
               baseCommitSha: planningBaseCommit,
               sourceIdentity: planningSource.identity,
               lease: localizationBudget,
+              ...(dynamicLocalization ? { planningEvidence } : {}),
               ...state,
             }),
             metadata: { visibility: "HOST_ONLY" },
           });
         };
-        await checkpoint({ status: "STARTED", requestIssued: false, modelCalls: 0 });
+        if (!resumeInvestigation)
+          await checkpoint({ status: "STARTED", requestIssued: false, modelCalls: 0 });
+        const behavior = atlas
+          ? new BehaviorRetriever(
+              atlas,
+              `${run.task.title}\n${run.task.description}`,
+              resumeInvestigation?.frontier,
+              resumeInvestigation?.sourceCache,
+            )
+          : undefined;
+        const currentLease = (evidence: readonly { snippet: string }[]) =>
+          localizationLease({
+            dynamic: dynamicLocalization,
+            deadlines: {
+              planner: this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
+              coding: 60000,
+              validation: Math.min(planTiming.timeoutMs, 300000),
+              review: this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS,
+              recovery: this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS,
+              finalize: this.environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
+            },
+            remainingTokens: planBudget!.remainingTotalTokens(metrics),
+            title: run.task.title,
+            description: run.task.description,
+            evidence,
+            outputs: {
+              localization:
+                this.modelBindings.get(localizationModel)?.settings?.maxOutputTokens ?? 4096,
+              planner: this.modelBindings.get(model)?.settings?.maxOutputTokens ?? 4096,
+              execute: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+              repair: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+              review: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 4096,
+            },
+          });
+        let latestDownstream = localizationBudget.downstreamResources;
         const result = await new IssueLocalizationAgent().run({
+          mode: localizationMode,
+          maxModelCalls: this.environment.DEVFLOW_MAX_MODEL_CALLS ?? run.maxSteps,
+          ...(resumeInvestigation ? { resume: resumeInvestigation } : {}),
+          ...(this.database.repositoryIndexes ? { factStore: this.prgIndexStore()! } : {}),
+          ...(behavior
+            ? {
+                investigationView: () => behavior.view(),
+                investigationFrontier: () => behavior.frontier(),
+              }
+            : {}),
           title: run.task.title,
           description: run.task.description,
           repositoryId: run.repository.id,
@@ -631,7 +749,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           onCheckpoint: checkpoint,
           timeoutMs: planBudget!.remainingTimeoutMs("PLAN"),
           signal: planSignal,
-          maxTokens: localizationBudget.maxTokens,
+          maxTokens: localizationBudget.maxTokens + (resumeInvestigation?.metrics.totalTokens ?? 0),
           buildGraph: this.environment.DEVFLOW_RELATION_GRAPH_ENABLED ?? true,
           onGraph: async (graph, issue) => {
             const content = JSON.stringify(graph);
@@ -660,25 +778,47 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             return artifact.id;
           },
           retrieve: (query, source, querySignal) =>
-            new IssueLocalizer(this.database.repositoryIndexes, {
-              smallRepoFiles: this.environment.DEVFLOW_LOCALIZATION_SMALL_REPO_FILES ?? 64,
-              fastFiles: this.environment.DEVFLOW_LOCALIZATION_FAST_FILES ?? 3,
-            }).retrieve({
-              repositoryId: run.repository.id,
-              accessScope: run.repository.id,
-              baseCommitSha: planningBaseCommit,
-              runId: run.id,
-              workspaceRevision: 0,
-              description: query,
-              source,
-              signal: querySignal,
-              tokenBudget: 6000,
-            }),
+            behavior
+              ? behavior.retrieve({
+                  query,
+                  source,
+                  signal: querySignal,
+                  template: planningEvidence,
+                  repositoryId: run.repository.id,
+                  baseCommitSha: planningBaseCommit,
+                })
+              : new IssueLocalizer(this.database.repositoryIndexes, {
+                  smallRepoFiles: this.environment.DEVFLOW_LOCALIZATION_SMALL_REPO_FILES ?? 64,
+                  fastFiles: this.environment.DEVFLOW_LOCALIZATION_FAST_FILES ?? 3,
+                }).retrieve({
+                  repositoryId: run.repository.id,
+                  accessScope: run.repository.id,
+                  baseCommitSha: planningBaseCommit,
+                  runId: run.id,
+                  workspaceRevision: 0,
+                  description: query,
+                  source,
+                  signal: querySignal,
+                  tokenBudget: 6000,
+                }),
           onRequest: async (request) => {
-            request.resourceContinuation = { tokens: localizationBudget.downstream };
+            if (dynamicLocalization) {
+              const message = request.messages.find((m) => m.role === "USER");
+              const projected = JSON.parse(String(message?.content ?? "{}")) as {
+                evidence?: { snippet: string }[];
+              };
+              latestDownstream = currentLease(
+                projected.evidence ?? planningEvidence.evidence,
+              ).downstreamResources;
+            }
+            request.resourceContinuation = dynamicLocalization
+              ? latestDownstream
+              : { tokens: localizationBudget.downstream };
             planBudget!.assertWithinLimits("PLAN", metrics);
             // Leave one PLAN, one EXECUTE and one REVIEW decision available.
-            if (planBudget!.remainingAgentSteps <= 3)
+            if (
+              planBudget!.remainingAgentSteps <= (dynamicLocalization ? latestDownstream.steps : 3)
+            )
               throw new DevflowError({
                 code: "INSUFFICIENT_EVIDENCE",
                 message: "Localization must preserve PLAN/EXECUTE/REVIEW step capacity.",
@@ -693,6 +833,43 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               payload: { purpose: "LOCALIZATION" },
             });
           },
+          ...(dynamicLocalization
+            ? {
+                beforeEvidence: async (operation: {
+                  kind: "SEARCH" | "READ";
+                  path?: string;
+                  estimatedNextInputTokens: number;
+                  outputTokens: number;
+                }) => {
+                  const runtime = resourceBudgetContext.getStore();
+                  const growth = operation.kind === "READ" ? 4096 : 16 * 1024;
+                  const quote = {
+                    kind: "OPERATION" as const,
+                    id: "localization:evidence-and-next-decision",
+                    requirement: "REQUIRED" as const,
+                    state: "PENDING" as const,
+                    resources: {
+                      tokens:
+                        operation.estimatedNextInputTokens +
+                        Math.ceil(growth / 3) +
+                        operation.outputTokens +
+                        latestDownstream.tokens,
+                      modelCalls: 1 + latestDownstream.modelCalls,
+                      steps: 1 + latestDownstream.steps,
+                      logicalToolCalls: 1 + latestDownstream.logicalToolCalls,
+                      ioReads: operation.kind === "READ" ? 1 : 4,
+                      ioBytes: 512 * 1024,
+                      toolExecutions: operation.kind === "READ" ? 1 : 4,
+                      timeMs:
+                        8000 +
+                        (this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000) +
+                        latestDownstream.timeMs,
+                    },
+                  };
+                  await runtime?.checkContinuation(quote.resources, quote.id);
+                },
+              }
+            : {}),
           onResponse: async (response) => {
             recordModelResponse(metrics, "PLAN", response);
             await this.database.events.append({
@@ -4861,6 +5038,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         if (input.run.task.baseCommitSha && baseline.baseCommitSha !== input.run.task.baseCommitSha)
           throw new Error("Graph does not match the approved base");
         relationGraph = new RepositoryRelationGraph({
+          prg: input.run.localizationMode === "prg",
+          ...(this.database.repositoryIndexes ? { factStore: this.prgIndexStore()! } : {}),
           repositoryId: input.run.repository.id,
           baseCommitSha: baseline.baseCommitSha,
           source: sandboxSource(input.sandbox, { maxFileBytes: 512 * 1024 }),
@@ -6542,6 +6721,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     // These unknown reservations are already debited by the restored Run ledger. Do not charge them twice in the new phase result.
     state.pendingTokenReserve = 0;
     return state;
+  }
+
+  private prgIndexStore() {
+    const store = this.database.repositoryIndexes;
+    return store ? (resourceBudgetContext.getStore()?.indexStore(store) ?? store) : undefined;
   }
 
   private planningOutputLimits(model: LanguageModelPort): { finalOutputTokens?: number } {

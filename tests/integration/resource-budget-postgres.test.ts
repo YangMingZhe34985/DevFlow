@@ -11,6 +11,22 @@ import {
 const enabled = process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION === "1";
 
 describe.skipIf(!enabled)("PostgreSQL resource ledger", () => {
+  it("freezes localization mode through database reload and rejects idempotent mode changes", async () => {
+    await withDatabases(async (a, b) => {
+      const base = await createRun(a);
+      const idempotencyKey = `prg-mode-${randomUUID()}`;
+      const input = { taskId: base.taskId, idempotencyKey, localizationMode: "prg" as const };
+      const created = await a.runs.create(input);
+      expect((await b.runs.create(input)).run).toMatchObject({
+        id: created.run.id,
+        localizationMode: "prg",
+      });
+      await expect(
+        b.runs.create({ ...input, localizationMode: "legacy-dynamic" }),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      expect(base.localizationMode).toBe("legacy");
+    });
+  });
   it("serializes reservation and settlement from independent database connections", async () => {
     await withDatabases(async (a, b) => {
       const run = await createRun(a);

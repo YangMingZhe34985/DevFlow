@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
+import { DevflowError } from "@devflow/shared";
 import { IssueLocalizationAgent } from "../src/localization/issue-localization-agent.js";
 import { hash, type IndexSource } from "../src/localization/contracts.js";
 import type { LocalizationInvestigationState } from "../src/localization/investigation-state.js";
@@ -151,5 +152,31 @@ describe("dynamic localization investigation", () => {
       }),
     ).rejects.toThrow("downstream");
     expect(input.source.read).not.toHaveBeenCalled();
+  });
+  it("saves a known budget stop and its pending hypothesis without issuing IO or a summary", async () => {
+    const input = setup();
+    const checkpoints: Record<string, unknown>[] = [];
+    const model = new FakeLanguageModel([decision([read(0)])]);
+    const result = await new IssueLocalizationAgent().run({
+      ...input,
+      model,
+      onCheckpoint: async (state) => {
+        checkpoints.push(state);
+      },
+      beforeEvidence: async () => {
+        throw new DevflowError({
+          code: "EXECUTION_BUDGET_EXCEEDED",
+          message: "Required next decision does not fit.",
+          details: { requestIssued: false },
+        });
+      },
+    });
+    expect(result.metrics.finalReason).toBe("INSUFFICIENT_EVIDENCE");
+    expect(model.requests).toHaveLength(1);
+    expect(input.source.read).not.toHaveBeenCalled();
+    expect(checkpoints.at(-1)?.investigation).toMatchObject({
+      phase: "STOPPED",
+      metrics: { modelCalls: 1 },
+    });
   });
 });

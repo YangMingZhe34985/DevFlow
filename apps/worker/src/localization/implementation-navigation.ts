@@ -116,6 +116,8 @@ export async function navigateImplementation(input: {
   /** Speculative recall stays inside the requested view; observed import edges may leave it. */
   fallbackPaths?: readonly string[];
   behaviorNavigation?: boolean;
+  /** Keep a share of this same read allowance reachable for reverse consumers. */
+  reserveConsumers?: boolean;
   /** SHA-verified earlier projection; reuse behavior names without rereading assertions. */
   observedWindows?: readonly { path: string; snippet: string }[];
   onFile?(path: string, content: string): Promise<void>;
@@ -307,6 +309,14 @@ export async function navigateImplementation(input: {
       )
       .sort(
         (a, b) =>
+          (input.reserveConsumers
+            ? issueSearchTerms(signals).filter(
+                (t) => t.length > 3 && b.toLowerCase().includes(t.toLowerCase()),
+              ).length -
+              issueSearchTerms(signals).filter(
+                (t) => t.length > 3 && a.toLowerCase().includes(t.toLowerCase()),
+              ).length
+            : 0) ||
           Number(/(?:^|\/)regression\//u.test(b)) - Number(/(?:^|\/)regression\//u.test(a)) ||
           basePriority(b) - basePriority(a) ||
           a.localeCompare(b),
@@ -364,7 +374,13 @@ export async function navigateImplementation(input: {
         return;
       }
     }
-    if (result.windows.length >= limits.windows) return;
+    if (
+      result.windows.length >=
+      (input.reserveConsumers && !reason.startsWith("Consumer reference")
+        ? Math.max(1, limits.windows - 1)
+        : limits.windows)
+    )
+      return;
     const pendingOthers = pendingRequested().filter((p) => p !== path).length;
     if (
       requested.size &&
@@ -444,7 +460,13 @@ export async function navigateImplementation(input: {
     );
     const priority = (item: (typeof queue)[number]) =>
       item.priority +
-      (/\.(?:test|spec)\.[^.]+$/u.test(item.path) ? 1100 : 0) +
+      ((
+        input.reserveConsumers
+          ? sourceRole(item.path) === "TEST"
+          : /\.(?:test|spec)\.[^.]+$/u.test(item.path)
+      )
+        ? 1100
+        : 0) +
       (item.reason.startsWith("Public test dependency") ? 1200 - item.depth * 120 : 0) +
       (requested.has(item.path) && !contentCache.has(item.path) ? 1000 : 0) -
       (staticSourceLanguage(item.path) &&
@@ -498,7 +520,8 @@ export async function navigateImplementation(input: {
       const entry = entries.get(item.path)!;
       if (
         entry.sizeBytes > 512 * 1024 ||
-        result.metrics.reads >= limits.reads ||
+        result.metrics.reads >=
+          (input.reserveConsumers ? Math.max(1, limits.reads - 2) : limits.reads) ||
         result.metrics.sourceBytes + entry.sizeBytes > limits.bytes
       ) {
         result.metrics.exitReason = "SOURCE_BUDGET";
@@ -536,6 +559,28 @@ export async function navigateImplementation(input: {
       .files.find((f) => f.path === item.path && f.state === "CURRENT" && f.sha256 === file.digest);
     if (node?.sourceUnit) {
       const unit = node.sourceUnit;
+      if (input.reserveConsumers && sourceRole(item.path) === "TEST") {
+        const lines = file.content.split(/\r?\n/u);
+        const scored = lines
+          .map((text, index) => ({
+            index,
+            score:
+              evidenceTerms.filter((t) => text.toLowerCase().includes(t)).length +
+              (/\b(?:assert|expect|ASSERT_|EXPECT_|CHECK|REQUIRE)/u.test(text) ? 1 : 0),
+          }))
+          .sort((a, b) => b.score - a.score || a.index - b.index);
+        const start = Math.max(1, (scored[0]?.index ?? 0) - 8);
+        addWindow(
+          item.path,
+          file,
+          start,
+          Math.min(lines.length, start + limits.lines - 1),
+          null,
+          "REFERENCE",
+          "Public test assertions; observed source precedes dependency navigation.",
+          unit.parser === "TREE_SITTER_WASM" ? "AST" : "LEXICAL_STATIC",
+        );
+      }
       const wanted = item.names.map((n) => n.split(/\.|::/u).at(-1)!);
       const hint =
         item.depth === 0
@@ -601,8 +646,8 @@ export async function navigateImplementation(input: {
           definition.endLine,
           definition.name,
           definition.forwarding ? "REFERENCE" : implementationKind(item.path),
-          `Observed ${unit.language} lexical definition${definition.forwarding ? " forwarding to another call" : ""}; runtime dispatch and root cause unverified.`,
-          "LEXICAL_STATIC",
+          `Observed ${unit.language} ${unit.parser} definition${definition.forwarding ? " forwarding to another call" : ""}; runtime dispatch and root cause unverified.`,
+          unit.parser === "TREE_SITTER_WASM" ? "AST" : "LEXICAL_STATIC",
           definition.forwarding,
         );
         if (definition.endLine - definition.startLine >= limits.lines) {
@@ -627,8 +672,8 @@ export async function navigateImplementation(input: {
               Math.min(definition.endLine, hit.line + limits.lines - 13),
               definition.name,
               implementationKind(item.path),
-              "Behavioral branch within a lexical definition; semantic verification required.",
-              "LEXICAL_STATIC",
+              "Behavioral branch within a source definition; semantic verification required.",
+              unit.parser === "TREE_SITTER_WASM" ? "AST" : "LEXICAL_STATIC",
             );
         }
       }
@@ -656,8 +701,11 @@ export async function navigateImplementation(input: {
         }
         if (unit.language === "C++" && dependency.kind === "IMPORT")
           observedCalls.forEach((call) => requested.add(call.name));
-        if (dependency.kind === "IMPLEMENTATION_PAIR")
+        if (dependency.kind === "IMPLEMENTATION_PAIR") {
           wanted.forEach((name) => requested.add(name));
+          if (input.reserveConsumers)
+            selectedDefinitions.forEach((definition) => requested.add(definition.name));
+        }
         if (!requested.size) continue;
         for (const target of dependency.paths.slice(0, 2))
           enqueue(
@@ -706,7 +754,7 @@ export async function navigateImplementation(input: {
           local.name,
           local.forwarding ? "REFERENCE" : implementationKind(item.path),
           "Observed local call candidate; lexical resolution only.",
-          "LEXICAL_STATIC",
+          unit.parser === "TREE_SITTER_WASM" ? "AST" : "LEXICAL_STATIC",
           local.forwarding,
         );
       result.observations.push(

@@ -90,6 +90,12 @@ export interface EvidenceItem {
   truncated: boolean;
 }
 export interface EvidencePack {
+  prg?: {
+    atlasIdentity: string;
+    coverage: "COMPLETE" | "PARTIAL";
+    frontierSize: number;
+    inspectedFiles: number;
+  };
   route?: "FAST_PATH" | "DIRECT_SEARCH" | "INDEXED_SEARCH";
   evidenceSufficient?: boolean;
   sufficiencyReasons?: string[];

@@ -369,6 +369,7 @@ class PrismaRunStore implements RunRepository {
         const created = await this.client.run.create({
           data: {
             taskId: input.taskId,
+            metadata: { localizationMode: input.localizationMode ?? "legacy" },
             ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
             ...(input.modelName === undefined ? {} : { modelName: input.modelName }),
@@ -1854,6 +1855,7 @@ function mapTask(task: PrismaTask): TaskRecord {
 function mapRun(run: PrismaRun): RunRecord {
   const result = resultFromRun(run);
   return {
+    localizationMode: localizationModeFromMetadata(run.metadata),
     id: run.id,
     taskId: run.taskId,
     ...(run.idempotencyKey === null ? {} : { idempotencyKey: run.idempotencyKey }),
@@ -2133,6 +2135,9 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
     throw conflict("Idempotency key is already associated with another task.");
   }
   const mismatches = [
+    localizationModeFromMetadata(existing.metadata) !== (input.localizationMode ?? "legacy")
+      ? "localizationMode"
+      : undefined,
     existing.modelProvider !== (input.modelProvider ?? null) ? "modelProvider" : undefined,
     existing.modelName !== (input.modelName ?? null) ? "modelName" : undefined,
     existing.maxSteps !== (input.maxSteps ?? 25) ? "maxSteps" : undefined,
@@ -2144,6 +2149,13 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
       `Idempotency key is already associated with different Run options: ${mismatches.join(", ")}.`,
     );
   }
+}
+
+function localizationModeFromMetadata(metadata: unknown): "legacy" | "legacy-dynamic" | "prg" {
+  const mode = recordValue(metadata).localizationMode;
+  if (mode === undefined || mode === "legacy") return "legacy";
+  if (mode === "prg" || mode === "legacy-dynamic") return mode;
+  throw conflict("Invalid persisted Localization mode; resume cannot choose a new mode.");
 }
 
 function canTransitionTask(current: TaskStatus, next: TaskStatus): boolean {

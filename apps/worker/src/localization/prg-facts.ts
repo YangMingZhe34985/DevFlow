@@ -63,7 +63,7 @@ export function queryPrgFacts(
         status:
           e.resolution === "DYNAMIC"
             ? "DYNAMIC"
-            : e.resolution === "RESOLVED"
+            : e.resolution === "RESOLVED" && e.kind !== "IMPLEMENTATION_PAIR"
               ? "VERIFIED"
               : "UNRESOLVED",
         evidence: { ...base, startLine: e.line, endLine: e.line },

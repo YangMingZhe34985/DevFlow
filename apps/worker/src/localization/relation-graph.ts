@@ -1,5 +1,6 @@
 import { SourceUnitSchema, parseStaticSource, staticSourceLanguage } from "./source-units.js";
 import type { RepositoryIndexStore } from "@devflow/database";
+import { resourceBudgetContext } from "../runs/resource-budget-runtime.js";
 import {
   PRG_PARSER_VERSION,
   PrgFactsSchema,
@@ -73,6 +74,7 @@ const EdgeSchema = z.object({
   stale: z.boolean(),
 });
 export const RelationGraphSchema = z.object({
+  prg: z.boolean().optional(),
   version: z.literal(GRAPH_VERSION),
   parserVersion: z.literal(RELATION_PARSER_VERSION),
   repositoryId: z.string(),
@@ -127,6 +129,7 @@ export const RelationGraphSchema = z.object({
     reads: z.number(),
     cacheHits: z.number(),
     coldParses: z.number(),
+    parserMs: z.number().optional(),
   }),
 });
 export type RelationGraphArtifact = z.infer<typeof RelationGraphSchema>;
@@ -164,6 +167,7 @@ const cache = new Map<string, RelationParse>();
 
 /** A partial static file/package/export graph. It never claims a runtime call graph or root cause. */
 export class RepositoryRelationGraph {
+  private readonly prgEnabled: boolean;
   private manifest = new Map<string, IndexEntry>();
   private listing: { entries: IndexEntry[]; incomplete: boolean } | undefined;
   private configuration: Record<string, string> = {};
@@ -185,6 +189,7 @@ export class RepositoryRelationGraph {
     },
   ) {
     const baseline = input.baseline && RelationGraphSchema.parse(input.baseline);
+    this.prgEnabled = input.prg ?? baseline?.prg ?? false;
     if (
       baseline &&
       (baseline.repositoryId !== input.repositoryId ||
@@ -219,6 +224,7 @@ export class RepositoryRelationGraph {
       this.invalidate([], input.workspaceRevision ?? baseline.workspaceRevision + 1, true);
     }
     this.artifact.sourceIdentity = input.source.identity ?? null;
+    if (this.prgEnabled) this.artifact.prg = true;
     this.artifact.configHash = hash(
       JSON.stringify({ ...CONFIG, maxReadBytes: input.maxReadBytes ?? CONFIG.maxReadBytes }),
     );
@@ -370,7 +376,8 @@ export class RepositoryRelationGraph {
       seen = new Set<string>();
     while (
       queue.length &&
-      this.artifact.metrics.coldParses + this.artifact.metrics.cacheHits < CONFIG.maxFiles
+      this.artifact.metrics.coldParses + this.artifact.metrics.cacheHits <
+        (this.prgEnabled ? 2000 : CONFIG.maxFiles)
     ) {
       signal.throwIfAborted();
       const { path, depth } = queue.shift()!;
@@ -411,7 +418,10 @@ export class RepositoryRelationGraph {
       )
     )
       return;
-    if (this.artifact.metrics.coldParses + this.artifact.metrics.cacheHits >= CONFIG.maxFiles) {
+    if (
+      this.artifact.metrics.coldParses + this.artifact.metrics.cacheHits >=
+      (this.prgEnabled ? 2000 : CONFIG.maxFiles)
+    ) {
       this.reason("Graph parse budget reached");
       return;
     }
@@ -424,14 +434,18 @@ export class RepositoryRelationGraph {
     let sourceUnit = parseStaticSource(path, content, [...this.manifest.keys()]);
     let prgFacts: z.infer<typeof PrgFactsSchema> | undefined;
     let parseCacheHit = false;
-    if (sourceUnit && this.input.prg) {
+    if (sourceUnit && this.prgEnabled) {
       const scope = `${this.input.factScope ?? this.input.repositoryId}:${PRG_PARSER_VERSION}`;
       // Syntax is content-addressed; binding resolution is recomputed against this view/configuration.
       const key = hash(`${staticSourceLanguage(path)}:${sha256}:${PRG_PARSER_VERSION}`);
       try {
         const cached = SyntaxFactsSchema.safeParse(await this.input.factStore?.get(scope, key));
         parseCacheHit = cached.success;
+        const parseStarted = Date.now();
         const syntax = cached.success ? cached.data : await parsePrgSyntax(path, content, signal);
+        if (!cached.success)
+          this.artifact.metrics.parserMs =
+            (this.artifact.metrics.parserMs ?? 0) + Date.now() - parseStarted;
         if (!cached.success && syntax.status === "PARSED" && !syntax.truncated)
           await this.input.factStore?.publish(scope, key, syntax);
         sourceUnit = sourceUnitFromSyntax(path, content, [...this.manifest.keys()], syntax);
@@ -466,7 +480,9 @@ export class RepositoryRelationGraph {
       this.artifact.edges = this.artifact.edges.filter((e) => e.from !== path);
       for (const dependency of sourceUnit.dependencies) {
         const to =
-          dependency.resolution === "RESOLVED" && graphPathAllowed(dependency.paths[0]!)
+          (dependency.resolution === "RESOLVED" ||
+            (this.prgEnabled && dependency.paths.length === 1)) &&
+          graphPathAllowed(dependency.paths[0]!)
             ? dependency.paths[0]!
             : null;
         this.artifact.edges.push({
@@ -480,7 +496,7 @@ export class RepositoryRelationGraph {
           line: dependency.line,
           sourceSha256: sha256,
           configurationHash: this.artifact.configurationHash,
-          resolution: to ? "RESOLVED" : "UNRESOLVED",
+          resolution: to && dependency.resolution === "RESOLVED" ? "RESOLVED" : "UNRESOLVED",
           reason: `${dependency.provenance}; ${dependency.resolution}; ${sourceUnit.parser}, runtime dispatch unknown`,
           stale: false,
         });
@@ -510,16 +526,28 @@ export class RepositoryRelationGraph {
     try {
       if (parsed) this.artifact.metrics.cacheHits++;
       else {
-        parsed = await parseRelations(
-          {
-            path,
-            content,
-            paths: [...this.manifest.keys()],
-            configuration: this.configuration,
-            ...(configPath ? { configPath } : {}),
-          },
-          signal,
-        );
+        const parseStarted = Date.now();
+        const parse = () =>
+          parseRelations(
+            {
+              path,
+              content,
+              paths: [...this.manifest.keys()],
+              configuration: this.configuration,
+              ...(configPath ? { configPath } : {}),
+            },
+            signal,
+          );
+        const runtime = this.prgEnabled ? resourceBudgetContext.getStore() : undefined;
+        parsed = runtime
+          ? await runtime.internal(
+              "prg:typescript-parse",
+              { toolExecutions: 1, timeMs: 8000 },
+              parse,
+            )
+          : await parse();
+        this.artifact.metrics.parserMs =
+          (this.artifact.metrics.parserMs ?? 0) + Date.now() - parseStarted;
         this.artifact.metrics.coldParses++;
         if (cache.size >= 128) cache.delete(cache.keys().next().value!);
         cache.set(key, parsed);
@@ -696,7 +724,7 @@ export class RepositoryRelationGraph {
       { language: "TypeScript/JavaScript", parser: "AST", completeness: "PARTIAL_STATIC" },
       ...["Python", "Java", "C++"].map((language) => ({
         language,
-        parser: this.input.prg ? PRG_PARSER_VERSION : "LEXICAL_STATIC",
+        parser: this.prgEnabled ? PRG_PARSER_VERSION : "LEXICAL_STATIC",
         completeness: "PARTIAL",
       })),
     ];

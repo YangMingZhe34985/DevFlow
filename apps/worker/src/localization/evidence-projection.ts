@@ -21,7 +21,7 @@ export interface EvidenceOmission {
 /** A navigation hint, never a proof of behavior, causality or write authority. */
 export function behaviorEvidence(item: EvidenceItem): boolean {
   return (
-    /\.(?:test|spec)\.[^.]+$/u.test(item.path) ||
+    item.fileType === "TEST" ||
     item.reason.startsWith("Consumer reference") ||
     (item.fileType === "SOURCE" &&
       /\b(?:return|if|switch|throw|raise|yield)\b|=>/u.test(item.snippet))

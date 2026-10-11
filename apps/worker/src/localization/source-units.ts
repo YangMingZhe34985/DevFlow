@@ -12,7 +12,7 @@ export const SourceUnitSchema = z.object({
   path: z.string(),
   sha256: z.string(),
   language: z.enum(["Python", "Java", "C++"]),
-  parser: z.literal("LEXICAL_STATIC"),
+  parser: z.enum(["LEXICAL_STATIC", "TREE_SITTER_WASM"]),
   completeness: z.literal("PARTIAL"),
   definitions: z.array(
     z.object({

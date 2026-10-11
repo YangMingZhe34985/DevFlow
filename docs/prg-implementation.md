@@ -23,6 +23,22 @@ Cold construction performs one manifest acquisition and zero source reads; warm
 construction uses persisted shards and performs neither. Production wiring and Docker
 acceptance follow in batch D; no capability or real experiment claim is made here.
 
+## Batch B — syntax facts and static navigation
+
+Pinned `@vscode/tree-sitter-wasm@0.3.1` supplies its own matching runtime and Python,
+Java and C++ grammars. Parsing runs in an empty-environment worker, with a 512 KiB
+input bound, an eight-second deadline and bounded syntax output. TS/JS retains the
+TypeScript 5.9.3 resolver. No repository scripts, language servers or plugins execute.
+
+Current source SHA and configuration identity bind facts. Immutable syntax shards
+can be reused; manifest-dependent bindings are recomputed. Declarations and uniquely
+resolved import files are static facts. Call/reference locations are exposed without
+claiming overload, macro or runtime dispatch targets. Reverse coverage stays partial.
+
+Validation: 47 parser, source-unit and graph regressions passed, including WASM on
+Windows, TS aliases, overloads, macros, syntax failure, cache reuse and invalidation.
+Core compilation passed. Shared Worker query wiring remains batch D work.
+
 ## Release and paid-test gate
 
 Keep version 2.3.1 throughout implementation. Complete free engineering acceptance,

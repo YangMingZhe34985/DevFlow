@@ -6,6 +6,10 @@ import { workspacePackages } from "./workspace-packages.js";
 
 export const RELATION_PARSER_VERSION = "typescript-5.9.3-relations-v4";
 export const RelationParseSchema = z.object({
+  references: z.array(z.object({ name: z.string(), line: z.number() })).optional(),
+  calls: z
+    .array(z.object({ name: z.string(), receiver: z.string().nullable(), line: z.number() }))
+    .optional(),
   status: z.enum(["PARSED", "PARSE_ERROR"]),
   symbols: z.array(
     z.object({
@@ -103,7 +107,7 @@ while(pendingConfigs.length && seenConfigs.size<16) {
  }
 }
 const file=root+d.path, source=ts.createSourceFile(file,d.content,ts.ScriptTarget.Latest,true);
-const imports=[], symbols=[], exports=[]; let truncated=false;
+const imports=[], symbols=[], exports=[], references=[], calls=[]; let truncated=false;
 let shadowedRequire=false;
 function findShadow(node) {
   if(node.name&&ts.isIdentifier(node.name)&&node.name.text==='require'&&(ts.isVariableDeclaration(node)||ts.isFunctionDeclaration(node)||ts.isParameter(node)||ts.isImportSpecifier(node)||ts.isImportClause(node)||ts.isNamespaceImport(node))) shadowedRequire=true;
@@ -138,6 +142,8 @@ function dependency(node,specifier,kind) {
   imports.push(row);
 }
 function visit(node) {
+  if(ts.isIdentifier(node)) { if(references.length<4000)references.push({name:node.text,line:line(node)});else truncated=true; }
+  if(ts.isCallExpression(node)) { if(calls.length<1000)calls.push({name:ts.isPropertyAccessExpression(node.expression)?node.expression.name.text:node.expression.getText(source).slice(0,256),receiver:ts.isPropertyAccessExpression(node.expression)?node.expression.expression.getText(source).slice(0,256):null,line:line(node)});else truncated=true; }
   if(node.name && (ts.isFunctionDeclaration(node)||ts.isClassDeclaration(node)||ts.isInterfaceDeclaration(node)||ts.isTypeAliasDeclaration(node)||ts.isVariableDeclaration(node)||ts.isMethodDeclaration(node))) {
     if(symbols.length<1000) {
       let decl=ts.isVariableDeclaration(node)?node.parent.parent:node;
@@ -170,7 +176,7 @@ function visit(node) {
   ts.forEachChild(node,visit);
 }
 visit(source);
-parentPort.postMessage({status:source.parseDiagnostics.length?'PARSE_ERROR':'PARSED',symbols,exports:exports.slice(0,1000),imports,configurationErrors,truncated:truncated||exports.length>1000});
+parentPort.postMessage({status:source.parseDiagnostics.length?'PARSE_ERROR':'PARSED',symbols,exports:exports.slice(0,1000),imports,references,calls,configurationErrors,truncated:truncated||exports.length>1000});
 `;
 
 export async function parseRelations(

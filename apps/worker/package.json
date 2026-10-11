@@ -24,6 +24,7 @@
     "@devflow/shared": "2.3.1",
     "@devflow/tools": "2.3.1",
     "@devflow/workflow": "2.3.1",
+    "@vscode/tree-sitter-wasm": "0.3.1",
     "bullmq": "6.3.7",
     "dotenv": "18.0.0",
     "ioredis": "6.0.0",

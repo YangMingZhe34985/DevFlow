@@ -1,4 +1,12 @@
 import { SourceUnitSchema, parseStaticSource, staticSourceLanguage } from "./source-units.js";
+import type { RepositoryIndexStore } from "@devflow/database";
+import {
+  PRG_PARSER_VERSION,
+  PrgFactsSchema,
+  SyntaxFactsSchema,
+  parsePrgSyntax,
+  sourceUnitFromSyntax,
+} from "./prg-parser.js";
 import { posix } from "node:path";
 import ts from "typescript";
 import { z } from "zod";
@@ -49,6 +57,7 @@ const FileSchema = z.object({
   fileType: z.string(),
   parse: RelationParseSchema.nullable(),
   sourceUnit: SourceUnitSchema.optional(),
+  prgFacts: PrgFactsSchema.optional(),
 });
 const EdgeSchema = z.object({
   id: z.string(),
@@ -170,6 +179,9 @@ export class RepositoryRelationGraph {
       onRead?(bytes: number): Promise<void>;
       maxReadBytes?: number;
       baseline?: RelationGraphArtifact;
+      prg?: boolean;
+      factStore?: RepositoryIndexStore;
+      factScope?: string;
     },
   ) {
     const baseline = input.baseline && RelationGraphSchema.parse(input.baseline);
@@ -409,9 +421,39 @@ export class RepositoryRelationGraph {
       sizeBytes: Buffer.byteLength(content),
       contentHash: sha256,
     });
-    const sourceUnit = parseStaticSource(path, content, [...this.manifest.keys()]);
+    let sourceUnit = parseStaticSource(path, content, [...this.manifest.keys()]);
+    let prgFacts: z.infer<typeof PrgFactsSchema> | undefined;
+    let parseCacheHit = false;
+    if (sourceUnit && this.input.prg) {
+      const scope = `${this.input.factScope ?? this.input.repositoryId}:${PRG_PARSER_VERSION}`;
+      // Syntax is content-addressed; binding resolution is recomputed against this view/configuration.
+      const key = hash(`${staticSourceLanguage(path)}:${sha256}:${PRG_PARSER_VERSION}`);
+      try {
+        const cached = SyntaxFactsSchema.safeParse(await this.input.factStore?.get(scope, key));
+        parseCacheHit = cached.success;
+        const syntax = cached.success ? cached.data : await parsePrgSyntax(path, content, signal);
+        if (!cached.success && syntax.status === "PARSED" && !syntax.truncated)
+          await this.input.factStore?.publish(scope, key, syntax);
+        sourceUnit = sourceUnitFromSyntax(path, content, [...this.manifest.keys()], syntax);
+        prgFacts = {
+          parserVersion: PRG_PARSER_VERSION,
+          sourceSha: sha256,
+          configurationHash: this.artifact.configurationHash,
+          syntax,
+          coverage: "PARTIAL",
+        };
+      } catch (error) {
+        signal.throwIfAborted();
+        this.reason(
+          `PRG syntax unavailable: ${path}: ${error instanceof Error ? error.message : "parser failure"}`,
+        );
+        this.upsert({ path, sha256, state: "UNAVAILABLE", fileType: fileType(path), parse: null });
+        return;
+      }
+    }
     if (sourceUnit) {
-      this.artifact.metrics.coldParses++;
+      if (parseCacheHit) this.artifact.metrics.cacheHits++;
+      else this.artifact.metrics.coldParses++;
       this.upsert({
         path,
         sha256,
@@ -419,6 +461,7 @@ export class RepositoryRelationGraph {
         fileType: fileType(path),
         parse: null,
         sourceUnit,
+        ...(prgFacts ? { prgFacts } : {}),
       });
       this.artifact.edges = this.artifact.edges.filter((e) => e.from !== path);
       for (const dependency of sourceUnit.dependencies) {
@@ -438,7 +481,7 @@ export class RepositoryRelationGraph {
           sourceSha256: sha256,
           configurationHash: this.artifact.configurationHash,
           resolution: to ? "RESOLVED" : "UNRESOLVED",
-          reason: `${dependency.provenance}; ${dependency.resolution}; lexical, runtime dispatch unknown`,
+          reason: `${dependency.provenance}; ${dependency.resolution}; ${sourceUnit.parser}, runtime dispatch unknown`,
           stale: false,
         });
         if (to && !this.artifact.files.some((f) => f.path === to))
@@ -647,15 +690,21 @@ export class RepositoryRelationGraph {
       "C++",
     ];
     this.artifact.coverage.lexicalParsedFiles = this.artifact.files.filter(
-      (f) => f.state === "CURRENT" && f.sourceUnit,
+      (f) => f.state === "CURRENT" && f.sourceUnit?.parser === "LEXICAL_STATIC",
     ).length;
     this.artifact.coverage.languageCapabilities = [
       { language: "TypeScript/JavaScript", parser: "AST", completeness: "PARTIAL_STATIC" },
-      { language: "Python", parser: "LEXICAL_STATIC", completeness: "PARTIAL" },
-      { language: "Java", parser: "LEXICAL_STATIC", completeness: "PARTIAL" },
-      { language: "C++", parser: "LEXICAL_STATIC", completeness: "PARTIAL" },
+      ...["Python", "Java", "C++"].map((language) => ({
+        language,
+        parser: this.input.prg ? PRG_PARSER_VERSION : "LEXICAL_STATIC",
+        completeness: "PARTIAL",
+      })),
     ];
-    this.artifact.coverage.astParsedFiles = this.artifact.coverage.parsedFiles;
+    this.artifact.coverage.astParsedFiles =
+      this.artifact.coverage.parsedFiles +
+      this.artifact.files.filter(
+        (f) => f.state === "CURRENT" && f.prgFacts?.syntax.status === "PARSED",
+      ).length;
     this.artifact.coverage.unsupportedSourceFiles = [...this.manifest.keys()].filter((p) =>
       /\.(?:go|rs)$/u.test(p),
     ).length;

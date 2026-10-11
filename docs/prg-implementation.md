@@ -178,9 +178,14 @@ answers enter retrieval or model context. The cumulative authorized ceiling is �
 reload the ledger before experiments. One strictly passing PRG case plus engineering
 acceptance is the agreed v2.4.0 gate, not proof of general success rate or attribution.
 
-This implementation issued **zero paid requests**. Retained campaign accounting is
+The implementation/free-acceptance phase issued **zero paid requests**. Its retained campaign accounting was
 **¥154.664838 / ¥175**, leaving **¥20.335162**, including existing unknown fee bounds.
 The next case needs at least ¥4 available plus per-request admission. PRG E05 → E06 → E10
-real runs remain **not run** pending the user's subsequent instruction. Successful or
+real runs were pending the user's subsequent instruction at that checkpoint. Successful or
 materially advancing cases receive `legacy-dynamic` controls; one success does not establish
 overall stability or isolate the contribution of PRG from dynamic allocation.
+
+The user started the experiments on 2026-10-12. PRG strictly passed E05 and failed
+E06/E10; the E05 legacy-dynamic control stopped on Planner output validation. The agreed
+single-case gate was met and package metadata advanced to 2.4.0 after the frozen experiments.
+See [the real acceptance and remaining problems](prg-validation-20261012.md).

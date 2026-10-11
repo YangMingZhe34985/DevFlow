@@ -1,10 +1,12 @@
-# DevFlow 2.3.1
+# DevFlow 2.4.0
 
-The `codex/prg-v24` branch adds experimental Progressive Repository Graph localization.
-See [implementation, free acceptance and limits](docs/prg-implementation.md). Paid PRG
-experiments have not started; the package remains **2.3.1** and the default mode is `legacy`.
+Version **2.4.0** adds opt-in Progressive Repository Graph localization. Its frozen real
+batch strictly passed **1/3 (E05)**; E06 and E10 remain unresolved. The E05 legacy-dynamic
+control stopped on Planner output validation, so this comparison does not isolate PRG's
+localization benefit. See [the real results](docs/prg-validation-20261012.md) and
+[implementation and limits](docs/prg-implementation.md). The default mode remains `legacy`.
 
-Package version: **2.3.1**. Editing and failure repair share one persistent Coding Session. The Resource Budget Scheduler development batch strictly passed **1/4** cases (E07). E10 now dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; the **v2.4 acceptance gate was not met**. See [the scheduler architecture](docs/resource-budget-scheduler.md), [current results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
+The **2.3.1 baseline** shares one persistent Coding Session for editing and failure repair. The earlier Resource Budget Scheduler batch strictly passed **1/4** cases (E07). E10 dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; that batch did not meet its E10-specific version gate. See [the scheduler architecture](docs/resource-budget-scheduler.md), [its results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
 
 The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. That experiment used package version 2.3.0.
 

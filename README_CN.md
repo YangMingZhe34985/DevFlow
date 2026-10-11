@@ -1,9 +1,10 @@
-# DevFlow 2.3.1
+# DevFlow 2.4.0
 
-`codex/prg-v24` 分支增加实验性的 PRG 渐进定位，详见[接入、免费验收及局限](docs/prg-implementation.md)。
-本轮尚未启动 PRG 真实付费实验，包版本保持 **2.3.1**；未指定模式时继续使用 `legacy`。
+**2.4.0** 增加可选 PRG 渐进定位，冻结真实批次严格通过 **1/3（E05）**，E06/E10 仍未修复。
+E05 的 legacy-dynamic 对照被 Planner 输出校验阻断，尚不能单独确认 PRG 的定位增益。
+详见[真实验收报告](docs/prg-validation-20261012.md)和[接入及局限](docs/prg-implementation.md)。未指定模式时继续使用 `legacy`。
 
-当前包版本 **2.3.1**。代码编辑与失败修复共用持久化的 Coding Session。Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，**未达到 v2.4 升级条件**。见[资源调度架构](docs/resource-budget-scheduler.md)、[本轮结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
+**2.3.1 基线**的代码编辑与失败修复共用持久化 Coding Session。此前 Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，未达到该批次的 E10 专用升级条件。见[资源调度架构](docs/resource-budget-scheduler.md)、[该批结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
 
 后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），该实验使用包版本 2.3.0。
 

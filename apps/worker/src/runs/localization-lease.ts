@@ -7,6 +7,7 @@ import {
 
 /** Reservations are capacity, not charged tokens. Recheck at each stage boundary. */
 export function localizationLease(input: {
+  dynamic?: boolean;
   remainingTokens: number;
   title: string;
   description: string;
@@ -88,7 +89,7 @@ export function localizationLease(input: {
   const desired = estimateOperationPlan(localizationOperationPlan).resources.tokens;
   const available = Math.max(0, input.remainingTokens - downstream);
   return {
-    maxTokens: Math.min(desired, available),
+    maxTokens: input.dynamic ? available : Math.min(desired, available),
     downstream,
     planner,
     execute,

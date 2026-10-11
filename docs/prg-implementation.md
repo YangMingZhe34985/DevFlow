@@ -39,6 +39,27 @@ Validation: 47 parser, source-unit and graph regressions passed, including WASM 
 Windows, TS aliases, overloads, macros, syntax failure, cache reuse and invalidation.
 Core compilation passed. Shared Worker query wiring remains batch D work.
 
+## Batch C — dynamic investigation and durable boundaries
+
+The existing Localization Agent accepts `legacy`, `legacy-dynamic` and `prg` modes.
+Dynamic modes remove the four-request/two-search/three-read stage allowances; Run
+limits and per-operation admission still apply. Read range, snippet and full-file
+bounds remain. Actual provider-prepared input is measured before generation without
+reducing configured output. A larger bounded host evidence archive is projected as
+complete records rather than injected wholesale.
+
+Versioned investigation checkpoints retain source identity, source cache, evidence,
+candidate/hypothesis state, completed queries/ranges, progress and original consumption.
+Safe evidence boundaries resume without repeating completed work. Unconfirmed model
+or IO reservations block rather than replay. Repeated requests stop immediately; two
+rounds without new source stop without a summary call. The original lease policy is
+retained for `legacy`; dynamic mode quotes remaining capacity beyond downstream needs.
+
+Validation: 37 investigation, legacy-agent and lease tests passed. Tests include six
+model requests with five fresh reads, duplicate/no-progress stops, resume with original
+consumption, unknown dispatch refusal and pre-IO downstream rejection. Worker-wide
+admission, mode freezing and production handoff are implemented in batch D.
+
 ## Release and paid-test gate
 
 Keep version 2.3.1 throughout implementation. Complete free engineering acceptance,

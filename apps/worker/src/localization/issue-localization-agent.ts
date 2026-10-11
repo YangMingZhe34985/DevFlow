@@ -1,6 +1,13 @@
 import type { LanguageModelPort, ModelRequest, ModelResponse } from "@devflow/agent";
 import { DevflowError } from "@devflow/shared";
 import { z } from "zod";
+import type { RepositoryIndexStore } from "@devflow/database";
+import { estimatePlanRequest } from "../runs/plan-agent-context.js";
+import {
+  validateInvestigationResume,
+  type LocalizationInvestigationState,
+  type LocalizationMode,
+} from "./investigation-state.js";
 import { generateStructuredOutput } from "../runs/workflow-structured-output.js";
 import {
   exclusionReason,
@@ -155,6 +162,19 @@ function permitted(path: string): boolean {
 /** Model decisions are grounded by immutable source reads; no repository writes or commands. */
 export class IssueLocalizationAgent {
   async run(input: {
+    mode?: LocalizationMode;
+    /** Run hard ceiling, not a stage allowance; every request still passes the Scheduler. */
+    maxModelCalls?: number;
+    resume?: LocalizationInvestigationState;
+    factStore?: RepositoryIndexStore;
+    investigationView?(): Record<string, unknown>;
+    investigationFrontier?(): NonNullable<LocalizationInvestigationState["frontier"]>;
+    beforeEvidence?(request: {
+      kind: "SEARCH" | "READ";
+      path?: string;
+      estimatedNextInputTokens: number;
+      outputTokens: number;
+    }): Promise<void>;
     title: string;
     description: string;
     repositoryId: string;
@@ -183,6 +203,17 @@ export class IssueLocalizationAgent {
     onRead?(bytes: number): Promise<void>;
     onInspect?(): Promise<void>;
   }): Promise<IssueLocalizationResult> {
+    const mode = input.mode ?? "legacy";
+    const dynamic = mode !== "legacy";
+    const resume = input.resume
+      ? validateInvestigationResume(input.resume, input.source.identity, input.baseCommitSha, mode)
+      : undefined;
+    const maxCalls = dynamic ? (input.maxModelCalls ?? 25) : 4;
+    const maxReads = dynamic ? Number.MAX_SAFE_INTEGER : LOCALIZATION_READ_LIMITS.maxReads;
+    const maxAttempts = dynamic
+      ? Number.MAX_SAFE_INTEGER
+      : LOCALIZATION_READ_LIMITS.maxReadAttempts;
+    const maxSearches = dynamic ? Number.MAX_SAFE_INTEGER : 2;
     const signal = AbortSignal.any([input.signal, AbortSignal.timeout(input.timeoutMs ?? 120_000)]);
     const metrics = {
       modelCalls: 0,
@@ -194,11 +225,12 @@ export class IssueLocalizationAgent {
       readCacheHits: 0,
       meaningfulProgress: 0,
       sourceReads: 0,
+      ...resume?.metrics,
     };
-    const observations: string[] = [];
+    const observations: string[] = [...(resume?.observations ?? [])];
     const catalogue = new Map<string, EvidenceItem>();
-    const anchors = new Set<string>();
-    const latestReads = new Set<string>();
+    const anchors = new Set<string>(resume?.anchors);
+    const latestReads = new Set<string>(resume?.latestReads);
     let displayedEvidence: NonNullable<
       NonNullable<IssueLocalizationResult["evidenceState"]>["displayedEvidence"]
     > = [];
@@ -208,10 +240,70 @@ export class IssueLocalizationAgent {
       sourcePathPriority(item.path, issueSignals) +
       (item.retrievalSource.includes("symbol-navigation") ? 120 : 0) +
       (item.retrievalSource.includes("agent-directed-read") ? 40 : 0);
-    const progressKeys = new Set<string>();
+    const progressKeys = new Set<string>(resume?.progressKeys);
     // Keep observed coverage even when a lower-priority catalogue row is evicted.
     // A different range over the same known source is not fresh implementation evidence.
-    const progressCoverage = new Map<string, [number, number][]>();
+    const progressCoverage = new Map<string, [number, number][]>(resume?.progressCoverage);
+    const seenQueries = new Set<string>(resume?.seenQueries);
+    const seenReads = new Set<string>(resume?.seenReads);
+    let summary = resume?.summary ?? "Localization evidence is inconclusive.";
+    let uncertainty: string[] = [...(resume?.uncertainty ?? [])];
+    let candidates: LocalizationCandidate[] = [...(resume?.candidates ?? [])];
+    let decisions = resume?.decisions ?? 0;
+    let lengthRegenerations = resume?.lengthRegenerations ?? 0;
+    let stalledRounds = resume?.stalledRounds ?? 0;
+    let exitReason = resume?.exitReason ?? "MODEL_FINAL";
+    const pendingReads: NonNullable<
+      NonNullable<IssueLocalizationResult["evidenceState"]>["pendingReads"]
+    > = [...(resume?.pendingReads ?? [])];
+    let implementationEvidence: LocalizationCandidate[] = [
+      ...(resume?.implementationEvidence ?? []),
+    ];
+    let navigationMissing: string[] = [...(resume?.navigationMissing ?? [])];
+    let hypotheses: { explanation: string; query: string }[] = [...(resume?.hypotheses ?? [])];
+    let phase: LocalizationInvestigationState["phase"] = resume?.phase ?? "READY";
+    let actionId: string | null = resume?.actionId ?? null;
+    let graph: RepositoryRelationGraph | undefined;
+    const readCache = new Map<string, { content: string; truncated: boolean }>(resume?.sourceCache);
+    const checkpoint = async (state: Record<string, unknown>) => {
+      const investigation: LocalizationInvestigationState | undefined = dynamic
+        ? {
+            version: "localization-investigation-v1",
+            mode,
+            sourceIdentity: input.source.identity ?? "",
+            baseCommitSha: input.baseCommitSha,
+            phase,
+            actionId,
+            metrics: { ...metrics },
+            evidence: [...catalogue.values()],
+            sourceCache: [...readCache],
+            anchors: [...anchors],
+            latestReads: [...latestReads],
+            progressKeys: [...progressKeys],
+            progressCoverage: [...progressCoverage],
+            seenQueries: [...seenQueries],
+            seenReads: [...seenReads],
+            observations,
+            summary,
+            uncertainty,
+            candidates,
+            implementationEvidence,
+            pendingReads,
+            navigationMissing,
+            decisions,
+            lengthRegenerations,
+            stalledRounds,
+            exitReason,
+            hypotheses,
+            ...(graph ? { graph: graph.snapshot() } : {}),
+            ...(input.investigationFrontier ? { frontier: input.investigationFrontier() } : {}),
+          }
+        : undefined;
+      await input.onCheckpoint?.({
+        ...state,
+        ...(investigation ? { investigation: structuredClone(investigation) } : {}),
+      });
+    };
     const add = (items: EvidenceItem[]) => {
       for (const item of items) {
         if (
@@ -234,7 +326,7 @@ export class IssueLocalizationAgent {
             latestReads.delete(oldId);
           }
         }
-        if (catalogue.size >= 33 && !catalogue.has(id))
+        if (catalogue.size >= (dynamic ? 256 : 33) && !catalogue.has(id))
           throw new DevflowError({
             code: "INSUFFICIENT_EVIDENCE",
             message: "Localization evidence archive exceeds its bounded retrieval/read capacity.",
@@ -245,7 +337,9 @@ export class IssueLocalizationAgent {
           anchors.add(id);
         }
         if (
-          ["IMPLEMENTATION", "ENTRY"].includes(sourceRole(item.path)) &&
+          (dynamic ? ["IMPLEMENTATION", "ENTRY", "TEST"] : ["IMPLEMENTATION", "ENTRY"]).includes(
+            sourceRole(item.path),
+          ) &&
           /^[a-f0-9]{64}$/u.test(item.contentHash)
         ) {
           const sourceKey = `${item.path}:${item.contentHash}`;
@@ -269,7 +363,7 @@ export class IssueLocalizationAgent {
         }
       }
     };
-    add(input.evidence?.evidence ?? []);
+    add(resume?.evidence ?? input.evidence?.evidence ?? []);
     const accountRead = async (bytes: number) => {
       metrics.readBytes += bytes;
       await input.onRead?.(bytes);
@@ -279,7 +373,6 @@ export class IssueLocalizationAgent {
           message: "Localization source byte budget exceeded.",
         });
     };
-    const readCache = new Map<string, { content: string; truncated: boolean }>();
     const immutable =
       !input.source.changes &&
       /^(?:[0-9a-f]{64}|github:[^@]+@[0-9a-f]{40,64}|git:[0-9a-f]{40,64})$/iu.test(
@@ -320,16 +413,19 @@ export class IssueLocalizationAgent {
         return file;
       },
     };
-    const graph = input.buildGraph
+    graph = input.buildGraph
       ? new RepositoryRelationGraph({
           repositoryId: input.repositoryId,
           baseCommitSha: input.baseCommitSha,
           source: observedSource,
           maxReadBytes: 1024 * 1024,
+          prg: mode === "prg",
+          ...(input.factStore ? { factStore: input.factStore } : {}),
+          ...(resume?.graph ? { baseline: resume.graph } : {}),
         })
       : undefined;
     const seeds = [...new Set((input.evidence?.evidence ?? []).map((e) => e.path))];
-    if (graph && seeds.length) {
+    if (graph && seeds.length && !resume) {
       await graph.inspect(seeds.slice(0, 4), signal, false);
       await graph.publicTests(seeds, signal);
     }
@@ -348,9 +444,7 @@ export class IssueLocalizationAgent {
       },
     };
     const issueSymbols = extractIssueSignals(`${input.title}\n${input.description}`).symbols;
-    let implementationEvidence: LocalizationCandidate[] = [];
-    let navigationMissing: string[] = [];
-    if (graph) {
+    if (graph && !resume) {
       const navigation = await navigateImplementation({
         repositoryId: input.repositoryId,
         baseCommitSha: input.baseCommitSha,
@@ -401,16 +495,30 @@ export class IssueLocalizationAgent {
         })),
       );
     }
-    const seenQueries = new Set<string>();
-    const seenReads = new Set<string>();
+    if (!resume) {
+      phase = "READY";
+      actionId = null;
+      await checkpoint({ status: "READY", requestIssued: false });
+    }
     const model: LanguageModelPort = {
       async generate(request: ModelRequest, options) {
         signal.throwIfAborted();
-        const estimated = Math.ceil(
-          Buffer.byteLength(
-            JSON.stringify({ messages: request.messages, schema: z.toJSONSchema(DecisionSchema) }),
-          ) / 3,
-        );
+        request = {
+          ...request,
+          settings: { ...request.settings, maxOutputTokens: input.maxOutputTokens ?? 4096 },
+        };
+        if (input.model.prepareRequest)
+          request = await input.model.prepareRequest(request, options);
+        const estimated = dynamic
+          ? estimatePlanRequest(request).estimatedInputTokens
+          : Math.ceil(
+              Buffer.byteLength(
+                JSON.stringify({
+                  messages: request.messages,
+                  schema: z.toJSONSchema(DecisionSchema),
+                }),
+              ) / 3,
+            );
         const remainingTokens = input.maxTokens - metrics.totalTokens;
         const configuredOutputTokens = input.maxOutputTokens ?? 4096;
         const outputTokens = Math.min(
@@ -419,13 +527,13 @@ export class IssueLocalizationAgent {
         );
         const contextTokens = input.contextTokens ?? 32000;
         if (
-          metrics.modelCalls >= 4 ||
+          metrics.modelCalls >= maxCalls ||
           estimated + outputTokens > contextTokens ||
           estimated + outputTokens > remainingTokens ||
           !Number.isSafeInteger(outputTokens) ||
           outputTokens < 1
         ) {
-          await input.onCheckpoint?.({
+          await checkpoint({
             status: "PREFLIGHT_BLOCKED",
             ...metrics,
             estimatedInputTokens: estimated,
@@ -452,7 +560,9 @@ export class IssueLocalizationAgent {
           });
         }
         metrics.modelCalls++;
-        await input.onCheckpoint?.({
+        phase = "DISPATCH_RESERVED";
+        actionId = `model:${metrics.modelCalls}`;
+        await checkpoint({
           status: "DISPATCH_RESERVED",
           ...metrics,
           reservedTokens: estimated + outputTokens,
@@ -497,7 +607,7 @@ export class IssueLocalizationAgent {
           );
           omittedEvidence = submitted.omittedEvidenceDetails ?? [];
         }
-        await input.onCheckpoint?.({
+        await checkpoint({
           status: "RESPONSE",
           ...metrics,
           displayedEvidence,
@@ -530,16 +640,6 @@ export class IssueLocalizationAgent {
         return response;
       },
     };
-    let summary = "Localization evidence is inconclusive.";
-    let uncertainty: string[] = [];
-    let candidates: LocalizationCandidate[] = [];
-    let decisions = 0;
-    let lengthRegenerations = 0;
-    let stalledRounds = 0;
-    let exitReason = "MODEL_FINAL";
-    const pendingReads: NonNullable<
-      NonNullable<IssueLocalizationResult["evidenceState"]>["pendingReads"]
-    > = [];
     const estimateState = (state: unknown) =>
       Math.ceil(
         Buffer.byteLength(
@@ -552,13 +652,13 @@ export class IssueLocalizationAgent {
           }),
         ) / 3,
       );
-    for (let round = 0; metrics.modelCalls < 4; round++) {
+    for (let round = decisions; metrics.modelCalls < maxCalls && phase !== "STOPPED"; round++) {
       const progressBefore = progressKeys.size;
-      const remainingCalls = 4 - metrics.modelCalls;
+      const remainingCalls = maxCalls - metrics.modelCalls;
       let finalOnly =
         remainingCalls <= 2 ||
         stalledRounds >= 2 ||
-        (metrics.searches >= 2 && metrics.readAttempts >= LOCALIZATION_READ_LIMITS.maxReadAttempts);
+        (metrics.searches >= maxSearches && metrics.readAttempts >= maxAttempts);
       exitReason =
         remainingCalls <= 2
           ? "MODEL_CALL_RESERVE"
@@ -571,22 +671,27 @@ export class IssueLocalizationAgent {
         issue: { title: input.title.slice(0, 1000), description: input.description.slice(0, 8000) },
         round,
         mode: finalOnly ? "FINAL" : "EXPLORE",
-        readLimits: LOCALIZATION_READ_LIMITS,
-        canInspect:
-          !finalOnly &&
-          metrics.reads < LOCALIZATION_READ_LIMITS.maxReads &&
-          metrics.readAttempts < LOCALIZATION_READ_LIMITS.maxReadAttempts,
+        readLimits: dynamic
+          ? {
+              maxLines: LOCALIZATION_READ_LIMITS.maxLines,
+              maxSnippetBytes: LOCALIZATION_READ_LIMITS.maxSnippetBytes,
+              maxFileBytes: LOCALIZATION_READ_LIMITS.maxFileBytes,
+              admission: "SCHEDULER_PER_OPERATION",
+            }
+          : LOCALIZATION_READ_LIMITS,
+        canInspect: !finalOnly && metrics.reads < maxReads && metrics.readAttempts < maxAttempts,
         remaining: {
-          searches: finalOnly ? 0 : 2 - metrics.searches,
-          reads: finalOnly ? 0 : LOCALIZATION_READ_LIMITS.maxReads - metrics.reads,
+          searches: finalOnly ? 0 : Math.min(2 * remainingCalls, maxSearches - metrics.searches),
+          reads: finalOnly ? 0 : Math.min(3 * remainingCalls, maxReads - metrics.reads),
           readAttempts: finalOnly
             ? 0
-            : LOCALIZATION_READ_LIMITS.maxReadAttempts - metrics.readAttempts,
-          rounds: Math.max(0, 3 - metrics.modelCalls),
-          modelCalls: 4 - metrics.modelCalls,
+            : Math.min(3 * remainingCalls, maxAttempts - metrics.readAttempts),
+          rounds: Math.max(0, maxCalls - 1 - metrics.modelCalls),
+          modelCalls: remainingCalls,
           tokens: Math.max(0, input.maxTokens - metrics.totalTokens),
         },
         observations: observations.slice(-8),
+        ...(input.investigationView ? { investigation: input.investigationView() } : {}),
         ...(graph ? { graph: graph.issueView(seeds, [], 4096, issueSymbols) } : {}),
       };
       const rows = [...catalogue]
@@ -649,7 +754,7 @@ export class IssueLocalizationAgent {
           endLine,
           reason: "CONTEXT_BUDGET" as const,
         }));
-        await input.onCheckpoint?.({
+        await checkpoint({
           status: "PREFLIGHT_BLOCKED",
           ...metrics,
           exitReason,
@@ -686,7 +791,7 @@ export class IssueLocalizationAgent {
           endLine,
         }),
       );
-      await input.onCheckpoint?.({
+      await checkpoint({
         status: "PROJECTION",
         ...metrics,
         preparedEvidence,
@@ -769,6 +874,7 @@ export class IssueLocalizationAgent {
           "Localization generation reached LENGTH; one budgeted regeneration used the original evidence with reasoning disabled where supported.",
         );
       const decision = generated.value;
+      hypotheses = decision.hypotheses;
       summary = decision.summary;
       uncertainty = decision.uncertainty;
       candidates = [];
@@ -850,7 +956,7 @@ export class IssueLocalizationAgent {
         (decision.inspect.length || decision.hypotheses.length) &&
         metrics.modelCalls <= 2 &&
         stalledRounds < 2 &&
-        metrics.reads < LOCALIZATION_READ_LIMITS.maxReads &&
+        metrics.reads < maxReads &&
         input.maxTokens - metrics.totalTokens >= finalReserve
       ) {
         finalOnly = false;
@@ -890,8 +996,16 @@ export class IssueLocalizationAgent {
       }
       for (const hypothesis of decision.hypotheses) {
         const query = hypothesis.query.trim();
-        if (metrics.searches >= 2 || seenQueries.has(queryKey(query))) continue;
+        if (metrics.searches >= maxSearches || seenQueries.has(queryKey(query))) continue;
         seenQueries.add(queryKey(query));
+        await input.beforeEvidence?.({
+          kind: "SEARCH",
+          estimatedNextInputTokens: estimatedInput,
+          outputTokens: configuredOutput,
+        });
+        phase = "IO_RESERVED";
+        actionId = `search:${hash(query)}`;
+        await checkpoint({ status: "IO_RESERVED", requestIssued: false });
         await input.onSearch?.();
         metrics.searches++;
         const pack = await input.retrieve(`${input.title}\n${query}`, source, signal);
@@ -912,12 +1026,12 @@ export class IssueLocalizationAgent {
           observations.push(`Rejected read: ${code}: ${path}; ${detail}.`);
           rejected = true;
         };
-        if (metrics.readAttempts >= LOCALIZATION_READ_LIMITS.maxReadAttempts) {
+        if (metrics.readAttempts >= maxAttempts) {
           reject("READ_ATTEMPT_BUDGET", "no validation attempts remain");
           continue;
         }
         metrics.readAttempts++;
-        if (metrics.reads >= LOCALIZATION_READ_LIMITS.maxReads) {
+        if (metrics.reads >= maxReads) {
           reject("READ_IO_BUDGET", "no source reads remain");
           continue;
         }
@@ -953,6 +1067,15 @@ export class IssueLocalizationAgent {
           );
           continue;
         }
+        await input.beforeEvidence?.({
+          kind: "READ",
+          path,
+          estimatedNextInputTokens: estimatedInput,
+          outputTokens: configuredOutput,
+        });
+        phase = "IO_RESERVED";
+        actionId = `read:${key}`;
+        await checkpoint({ status: "IO_RESERVED", requestIssued: false });
         await input.onInspect?.();
         metrics.reads++;
         const file = await source.read(path, signal);
@@ -1040,7 +1163,9 @@ export class IssueLocalizationAgent {
       const progress = Math.max(0, progressKeys.size - progressBefore);
       metrics.meaningfulProgress += progress;
       stalledRounds = progress ? 0 : stalledRounds + 1;
-      await input.onCheckpoint?.({
+      phase = "READY";
+      actionId = null;
+      await checkpoint({
         status: "EVIDENCE",
         ...metrics,
         stalledRounds,
@@ -1066,7 +1191,9 @@ export class IssueLocalizationAgent {
         ...uncertainty,
         "Some proposed evidence was rejected; candidates are only the verified regions listed here.",
       ];
-    await input.onCheckpoint?.({
+    phase = "STOPPED";
+    actionId = null;
+    await checkpoint({
       status: "STOPPED",
       ...metrics,
       stalledRounds,

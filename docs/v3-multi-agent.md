@@ -1,8 +1,8 @@
 # v3.0 持久化动态协作 RFC 与实施记录
 
-状态：开发中，版本保持 2.4.0。基线 `93342f5`，保护分支 `codex/pre-v3-93342f5`，开发分支 `codex/v3-multi-agent`。原始需求见仓库根目录 `DevFlow_v3.0_MultiAgent_Refactor_Brief.md`，原文保留。
+状态：实验实现及本轮免费验收已提交，真实稳定性验收未达标，版本保持 2.4.0。基线 `93342f5`，保护分支 `codex/pre-v3-93342f5`，开发分支 `codex/v3-multi-agent`。原始需求见仓库根目录 `DevFlow_v3.0_MultiAgent_Refactor_Brief.md`，原文保留。两轮 E10 结果及停止原因见 [验收报告](v3-validation.md)。
 
-## 源码审计（2026-10-13）
+## 基线源码审计（2026-10-13，以下描述重构前状态）
 
 生产入口为 API → BullMQ → RunProcessor → ApprovalWorkflowRunExecutor。`packages/workflow` 的 DefaultWorkflowEngine 仍是 NOT_IMPLEMENTED 占位，不能作为新团队执行入口。现有源码包含 PRG、PlanProposal/Approval、统一 CodingSession、宿主公开验证、独立 Review、受控 Replan 和 GitHub 发布审批。
 
@@ -26,7 +26,7 @@ Coordinator 选择 delegate/request_evidence/challenge/cancel/propose_plan/stop�
 
 租约与版本检查在事务中执行。操作预约先持久化，外部调用在事务外，回执与预算结算关联；未知调用不重发、不归零。任务依赖禁止循环，取消传播，陈旧 Worker 不能提交权威结果。Coding 补证时暂停写入，调查结束后恢复；新增路径仍须现有 Replan 核实及新 PLAN Approval。
 
-并发资源相加，确认并行的时间才按关键路径估算；必要下游在 Run 级共享预留一次。预约不是消费。保持 75 逻辑工具、25 步、250000 Token、25 分钟及既有修复/重规划限制。证据恢复与缓存命中如实记录，禁止把未知价格归零。
+并发资源相加，确认并行的时间才按关键路径估算；必要下游在 Run 级共享预留一次。预约不是消费。原方案为 75 逻辑工具、25 步、250000 Token、25 分钟；后续用户授权的新 Run 配置调整为下文的 32 步 / 320000 Token，其他限制不变。证据恢复与缓存命中如实记录，禁止把未知价格归零。
 
 ## 阶段与门槛
 
@@ -64,6 +64,7 @@ E10 中可复现的工程缺陷允许定向修复：冻结失败证据 → 免�
 - Phase 1：新增动态任务板核心及独立 Agent Session；受控测试证明零/单/多调查委派、反证改变另一 Agent 的实际读取、重复探索停止、未知调用恢复阻断及引用校验。3 个相关测试文件 34 PASS；build:core 和新增代码 ESLint PASS。此阶段尚未接入真实 Provider，不代表真实修复能力。
 - Phase 2：新增六张持久化团队表与 Run 租约事务；回执和 Scheduler 结算可原子提交，JSONB 键顺序不影响身份。模型/工具/控制动作完成后崩溃可本地续处理，未知调用不重发。团队与预算定向测试 49 PASS；PostgreSQL/Docker 8 PASS；build:core 与公开文件检查 PASS。生产接入仍待 Phase 3。
 - Phase 3：真实 Worker 接入团队调查、原 Planner 和 PLAN 审批。Coding 的 `locateIssue` 可在原重定位额度内暂停写者、启动只读团队、返回当前证据；不重新授予修改范围。生产 PostgreSQL/Docker 12 PASS，包含团队与 single 两种模式的审批→错误候选→公开 Test 失败→同一 Coding Session 修复→重测→独立 Review。single 延续原 Solver 身份、决策引用和执行模型，所有阶段计入原 Run。租约约束传递到事件、预算和候选 Artifact；陈旧 Worker 写回被拒绝。受控结果证明编排与权限，不证明真实模型修复能力。
+- Phase 4：完整免费验收后冻结两次 E10。R1 发现并发账本竞争和并行时间预留问题，经免费重现后修复；R2 已派发两个独立调查者，但在 Planner 前因下游费用报价停止。最新全仓 1036 PASS / 48 SKIPPED，PostgreSQL/Docker 13 PASS；其余工程、旧生产路径结果及每批身份见验收报告。未达到真实协作影响和严格修复门槛，停止继续迭代，保留实验开关和 2.4.0。
 
 ## 启用、审计与当前边界
 
@@ -108,4 +109,5 @@ flowchart TB
 - Investigator 使用结构化决策表达只读动作，由宿主复用现有检索/图/源码接口执行，无 shell、写入、审批或测试裁决权。模型输出无效或截断时目前明确停止；不猜测修正动作。未知已派发结果阻断恢复，已确认回执可本地续处理。
 - 子 Agent 仍在同一 Run Worker 进程内，不能独立跨进程派发。生产调查的实际并发派发组已接入时间报价：同组未完成操作取最长预留；不同组、后续顺序操作及独立下游预约相加。Token、费用、模型次数和 IO 始终相加。组身份由宿主创建并持久化，模型不能声明自己的操作属于并行组。
 - 同 Run 的 Scheduler 及原子回执适配共享短事务写入队列，避免搜索 IO 扇出饿死另一调查者的 CAS。模型与 IO 本身继续并行，跨 Worker 的数据库 CAS、租约检查及未知消费阻断保留。
+- 当前下游费用报价仍以最高 token 单价计全部预计输入／输出，且终态错误未完整保留被拒绝的报价。这导致 R2 提前费用阻断；团队模式尚不应作为稳定默认路径。最新累计保守费用 ¥157.242531 / ¥200，本轮已停止付费运行。
 - 关闭开关禁止创建新团队；排空或取消在途团队后再回退二进制。旧二进制不能接管未完成团队 Run。保留新增表及历史，禁止以删账本或新建 Agent 重新领取预算。

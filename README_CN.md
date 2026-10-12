@@ -4,6 +4,10 @@
 E05 的 legacy-dynamic 对照被 Planner 输出校验阻断，尚不能单独确认 PRG 的定位增益。
 详见[真实验收报告](docs/prg-validation-20261012.md)和[接入及局限](docs/prg-implementation.md)。未指定模式时继续使用 `legacy`。
 
+可选的 **v3 多 Agent 实验实现**新增持久化任务板、独立只读调查者、证据消息和共享 Run 预算，保留唯一 Coding 写者及原审批。
+团队模式默认关闭，**尚未达到发布门槛**：两次独立冻结的 E10 均在 Planner 前停止，包版本保持 **2.4.0**。
+详见[架构与启用／回退说明](docs/v3-multi-agent.md)和[工程验收、真实结果及剩余阻断](docs/v3-validation.md)。
+
 **2.3.1 基线**的代码编辑与失败修复共用持久化 Coding Session。此前 Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，未达到该批次的 E10 专用升级条件。见[资源调度架构](docs/resource-budget-scheduler.md)、[该批结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
 
 后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），该实验使用包版本 2.3.0。

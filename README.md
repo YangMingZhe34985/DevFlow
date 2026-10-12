@@ -6,6 +6,12 @@ control stopped on Planner output validation, so this comparison does not isolat
 localization benefit. See [the real results](docs/prg-validation-20261012.md) and
 [implementation and limits](docs/prg-implementation.md). The default mode remains `legacy`.
 
+The opt-in **v3 multi-agent experiment** adds persistent tasks, independent read-only investigators,
+evidence messages and shared Run accounting while retaining one Coding writer and existing approvals.
+It remains disabled by default and has **not** met its release gate: two separate frozen E10 attempts
+stopped before Planner. Package version stays **2.4.0**. See [the architecture and rollback guide](docs/v3-multi-agent.md)
+and [engineering checks, real results and remaining blockers](docs/v3-validation.md).
+
 The **2.3.1 baseline** shares one persistent Coding Session for editing and failure repair. The earlier Resource Budget Scheduler batch strictly passed **1/4** cases (E07). E10 dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; that batch did not meet its E10-specific version gate. See [the scheduler architecture](docs/resource-budget-scheduler.md), [its results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
 
 The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. That experiment used package version 2.3.0.

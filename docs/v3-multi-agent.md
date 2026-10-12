@@ -67,6 +67,41 @@ E10 中可复现的工程缺陷允许定向修复：冻结失败证据 → 免�
 
 ## 启用、审计与当前边界
 
+```mermaid
+flowchart TB
+  API[API / CLI] --> Q[BullMQ: Run]
+  Q --> W[租约内 ApprovalWorkflowRunExecutor]
+  W --> CO[Coordinator / 独立上下文]
+  CO <--> TB[持久化 Task Board / Message / Evidence]
+  TB <--> I1[只读 Investigator A]
+  TB <--> I2[只读 Investigator B]
+  CO --> P[原 Planner / PlanProposal]
+  P --> A[PLAN Approval]
+  A --> C[唯一 Unified Coding Session]
+  C --> V[宿主公开验证]
+  V -->|失败诊断| C
+  V -->|通过| R[Independent Review]
+  R -->|确认缺陷| C
+  R -->|批准| D[Diff / 独立发布审批]
+  C -->|暂停写入后补证| CO
+  C -->|范围不足| P
+  W <--> B[同一个 Run Scheduler / CAS Ledger]
+  TB <--> DB[(PostgreSQL / Artifact)]
+  B <--> DB
+```
+
+| 接口边界           | 实现                                                               | 权威与恢复要求                                                          |
+| ------------------ | ------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| 团队决策与任务推进 | `apps/worker/src/team/engine.ts`                                   | 稳定 Agent/操作 ID；模型只提出动作；宿主验证角色、引用、依赖及次数      |
+| 独立请求视图       | `team/context.ts`                                                  | 只投影本 Agent 的任务、收件箱、反证及有效证据；记录实际可见与省略项     |
+| 原能力接入         | `team/workflow-bridge.ts`                                          | 复用检索、PRG、源码读取和阶段模型；下游共享预约；返回原 EvidencePack    |
+| 原子消费           | `team/budget-store.ts`                                             | 同一事务关联团队回执与原 Run 预算 CAS；不能通过 Agent 新增额度          |
+| 持久化与租约       | `packages/database/src/prisma-team-store.ts`、`execution-lease.ts` | 锁 Run 校验 owner/revision/期限/取消；失去租约后禁止写回                |
+| 生产交接           | `approval-workflow-run-executor.ts`                                | 沿用原 Plan、审批、Coding 检查点、验证和 Review；团队不授予写权限       |
+| 对照身份           | `team/solver-session.ts`                                           | single 的规划与 Coding 延续同一 Solver 身份和决策引用；独立 Review 保留 |
+
+操作先持久化，再向外部派发；确认回执与资源结算共同提交。已完成回执在崩溃后本地续处理；已派发但回执未知时保留预约并阻断，不自动再调用。审批等待保留原预算和期限。SharedEvidence 中的完整 SHA、范围和来源仅证明观察身份，不证明修复正确。
+
 - 部署先执行增量 Prisma 迁移；API 和 Worker 设置 `DEVFLOW_TEAM_ENABLED=true`，创建 Run 时指定 `executionMode: "team"`（或受控对照 `single`）。缺少持久化、有效租约或预算账本时明确拒绝。默认 `workflow` 不受影响。
 - Coordinator/Investigator 的 `LLM_COORDINATOR_*` / `LLM_INVESTIGATOR_*` 分别继承 Planner/Localization。single 使用 Execute 模型贯穿求解。非敏感绑定哈希在首次团队初始化冻结，审批恢复时核对；不保存密钥。
 - `/api/v1/runs/:id/team` 返回任务板、消息及证据身份，现有 SSE 的 `WORKFLOW_CHECKPOINT` 带团队版本和状态。完整团队历史、每次实际请求投影保存在 HOST_ONLY Artifact；源码、模型判断和工具错误分别记录。过期任务结果标记非当前，不能作为当前源码事实。

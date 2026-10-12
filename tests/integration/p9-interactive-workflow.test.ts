@@ -87,7 +87,8 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
       DATABASE_URL: databaseUrl,
       REDIS_URL: redisUrl,
       RUN_QUEUE_NAME: queueName,
-      DEVFLOW_TIMEOUT_MS: "60000",
+      // Use the production workflow envelope; individual assertions still time out quickly.
+      DEVFLOW_TIMEOUT_MS: "1500000",
       DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: "60000",
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
@@ -216,6 +217,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
     const runId = page.url().split("/runs/")[1]?.split(/[?#]/u)[0];
     expect(runId).toMatch(/^[0-9a-f-]{36}$/u);
     if (runId === undefined) throw new Error("The browser did not navigate to a Run detail URL.");
+    await waitForRun(runId, "WAITING_APPROVAL");
     await page.getByRole("button", { name: "拒绝并重新规划" }).waitFor({ timeout: 30_000 });
     expect(await database.client.toolCall.count({ where: { runId } })).toBe(0);
     expect(await database.client.event.count({ where: { runId, type: "TEST_STARTED" } })).toBe(0);
@@ -361,6 +363,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
       (failed.result as { error: { details: { workflowCode: string } } }).error.details,
     ).toMatchObject({ workflowCode: "TEST_FAILED" });
     expect(await database.client.event.count({ where: { runId, type: "REPAIR_STARTED" } })).toBe(1);
+    expect(await database.client.event.count({ where: { runId, type: "TEST_STARTED" } })).toBe(2);
     expect(await database.client.event.count({ where: { runId, type: "REVIEW_STARTED" } })).toBe(0);
     expect(reviewerCalls).toBe(1);
   }, 120_000);
@@ -389,6 +392,8 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
     while (Date.now() < deadline) {
       const run = await request("GET", `/runs/${runId}`);
       if (run.status === status) return run;
+      if (["FAILED", "CANCELLED", "SUCCEEDED"].includes(String(run.status)))
+        throw new Error(`Run ended before ${status}: ${JSON.stringify(run)}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error(`Timed out waiting for Run ${runId} to reach ${status}.`);
@@ -484,7 +489,28 @@ function workflowModel(run: RunExecutionRecord, planningPrompts: string[]): Fake
     ],
   });
   if (run.task.title === "Never repairs")
-    return new FakeLanguageModel([badCandidate, fakeModelResponse({ toolCalls: [finish] })]);
+    // A different, still-wrong candidate exercises the repair cap. An unchanged
+    // finish correctly stops earlier under the production no-progress policy.
+    return new FakeLanguageModel([
+      badCandidate,
+      fakeModelResponse({
+        toolCalls: [
+          { id: crypto.randomUUID(), name: "readFile", input: { path: "src/calculator.js" } },
+        ],
+      }),
+      fakeModelResponse({
+        toolCalls: [
+          {
+            id: crypto.randomUUID(),
+            name: "applyPatch",
+            input: {
+              patch: patch(true).replace("+  return left - right;", "+  return left * right;"),
+            },
+          },
+          finish,
+        ],
+      }),
+    ]);
   return new FakeLanguageModel([
     badCandidate,
     fakeModelResponse({

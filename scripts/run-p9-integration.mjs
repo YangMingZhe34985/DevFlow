@@ -38,6 +38,18 @@ const compose = ["compose", "-f", "docker/compose.yml"];
 const npmCli = process.env.npm_execpath;
 if (npmCli === undefined) throw new Error("npm_execpath is required to run the migration.");
 run("docker", ["version"]);
+// Historical experiments may retain their own sandbox for diagnosis.
+const managedContainers = () =>
+  run(
+    "docker",
+    ["ps", "--all", "--filter", "label=devflow.managed=true", "--quiet"],
+    process.env,
+    true,
+  )
+    .trim()
+    .split(/\r?\n/u)
+    .filter(Boolean);
+const initialContainers = new Set(managedContainers());
 const initiallyRunning = new Set(
   run("docker", [...compose, "ps", "--status", "running", "--services"], process.env, true)
     .split(/\r?\n/u)
@@ -119,12 +131,7 @@ try {
   ]);
 }
 
-const residualContainers = run(
-  "docker",
-  ["ps", "--all", "--filter", "label=devflow.managed=true", "--quiet"],
-  process.env,
-  true,
-).trim();
+const residualContainers = managedContainers().filter((id) => !initialContainers.has(id));
 if (startedInfrastructure) run("docker", [...compose, "down"]);
 if (residualContainers.length > 0) {
   throw new Error("P9 integration left DevFlow sandbox containers behind.");

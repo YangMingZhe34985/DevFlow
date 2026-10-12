@@ -91,7 +91,9 @@ integrationDescribe("P11 existing Worker benchmark pipeline", () => {
       DATABASE_URL: databaseUrl,
       REDIS_URL: redisUrl,
       RUN_QUEUE_NAME: queueName,
-      DEVFLOW_TIMEOUT_MS: "30000",
+      // Freeze the workflow envelope independently of the intentional evaluator timeout.
+      // Scheduler reserves configured model/validation deadlines before any dispatch.
+      DEVFLOW_TIMEOUT_MS: "1500000",
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
       DEVFLOW_SANDBOX_NETWORK_ENABLED: "false",
@@ -417,7 +419,7 @@ function benchmarkCase(prepared: PreparedFixture): BenchmarkCase {
       memoryMb: 256,
       pids: 64,
       networkEnabled: false,
-      timeoutMs: 45_000,
+      timeoutMs: 1_500_000,
     },
     rules: {
       acceptedExitCodes: [0],

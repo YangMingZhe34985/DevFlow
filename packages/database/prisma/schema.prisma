@@ -200,10 +200,87 @@ model Run {
   approvals          Approval[]
   githubPublication  GitHubPublication?
   benchmarkExecution BenchmarkCaseExecution?
+  teamState          RunTeamState?
 
   @@index([taskId, createdAt])
   @@index([status, createdAt])
   @@index([status, leaseExpiresAt])
+}
+
+// Team rows are owned by one Run. Every write is fenced by its active execution lease.
+model RunTeamState {
+  runId      String @id @db.Uuid
+  revision   Int
+  state      Json
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+  run        Run @relation(fields: [runId], references: [id], onDelete: Cascade)
+  agents     AgentInstance[]
+  tasks      AgentTask[]
+  messages   AgentMessage[]
+  evidence   SharedEvidence[]
+  operations AgentOperation[]
+}
+
+model AgentInstance {
+  runId     String @db.Uuid
+  id        String
+  role      String
+  status    String
+  value     Json
+  sha256    String
+  team      RunTeamState @relation(fields: [runId], references: [runId], onDelete: Cascade)
+  @@id([runId, id])
+  @@index([runId, status])
+}
+
+model AgentTask {
+  runId     String @db.Uuid
+  id        String
+  agentId   String
+  status    String
+  value     Json
+  sha256    String
+  team      RunTeamState @relation(fields: [runId], references: [runId], onDelete: Cascade)
+  @@id([runId, id])
+  @@index([runId, agentId, status])
+}
+
+model AgentMessage {
+  runId          String @db.Uuid
+  id             String
+  sequence       Int
+  recipient      String
+  idempotencyKey String
+  value          Json
+  sha256         String
+  team           RunTeamState @relation(fields: [runId], references: [runId], onDelete: Cascade)
+  @@id([runId, id])
+  @@unique([runId, idempotencyKey])
+  @@unique([runId, sequence])
+  @@index([runId, recipient, sequence])
+}
+
+model SharedEvidence {
+  runId    String @db.Uuid
+  id       String
+  valid    Boolean
+  value    Json
+  sha256   String
+  team     RunTeamState @relation(fields: [runId], references: [runId], onDelete: Cascade)
+  @@id([runId, id])
+  @@index([runId, valid])
+}
+
+model AgentOperation {
+  runId    String @db.Uuid
+  id       String
+  agentId  String
+  status   String
+  value    Json
+  sha256   String
+  team     RunTeamState @relation(fields: [runId], references: [runId], onDelete: Cascade)
+  @@id([runId, id])
+  @@index([runId, status])
 }
 
 model BenchmarkSuiteExecution {

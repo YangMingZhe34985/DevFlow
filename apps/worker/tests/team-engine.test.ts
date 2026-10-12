@@ -27,6 +27,72 @@ const observation = (path: string): TeamEvidence => ({
 });
 
 describe("dynamic collaboration core", () => {
+  it("resumes saved decisions and action receipts without another model or physical read", async () => {
+    for (const window of ["response", "tool", "control"]) {
+      const store = new InMemoryTeamStore();
+      let calls = 0,
+        reads = 0,
+        crashed = false;
+      const ports = {
+        store,
+        lease,
+        signal: AbortSignal.timeout(5000),
+        decide: async () => {
+          calls++;
+          return result(
+            window === "control"
+              ? [{ type: "PROPOSE_PLAN", evidenceIds: [], missing: [] }]
+              : [
+                  { type: "READ", path: "source.ts", startLine: 1, endLine: 1 },
+                  { type: "PROPOSE_PLAN", evidenceIds: ["source.ts"], missing: [] },
+                ],
+          );
+        },
+        observe: async () => {
+          reads++;
+          return [observation("source.ts")];
+        },
+      };
+      const engine = new TeamEngine({
+        ...ports,
+        onChange: async (s) => {
+          const completed = s.operations.some(
+            (o) =>
+              o.status === "COMPLETED" &&
+              o.kind === (window === "response" ? "MODEL" : window === "tool" ? "TOOL" : "CONTROL"),
+          );
+          if (completed && !crashed) {
+            crashed = true;
+            throw new Error("simulated process exit");
+          }
+        },
+      });
+      await engine.initialize({
+        runId: "run",
+        repositoryId: "repo",
+        sourceIdentity: "base",
+        mode: "single",
+      });
+      await expect(engine.run("run", task, 1)).rejects.toThrow("simulated process exit");
+      const saved = await store.load("run");
+      // A post-commit process death has a durable tool receipt even when caller did not see it.
+      expect(saved?.operations.some((o) => o.status === "UNKNOWN")).toBe(false);
+      const restored = new TeamEngine(ports);
+      await restored.initialize({
+        runId: "run",
+        repositoryId: "repo",
+        sourceIdentity: "base",
+        mode: "single",
+      });
+      const done = await restored.run("run", task, 1);
+      expect(done.status).toBe("READY_FOR_PLAN");
+      expect(calls).toBe(1);
+      expect(reads).toBe(window === "control" ? 0 : 1);
+      expect(done.agents[0]?.history).toHaveLength(1);
+      await restored.run("run", task, 10);
+      expect(calls).toBe(1);
+    }
+  });
   it("delegates different work for different evidence and permits zero investigators", async () => {
     for (const path of ["cache.ts", "loader.ts", "sufficient.ts"]) {
       const store = new InMemoryTeamStore(),

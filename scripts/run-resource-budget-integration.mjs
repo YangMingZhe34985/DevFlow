@@ -60,6 +60,7 @@ try {
       path.resolve("node_modules/vitest/vitest.mjs"),
       "run",
       "tests/integration/resource-budget-postgres.test.ts",
+      "tests/integration/team-postgres.test.ts",
     ],
     env,
   );

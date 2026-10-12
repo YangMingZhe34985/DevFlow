@@ -433,6 +433,8 @@ export interface RunDetailRecord {
 }
 
 export interface DatabaseAdapter extends DatabaseLifecycle {
+  /** Required for team/single modes; never substitute an in-memory store in production. */
+  readonly teams?: import("./team-store.js").TeamStore;
   /** Required by the resource scheduler; optional only for legacy adapters. */
   readonly budgetLedgers?: BudgetLedgerStore;
   /** Immutable, scope-bound localization entries. Optional for legacy/test adapters. */

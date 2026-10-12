@@ -137,14 +137,12 @@ export class ResourceBudgetRuntime {
   async checkContinuation(resources: Partial<ResourceVector>, label: string): Promise<void> {
     const tokens = resources.tokens ?? 0;
     const priced =
-      tokens === 0 || resources.costMicros !== undefined || this.continuationRate !== undefined;
+      tokens === 0 || (resources.costMicros ?? 0) > 0 || this.continuationRate !== undefined;
     await this.check(
       {
         ...operation(label, {
           ...resources,
-          ...(tokens > 0 &&
-          resources.costMicros === undefined &&
-          this.continuationRate !== undefined
+          ...(tokens > 0 && (resources.costMicros ?? 0) === 0 && this.continuationRate !== undefined
             ? { costMicros: Math.ceil((tokens * this.continuationRate) / 1_000_000) }
             : {}),
         }),
@@ -215,6 +213,10 @@ export class ResourceBudgetRuntime {
       price?: ModelResourcePrice;
       /** Conservative bound across all reachable configured stage models. Unknown remains unpriced. */
       continuationMicrosPerMillionTokens?: number;
+      /** Host-owned operation identity; never use an unqualified model tool-call ID. */
+      operationId?: string;
+      /** Team decisions consume the same Run steps; Coding retains its state-store accounting. */
+      decisionSteps?: number;
     },
   ): LanguageModelPort {
     this.continuationRate = options.continuationMicrosPerMillionTokens;
@@ -236,12 +238,13 @@ export class ResourceBudgetRuntime {
             ? (options.recoveryTimeoutMs ?? options.timeoutMs)
             : options.timeoutMs;
         const priced = options.price !== undefined;
-        const id = `llm:${options.stage}:${randomUUID()}`;
+        const id = options.operationId ?? `llm:${options.stage}:${randomUUID()}`;
         const resources = {
           tokens: inputTokens + outputTokens,
           inputTokens,
           outputTokens,
           modelCalls: 1,
+          steps: options.decisionSteps ?? 0,
           timeMs: timeoutMs,
           costMicros: modelCost(options.price, inputTokens, outputTokens),
         };
@@ -250,11 +253,11 @@ export class ResourceBudgetRuntime {
           const futureTokens = continuation.tokens ?? 0;
           const futurePriced =
             futureTokens === 0 ||
-            continuation.costMicros !== undefined ||
+            (continuation.costMicros ?? 0) > 0 ||
             options.continuationMicrosPerMillionTokens !== undefined;
           if (
             futureTokens > 0 &&
-            continuation.costMicros === undefined &&
+            (continuation.costMicros ?? 0) === 0 &&
             options.continuationMicrosPerMillionTokens !== undefined
           )
             continuation.costMicros = Math.ceil(
@@ -299,7 +302,11 @@ export class ResourceBudgetRuntime {
             signal: AbortSignal.any([requestOptions.signal, AbortSignal.timeout(timeoutMs)]),
           });
         } catch (error) {
-          const knownUsage = { modelCalls: 1, timeMs: Math.max(0, Date.now() - started) };
+          const knownUsage = {
+            modelCalls: 1,
+            steps: options.decisionSteps ?? 0,
+            timeMs: Math.max(0, Date.now() - started),
+          };
           if (
             error instanceof DevflowError &&
             typeof error.details === "object" &&
@@ -348,6 +355,7 @@ export class ResourceBudgetRuntime {
           // Providers include reasoning in completion usage; never add it twice.
           outputTokens: response.usage.outputTokens,
           modelCalls: 1,
+          steps: options.decisionSteps ?? 0,
           timeMs: Math.max(0, Date.now() - started),
           costMicros: modelCost(
             options.price,

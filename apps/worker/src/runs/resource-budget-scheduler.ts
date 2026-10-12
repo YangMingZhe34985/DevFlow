@@ -49,6 +49,13 @@ export type ResourceBudgetOperationPlan =
       operations: readonly ResourceBudgetOperationPlan[];
     }
   | {
+      kind: "PARALLEL";
+      id: string;
+      /** Host dispatch group; not an agent claim that sequential operations are parallel. */
+      dispatchGroup: string;
+      operations: readonly ResourceBudgetOperationPlan[];
+    }
+  | {
       kind: "EXCLUSIVE";
       id: string;
       /** The workflow transition that makes these branches mutually exclusive. */
@@ -197,6 +204,37 @@ export class ResourceBudgetScheduler {
 
   async snapshot(): Promise<ResourceBudgetLedger> {
     return (await this.read()).ledger;
+  }
+
+  /** Shares the same Run ledger/limits; used to commit a team receipt atomically with settlement. */
+  withStore(store: BudgetLedgerStore): ResourceBudgetScheduler {
+    return new ResourceBudgetScheduler({ ...this.options, store });
+  }
+
+  /** One mutable, unconsumed downstream hold shared by all investigators. */
+  async replaceHold(
+    operationId: string,
+    plan: ResourceBudgetOperationPlan,
+  ): Promise<ResourceBudgetReservationResult> {
+    identifier(operationId);
+    return this.change<ResourceBudgetReservationResult>((ledger) => {
+      const existing = ledger.reservations[operationId];
+      if (existing && !["RESERVED", "RELEASED"].includes(existing.status))
+        throw conflict("A dispatched operation cannot become a downstream hold.");
+      const candidate = structuredClone(ledger);
+      delete candidate.reservations[operationId];
+      const quote = quoteAgainst(candidate, plan, this.now());
+      if (!quote.fits) return { value: { reserved: false, quote }, changed: false };
+      const reservation: ResourceBudgetReservation = {
+        id: operationId,
+        planDigest: digest(plan),
+        quote,
+        status: "RESERVED",
+        reservedAt: this.now(),
+      };
+      ledger.reservations[operationId] = reservation;
+      return { value: { reserved: true, quote, reservation }, changed: true };
+    });
   }
 
   async quote(plan: ResourceBudgetOperationPlan): Promise<ResourceBudgetQuote> {
@@ -519,6 +557,12 @@ export function estimateOperationPlan(
       return effective;
     }
     if (node.kind === "SEQUENCE") return addResources(...node.operations.map(visit));
+    if (node.kind === "PARALLEL") {
+      if (!node.dispatchGroup.trim() || !node.operations.length)
+        throw invalid("Parallel operations require a host dispatch group.");
+      const branches = node.operations.map(visit);
+      return { ...addResources(...branches), timeMs: Math.max(...branches.map((r) => r.timeMs)) };
+    }
     if (
       node.kind !== "EXCLUSIVE" ||
       node.exclusivityKey.trim().length === 0 ||

@@ -48,6 +48,51 @@ function setup(overrides: Partial<ResourceBudgetSchedulerOptions> = {}) {
 }
 
 describe("resource operation planning", () => {
+  it("counts parallel resource usage additively but quotes the host dispatch critical path", () => {
+    const parallel: ResourceBudgetOperationPlan = {
+      kind: "PARALLEL",
+      id: "investigators",
+      dispatchGroup: "group-1",
+      operations: [
+        operation("a", { tokens: 100, steps: 1, timeMs: 200, costMicros: 12 }),
+        operation("b", { tokens: 250, steps: 1, timeMs: 300, costMicros: 18 }),
+      ],
+    };
+    expect(estimateOperationPlan(parallel).resources).toMatchObject({
+      tokens: 350,
+      steps: 2,
+      timeMs: 300,
+      costMicros: 30,
+    });
+    expect(
+      estimateOperationPlan({ kind: "SEQUENCE", id: "ordered", operations: parallel.operations })
+        .resources.timeMs,
+    ).toBe(500);
+  });
+  it("shares and replaces downstream capacity without charging it or duplicating it per agent", async () => {
+    const scheduler = await setup().open();
+    expect(
+      (await scheduler.replaceHold("downstream", operation("plan-coding-review", { tokens: 300 })))
+        .reserved,
+    ).toBe(true);
+    expect(
+      (await scheduler.replaceHold("downstream", operation("updated-projection", { tokens: 350 })))
+        .reserved,
+    ).toBe(true);
+    const reservations = await Promise.all([
+      scheduler.reserve("a", operation("a", { tokens: 400 })),
+      scheduler.reserve("b", operation("b", { tokens: 400 })),
+    ]);
+    expect(reservations.filter((r) => r.reserved)).toHaveLength(1);
+    expect((await scheduler.snapshot()).consumed.tokens).toBe(0);
+    expect(
+      (await scheduler.replaceHold("downstream", operation("cannot-grow", { tokens: 700 })))
+        .reserved,
+    ).toBe(false);
+    expect((await scheduler.snapshot()).reservations.downstream?.quote.resources.tokens).toBe(350);
+    await scheduler.release("downstream", "Hand off to approved workflow");
+    expect((await scheduler.snapshot()).consumed.tokens).toBe(0);
+  });
   it("adds sequential stages, with one shared downstream envelope for explicitly exclusive branches", () => {
     const plan: ResourceBudgetOperationPlan = {
       kind: "EXCLUSIVE",

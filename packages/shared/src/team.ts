@@ -138,11 +138,14 @@ export interface TeamOperation {
   id: string;
   agentId: string;
   taskId?: string;
-  kind: "MODEL" | "TOOL";
+  kind: "MODEL" | "TOOL" | "CONTROL";
   status: "PREPARED" | "INFLIGHT" | "COMPLETED" | "NOT_ISSUED" | "UNKNOWN";
   input: unknown;
   output?: unknown;
   error?: string;
+  /** Completed model decisions are replayed locally until their effects and history commit. */
+  applied?: boolean;
+  observedBefore?: string[];
 }
 export interface TeamSnapshot {
   version: 1;
@@ -163,4 +166,17 @@ export interface TeamSnapshot {
   missing: string[];
   selectedEvidenceIds: string[];
   modelBindings?: Record<string, unknown>;
+}
+
+/** PostgreSQL JSONB reorders object keys; identities must survive a round trip. */
+export function teamCanonicalJson(value: unknown): string {
+  if (Array.isArray(value))
+    return `[${value.map((entry) => teamCanonicalJson(entry ?? null)).join(",")}]`;
+  if (value !== null && typeof value === "object")
+    return `{${Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${teamCanonicalJson(entry)}`)
+      .join(",")}}`;
+  return JSON.stringify(value) ?? "undefined";
 }

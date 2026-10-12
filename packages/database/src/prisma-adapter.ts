@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { PrismaTeamStore } from "./prisma-team-store.js";
 
 import { PrismaPg } from "@prisma/adapter-pg";
 import type {
@@ -82,6 +83,7 @@ type RunWithTaskAndRepository = Prisma.RunGetPayload<{
 }>;
 
 export class PrismaDatabaseAdapter implements DatabaseAdapter {
+  readonly teams: PrismaTeamStore;
   readonly budgetLedgers: BudgetLedgerStore;
   readonly repositoryIndexes: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
@@ -94,6 +96,7 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   readonly events: EventStore;
 
   constructor(readonly client: PrismaClient) {
+    this.teams = new PrismaTeamStore(client);
     this.budgetLedgers = new PrismaBudgetLedgerStore(client);
     this.repositoryIndexes = {
       get: async (scope, key) => {

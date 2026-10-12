@@ -4,6 +4,7 @@ import {
   DevflowError,
   TeamConfigurationSchema,
   TeamDecisionSchema,
+  teamCanonicalJson,
   type TeamSnapshot,
   type TeamAgent,
   type TeamAction,
@@ -15,7 +16,7 @@ import {
 } from "@devflow/shared";
 
 export const teamDigest = (value: unknown) =>
-  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+  createHash("sha256").update(teamCanonicalJson(value)).digest("hex");
 function fail(message: string): never {
   throw new DevflowError({ code: "CONFLICT", message });
 }
@@ -72,6 +73,11 @@ export class TeamEngine {
         teamDigest(input.modelBindings) !== teamDigest(saved.modelBindings)
       )
         fail("TEAM_MODEL_BINDING_CHANGED");
+      if (
+        input.config &&
+        teamDigest(TeamConfigurationSchema.parse(input.config)) !== teamDigest(saved.config)
+      )
+        fail("TEAM_CONFIGURATION_CHANGED");
       if (saved.operations.some((o) => o.status === "INFLIGHT" || o.status === "UNKNOWN"))
         fail("TEAM_OPERATION_OUTCOME_UNKNOWN");
       return saved;
@@ -103,6 +109,12 @@ export class TeamEngine {
     maxDecisions: number,
   ): Promise<TeamSnapshot> {
     let state = await this.load(runId);
+    // A confirmed receipt is local work, not a new model turn or a renewed quota.
+    for (const op of state.operations.filter(
+      (o) => o.kind === "MODEL" && o.status === "COMPLETED" && !o.applied,
+    ))
+      await this.applyDecision(runId, op);
+    state = await this.load(runId);
     const already = state.agents.reduce((n, a) => n + a.decisionCount, 0);
     let attempts = already;
     while (state.status === "RUNNING" && attempts < maxDecisions) {
@@ -169,7 +181,7 @@ export class TeamEngine {
 
   private async turn(runId: string, agentId: string, task: TeamDecisionView["task"]) {
     this.ports.signal.throwIfAborted();
-    let state = await this.load(runId);
+    const state = await this.load(runId);
     const agent = state.agents.find((a) => a.id === agentId)!;
     if (["CANCELLED", "BLOCKED"].includes(agent.status)) return;
     const assignments = state.tasks.filter(
@@ -210,6 +222,7 @@ export class TeamEngine {
       kind: "MODEL",
       status: "PREPARED",
       input: view,
+      observedBefore: [...agent.observedEvidenceIds],
     };
     await this.change(runId, (s) => {
       if (!s.operations.some((o) => o.id === id)) s.operations.push(operation);
@@ -234,14 +247,9 @@ export class TeamEngine {
       current.status = "RUNNING";
       s.operations.find((o) => o.id === id)!.status = "INFLIGHT";
     });
-    let decision: TeamDecision;
+    let response: unknown;
     try {
-      decision = TeamDecisionSchema.parse(await this.ports.decide(view, operation));
-      await this.change(runId, (s) => {
-        const op = s.operations.find((o) => o.id === id)!;
-        op.status = "COMPLETED";
-        op.output = decision;
-      });
+      response = await this.ports.decide(view, operation);
     } catch (error) {
       const notIssued =
         error instanceof DevflowError &&
@@ -253,21 +261,61 @@ export class TeamEngine {
       });
       throw error;
     }
-    const originalEvidence = new Set(agent.observedEvidenceIds);
+    await this.change(runId, (s) => {
+      const op = s.operations.find((o) => o.id === id)!;
+      op.status = "COMPLETED";
+      op.output = response;
+    });
+    await this.applyDecision(
+      runId,
+      (await this.load(runId)).operations.find((o) => o.id === id)!,
+    );
+  }
+
+  private async applyDecision(runId: string, operation: TeamOperation) {
+    if (operation.applied) return;
+    const parsed = TeamDecisionSchema.safeParse(operation.output);
+    if (!parsed.success) {
+      await this.change(runId, (s) => {
+        const op = s.operations.find((o) => o.id === operation.id)!;
+        op.applied = true;
+        op.error = `TEAM_OUTPUT_INVALID: ${parsed.error.message}`;
+        s.status = "STOPPED";
+        s.stopReason = "MODEL_OUTPUT_INVALID";
+        s.missing = [op.error];
+      });
+      return;
+    }
+    const decision = parsed.data;
+    const view = operation.input as TeamDecisionView;
+    const agentId = operation.agentId;
+    const id = operation.id;
+    const inbox = view.inbox;
+    const originalEvidence = new Set(operation.observedBefore ?? []);
+    let state = await this.load(runId);
     let duplicateOnly = true;
     for (let index = 0; index < decision.actions.length; index++) {
       state = await this.load(runId);
       if (state.status !== "RUNNING") break;
       const action = decision.actions[index]!;
+      const actionId = `${id}:action:${index}`;
       const actionKey = teamDigest({ action, source: state.sourceIdentity });
+      const receipt = state.operations.find((o) => o.id === actionId);
+      if (receipt?.status === "COMPLETED") {
+        duplicateOnly = false;
+        continue;
+      }
       if (state.agents.find((a) => a.id === agentId)!.seenActions.includes(actionKey)) continue;
       duplicateOnly = false;
-      await this.apply(runId, agentId, action, `${id}:action:${index}`, decision.summary);
+      await this.apply(runId, agentId, action, actionId, decision.summary);
       await this.change(runId, (s) => {
         s.agents.find((a) => a.id === agentId)!.seenActions.push(actionKey);
       });
     }
     await this.change(runId, (s) => {
+      const op = s.operations.find((o) => o.id === id)!;
+      if (op.applied) return;
+      op.applied = true;
       const current = s.agents.find((a) => a.id === agentId)!;
       const observed =
         current.role === "INVESTIGATOR"
@@ -280,7 +328,11 @@ export class TeamEngine {
       // History records preserve a bounded view without recursively embedding its own history.
       current.history.push({ input: { ...view, history: undefined }, output: decision });
       if (current.status === "RUNNING") current.status = "READY";
-      if (duplicateOnly || current.noProgress >= 2) {
+      if (
+        (duplicateOnly || current.noProgress >= 2) &&
+        !["COMPLETED", "CANCELLED"].includes(current.status) &&
+        s.status === "RUNNING"
+      ) {
         current.status = "BLOCKED";
         for (const t of s.tasks.filter(
           (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
@@ -306,6 +358,9 @@ export class TeamEngine {
   ) {
     const state = await this.load(runId),
       agent = state.agents.find((a) => a.id === agentId)!;
+    const previous = state.operations.find((o) => o.id === operationId);
+    if (previous?.status === "COMPLETED") return;
+    if (previous) fail("TEAM_OPERATION_OUTCOME_UNKNOWN");
     const manager = agent.role !== "INVESTIGATOR";
     if (["DELEGATE", "CANCEL", "PROPOSE_PLAN", "STOP"].includes(action.type) && !manager)
       fail("TEAM_ROLE_DENIED");
@@ -340,6 +395,13 @@ export class TeamEngine {
           op.output = evidence.map((e) => e.id);
         });
       } catch (error) {
+        // A receipt may already have committed before an audit sink/process failed.
+        // Never turn a confirmed completed operation into unknown consumption.
+        if (
+          (await this.load(runId)).operations.find((o) => o.id === operationId)?.status ===
+          "COMPLETED"
+        )
+          throw error;
         await this.change(runId, (s) => {
           const op = s.operations.find((o) => o.id === operationId)!;
           op.status = "UNKNOWN";
@@ -350,6 +412,7 @@ export class TeamEngine {
       return;
     }
     await this.change(runId, (s) => {
+      if (s.operations.some((o) => o.id === operationId)) return;
       if ("evidenceIds" in action) this.refs(s, action.evidenceIds);
       switch (action.type) {
         case "DELEGATE": {
@@ -450,6 +513,13 @@ export class TeamEngine {
           s.missing = action.missing;
           break;
       }
+      s.operations.push({
+        id: operationId,
+        agentId,
+        kind: "CONTROL",
+        status: "COMPLETED",
+        input: action,
+      });
     });
   }
 

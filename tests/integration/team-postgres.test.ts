@@ -92,13 +92,37 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           resources: { tokens: 600, steps: 1 },
         });
         await scoped.admit(op.id);
-        await scoped.settle(op.id, { tokens: 500, steps: 1 });
+        // Frozen E10 shape: one Investigator settles while a search in a sibling
+        // fans out into index/source operations on the very same Run ledger.
+        await Promise.all([
+          scoped.settle(op.id, { tokens: 500, steps: 1 }),
+          ...Array.from({ length: 48 }, async (_, index) => {
+            const id = `index-read-${index}`;
+            expect(
+              (
+                await scheduler.reserve(id, {
+                  kind: "OPERATION",
+                  id,
+                  requirement: "REQUIRED",
+                  state: "PENDING",
+                  resources: { ioReads: 1 },
+                })
+              ).reserved,
+            ).toBe(true);
+            expect((await scheduler.admit(id)).admitted).toBe(true);
+            await scheduler.settle(id, { ioReads: 1 });
+          }),
+        ]);
         await scoped.settle(op.id, { tokens: 500, steps: 1 });
         expect((await b.teams.load(state.runId))?.operations[0]).toMatchObject({
           status: "COMPLETED",
           output: { observation: "counterexample" },
         });
-        expect((await scheduler.snapshot()).consumed).toMatchObject({ tokens: 500, steps: 1 });
+        expect((await scheduler.snapshot()).consumed).toMatchObject({
+          tokens: 500,
+          steps: 1,
+          ioReads: 48,
+        });
         await b.client.run.update({
           where: { id: state.runId },
           data: { cancelRequestedAt: new Date() },

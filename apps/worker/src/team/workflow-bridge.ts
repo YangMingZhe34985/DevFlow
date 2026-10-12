@@ -272,6 +272,7 @@ export async function investigateWithTeam(input: {
     store,
     lease,
     signal,
+    parallelInvestigators: (group, execute) => runtime.scheduler.parallelDispatch(group, execute),
     beforeDecision: reserveDownstream,
     decide: async (view, operation) => {
       const role = view.role === "INVESTIGATOR" ? "INVESTIGATOR" : "COORDINATOR",

@@ -48,6 +48,79 @@ function setup(overrides: Partial<ResourceBudgetSchedulerOptions> = {}) {
 }
 
 describe("resource operation planning", () => {
+  it("preserves downstream time and adds costs while quoting the actual investigator dispatch group", async () => {
+    const fixture = setup({
+      limits: { tokens: 1000, costMicros: 1000, timeMs: 1500000 },
+      deadlineAt: 1501000,
+    });
+    const scheduler = await fixture.open();
+    const request = (id: string) => operation(id, { timeMs: 180000, tokens: 100, costMicros: 100 });
+    await scheduler.replaceHold("downstream", operation("validation-review", { timeMs: 1260000 }));
+    await scheduler.parallelDispatch("host-wave-1", async () => {
+      const sibling = scheduler.withStore(fixture.store);
+      expect((await scheduler.reserve("a", request("a"))).reserved).toBe(true);
+      expect((await scheduler.admit("a")).admitted).toBe(true);
+      expect((await sibling.reserve("b", request("b"))).reserved).toBe(true);
+      expect((await sibling.admit("b")).admitted).toBe(true);
+      // Same group does not turn a future sequential plan into parallel work.
+      expect(
+        (
+          await sibling.quote({
+            kind: "SEQUENCE",
+            id: "sequential",
+            operations: [request("c"), request("d")],
+          })
+        ).fits,
+      ).toBe(false);
+      expect((await sibling.quote(operation("cost", { costMicros: 801 }))).fits).toBe(false);
+      await scheduler.reserve("io", operation("io", { timeMs: 30000, ioReads: 1 }));
+      await scheduler.admit("io");
+      await scheduler.settle("io", { timeMs: 1, ioReads: 1 });
+      await scheduler.settle("a", { tokens: 80, costMicros: 80, timeMs: 8000 });
+      expect((await scheduler.snapshot()).violations).toEqual([]);
+    });
+    expect((await scheduler.quote(request("outside"))).fits).toBe(false);
+    const resumed = await fixture.open();
+    expect((await resumed.quote(request("resumed-outside"))).fits).toBe(false);
+    expect((await resumed.snapshot()).reservations.b?.quote.dispatchGroup).toBe("host-wave-1");
+    await resumed.settle("b", { tokens: 90, costMicros: 90, timeMs: 9000 });
+    expect((await resumed.snapshot()).consumed).toMatchObject({
+      tokens: 170,
+      costMicros: 170,
+      ioReads: 1,
+    });
+    expect((await resumed.snapshot()).reservations.downstream?.quote.dispatchGroup).toBeUndefined();
+    fixture.setTime(250001);
+    expect((await resumed.quote(operation("past-preserved-time", { timeMs: 1 }))).fits).toBe(false);
+  });
+
+  it("serializes sibling ledger mutations while admitting concurrent physical IO exactly once", async () => {
+    const fixture = setup();
+    const scheduler = await fixture.open();
+    // A search can fan out into many index/source operations while a sibling
+    // Investigator persists its own model receipt through a scoped store.
+    const sibling = scheduler.withStore({
+      get: fixture.store.get.bind(fixture.store),
+      compareAndSwap: fixture.store.compareAndSwap.bind(fixture.store),
+    });
+    let dispatched = 0;
+    await Promise.all(
+      Array.from({ length: 48 }, async (_, index) => {
+        const owner = index % 2 === 0 ? scheduler : sibling;
+        const id = `source-${index}`;
+        expect((await owner.reserve(id, operation(id, { ioReads: 1 }))).reserved).toBe(true);
+        expect((await owner.admit(id)).admitted).toBe(true);
+        dispatched++;
+        await owner.settle(id, { ioReads: 1 });
+      }),
+    );
+    const state = await scheduler.snapshot();
+    expect(dispatched).toBe(48);
+    expect(state.consumed.ioReads).toBe(48);
+    expect(Object.values(state.reservations).every((r) => r.status === "SETTLED")).toBe(true);
+    expect(state.violations).toEqual([]);
+  });
+
   it("counts parallel resource usage additively but quotes the host dispatch critical path", () => {
     const parallel: ResourceBudgetOperationPlan = {
       kind: "PARALLEL",

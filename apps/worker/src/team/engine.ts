@@ -54,6 +54,8 @@ export interface TeamEnginePorts {
     operation: TeamOperation,
   ): Promise<TeamEvidence[]>;
   beforeDecision?(view: TeamDecisionView, operation: TeamOperation): Promise<void>;
+  /** Host verifies the immutable read-only dispatch group; this is not an Agent option. */
+  parallelInvestigators?(group: string, execute: () => Promise<void>): Promise<void>;
   onChange?(snapshot: TeamSnapshot): Promise<void>;
 }
 
@@ -202,23 +204,28 @@ export class TeamEngine {
         Math.min(state.config.concurrency, maxDecisions - attempts),
       );
       // Every selected task shares the same immutable view; no Coding writer is running here.
-      const outcomes = await Promise.allSettled(
-        selected.map(async (a) => {
-          while (attempts < maxDecisions) {
-            const current = await this.load(runId);
-            if (
-              current.status !== "RUNNING" ||
-              current.agents.find((row) => row.id === a.id)?.status !== "READY"
-            )
-              break;
-            // Synchronous allocation before await prevents parallel siblings using the same remaining slot.
-            if (attempts >= maxDecisions) break;
-            attempts++;
-            await this.turn(runId, a.id, task);
-          }
-        }),
-      );
-      for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+      const dispatch = async () => {
+        const outcomes = await Promise.allSettled(
+          selected.map(async (a) => {
+            while (attempts < maxDecisions) {
+              const current = await this.load(runId);
+              if (
+                current.status !== "RUNNING" ||
+                current.agents.find((row) => row.id === a.id)?.status !== "READY"
+              )
+                break;
+              // Synchronous allocation before await prevents parallel siblings using the same remaining slot.
+              if (attempts >= maxDecisions) break;
+              attempts++;
+              await this.turn(runId, a.id, task);
+            }
+          }),
+        );
+        for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+      };
+      if (this.ports.parallelInvestigators && selected.length)
+        await this.ports.parallelInvestigators(`team:${runId}:wave:${state.revision}`, dispatch);
+      else await dispatch();
       await this.change(runId, (s) => {
         for (const t of s.tasks)
           if (

@@ -34,9 +34,14 @@ export function recordStageAttempt(metrics: RunMetrics, stage: RunMetricStage): 
 }
 
 /** Records one logical model decision against the run-wide step budget. */
-export function recordStageStep(metrics: RunMetrics, stage: RunMetricStage, count = 1): void {
+export function recordStageStep(
+  metrics: RunMetrics,
+  stage: RunMetricStage,
+  count = 1,
+  alreadyAccounted = false,
+): void {
   const steps = nonnegativeInteger(count);
-  recordDecisionResourceWork(steps);
+  if (!alreadyAccounted) recordDecisionResourceWork(steps);
   metrics.steps += steps;
   stageMetrics(metrics, stage).steps += steps;
   syncBudgetStageSteps(metrics);

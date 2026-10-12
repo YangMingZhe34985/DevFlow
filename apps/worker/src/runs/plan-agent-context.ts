@@ -116,6 +116,7 @@ export interface PlanHostState {
 }
 
 export interface PlanContextInput {
+  priorSolverSession?: unknown;
   title: string;
   description: string;
   hostConstraints?: readonly string[];
@@ -337,6 +338,7 @@ export function planContextText(
   observations: readonly string[],
 ): string {
   return JSON.stringify({
+    ...(input.priorSolverSession ? { priorSolverSession: input.priorSolverSession } : {}),
     hostState: {
       ...host,
       // Protected host paths can identify hidden evaluation material. Never disclose them.

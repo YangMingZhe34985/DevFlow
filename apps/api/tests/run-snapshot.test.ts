@@ -122,7 +122,11 @@ describe("Run creation LOCAL snapshot", () => {
     ).resolves.toMatchObject({ created: false, run: { id: run.id } });
 
     expect(findByIdempotencyKey).toHaveBeenCalledWith("stable-idempotency-key");
-    expect(create).toHaveBeenCalledWith({ taskId, idempotencyKey: "stable-idempotency-key" });
+    expect(create).toHaveBeenCalledWith({
+      taskId,
+      idempotencyKey: "stable-idempotency-key",
+      maxSteps: run.maxSteps,
+    });
     expect(database.tasks.findById).not.toHaveBeenCalled();
     expect(queue.enqueue).toHaveBeenCalledTimes(1);
   });

@@ -98,6 +98,7 @@ export class QueuedRunWorkerEvaluationGateway implements ExistingRunWorkerGatewa
           : undefined;
       const persisted = await this.database.runs.create({
         localizationMode: profile.runtime.configuration.localizationMode ?? "legacy",
+        executionMode: profile.runtime.configuration.executionMode ?? "workflow",
         taskId: task.id,
         idempotencyKey: `benchmark:${request.agent.executionId}`,
         modelProvider: profile.model.provider,
@@ -236,6 +237,7 @@ function verifiedTerminalObservation(run: RunRecord, input: unknown): Evaluation
 
 function assertRuntimeConfigurationApplied(
   configuration: {
+    executionMode?: "workflow" | "team" | "single" | undefined;
     localizationMode?: "legacy" | "legacy-dynamic" | "prg" | undefined;
     maxSteps?: number | undefined;
     maxTestRetries?: number | undefined;
@@ -244,6 +246,7 @@ function assertRuntimeConfigurationApplied(
   run: RunRecord,
 ): void {
   const checks = [
+    ["executionMode", configuration.executionMode, run.executionMode ?? "workflow"],
     ["localizationMode", configuration.localizationMode, run.localizationMode ?? "legacy"],
     ["maxSteps", configuration.maxSteps, run.maxSteps],
     ["maxTestRetries", configuration.maxTestRetries, run.maxTestRetries],

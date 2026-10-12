@@ -19,6 +19,21 @@ const env = {
   LLM_PROVIDER_NAME: "bailian",
 };
 describe("stage model bindings", () => {
+  it("inherits Coordinator and Investigator settings without leaking credentials into bindings", () => {
+    const configured = loadWorkerEnvironment({
+      ...env,
+      LLM_PLANNER_MODEL: "plan",
+      LLM_PLANNER_MAX_OUTPUT_TOKENS: "8192",
+      LLM_PLANNER_CONTEXT_TOKENS: "32000",
+      LLM_LOCALIZATION_MODEL: "locate",
+      LLM_INVESTIGATOR_MODEL: "investigator",
+    });
+    const coordinator = resolveStageModel("COORDINATOR", configured);
+    expect(coordinator.provenance.model).toBe("plan");
+    expect(coordinator.settings.maxOutputTokens).toBe(8192);
+    expect(resolveStageModel("INVESTIGATOR", configured).provenance.model).toBe("investigator");
+    expect(JSON.stringify(coordinator.provenance)).not.toContain(env.LLM_API_KEY);
+  });
   it.each(["REVIEW", "REPAIR"] as const)(
     "forwards the public %s configuration to HTTP without a smaller internal output cap",
     async (stage) => {

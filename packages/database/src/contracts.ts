@@ -8,7 +8,10 @@ import type {
   RunStatus,
   TaskStatus,
   WorkflowStage,
+  TeamConfiguration,
+  TeamLease,
 } from "@devflow/shared";
+import type { TeamStore } from "./team-store.js";
 import type {
   GitHubPublicationRecord,
   GitHubPublicationStore,
@@ -100,6 +103,8 @@ export interface TaskStore {
 }
 
 export interface RunRecord {
+  executionMode?: "workflow" | "team" | "single";
+  teamConfiguration?: TeamConfiguration;
   localizationMode?: "legacy" | "legacy-dynamic" | "prg";
   id: RunId;
   taskId: string;
@@ -129,6 +134,8 @@ export interface RunExecutionRecord extends RunRecord {
 }
 
 export interface CreateRunInput {
+  executionMode?: "workflow" | "team" | "single" | undefined;
+  teamConfiguration?: TeamConfiguration | undefined;
   localizationMode?: "legacy" | "legacy-dynamic" | "prg" | undefined;
   taskId: string;
   idempotencyKey?: string | undefined;
@@ -320,6 +327,7 @@ export interface BudgetLedgerRecord {
 }
 
 export interface BudgetLedgerStore {
+  forLease?(lease: TeamLease): BudgetLedgerStore;
   get(runId: RunId): Promise<BudgetLedgerRecord | null>;
   /** null creates revision 0; an existing revision may only advance by one. */
   compareAndSwap(runId: RunId, expectedRevision: number | null, value: unknown): Promise<boolean>;
@@ -434,7 +442,7 @@ export interface RunDetailRecord {
 
 export interface DatabaseAdapter extends DatabaseLifecycle {
   /** Required for team/single modes; never substitute an in-memory store in production. */
-  readonly teams?: import("./team-store.js").TeamStore;
+  readonly teams?: TeamStore;
   /** Required by the resource scheduler; optional only for legacy adapters. */
   readonly budgetLedgers?: BudgetLedgerStore;
   /** Immutable, scope-bound localization entries. Optional for legacy/test adapters. */
@@ -455,7 +463,7 @@ export interface RepositoryIndexStore {
 }
 
 export interface AtomicEventWriter extends EventSink {
-  append(event: NewAgentEvent): Promise<AgentEvent>;
+  append(event: NewAgentEvent, lease?: TeamLease): Promise<AgentEvent>;
 }
 
 export interface EventQuery {

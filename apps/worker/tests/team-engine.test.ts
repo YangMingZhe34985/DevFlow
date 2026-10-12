@@ -27,6 +27,71 @@ const observation = (path: string): TeamEvidence => ({
 });
 
 describe("dynamic collaboration core", () => {
+  it("reopens a changed Coding view without reviving old evidence or renewing decisions", async () => {
+    const store = new InMemoryTeamStore();
+    let count = 0;
+    const engine = new TeamEngine({
+      store,
+      lease,
+      signal: AbortSignal.timeout(5000),
+      decide: async (view) => {
+        count++;
+        return result([
+          { type: "PROPOSE_PLAN", evidenceIds: view.evidence.map((e) => e.id), missing: [] },
+        ]);
+      },
+      observe: async () => [],
+    });
+    await engine.initialize({
+      runId: "run",
+      repositoryId: "repo",
+      sourceIdentity: "base",
+      mode: "team",
+      evidence: [observation("old.ts")],
+    });
+    await engine.run("run", task, 8);
+    const next = { ...observation("current.ts"), sourceIdentity: "candidate" };
+    const feedback = {
+      id: "validation-1",
+      origin: "VALIDATION" as const,
+      description: "Public test still fails after an approved edit",
+    };
+    await engine.reopen("run", "candidate", [next], feedback);
+    const reopened = (await store.load("run"))!;
+    expect(reopened.evidence.find((e) => e.id === "old.ts")?.valid).toBe(false);
+    expect(reopened.agents[0]!.decisionCount).toBe(1);
+    await engine.run("run", task, 8);
+    await engine.reopen("run", "candidate", [next], feedback);
+    await engine.run("run", task, 8);
+    expect(count).toBe(2);
+    expect((await store.load("run"))!.viewTransitions).toHaveLength(1);
+    await expect(engine.reopen("run", "another", [], feedback)).rejects.toThrow(
+      "TEAM_FEEDBACK_SOURCE_CHANGED",
+    );
+  });
+
+  it("does not count varied tool errors as source progress and preserves their receipts", async () => {
+    const store = new InMemoryTeamStore();
+    let calls = 0;
+    const engine = new TeamEngine({
+      store,
+      lease,
+      signal: AbortSignal.timeout(5000),
+      decide: async () =>
+        result([{ type: "READ", path: `${++calls}.ts`, startLine: 1, endLine: 1 }]),
+      observe: async (a) => [{ ...observation(JSON.stringify(a)), kind: "TOOL_ERROR" }],
+    });
+    await engine.initialize({
+      runId: "run",
+      repositoryId: "repo",
+      sourceIdentity: "base",
+      mode: "single",
+    });
+    const stopped = await engine.run("run", task, 8);
+    expect(calls).toBe(2);
+    expect(stopped.stopReason).toBe("STALLED");
+    expect(stopped.operations.filter((o) => o.kind === "TOOL")).toHaveLength(2);
+  });
   it("resumes saved decisions and action receipts without another model or physical read", async () => {
     for (const window of ["response", "tool", "control"]) {
       const store = new InMemoryTeamStore();

@@ -63,3 +63,13 @@ E10 中可复现的工程缺陷允许定向修复：冻结失败证据 → 免�
 - Phase 0：基线审计完成；后续验收待执行。
 - Phase 1：新增动态任务板核心及独立 Agent Session；受控测试证明零/单/多调查委派、反证改变另一 Agent 的实际读取、重复探索停止、未知调用恢复阻断及引用校验。3 个相关测试文件 34 PASS；build:core 和新增代码 ESLint PASS。此阶段尚未接入真实 Provider，不代表真实修复能力。
 - Phase 2：新增六张持久化团队表与 Run 租约事务；回执和 Scheduler 结算可原子提交，JSONB 键顺序不影响身份。模型/工具/控制动作完成后崩溃可本地续处理，未知调用不重发。团队与预算定向测试 49 PASS；PostgreSQL/Docker 8 PASS；build:core 与公开文件检查 PASS。生产接入仍待 Phase 3。
+- Phase 3：真实 Worker 接入团队调查、原 Planner 和 PLAN 审批。Coding 的 `locateIssue` 可在原重定位额度内暂停写者、启动只读团队、返回当前证据；不重新授予修改范围。生产 PostgreSQL/Docker 12 PASS，包含团队与 single 两种模式的审批→错误候选→公开 Test 失败→同一 Coding Session 修复→重测→独立 Review。single 延续原 Solver 身份、决策引用和执行模型，所有阶段计入原 Run。租约约束传递到事件、预算和候选 Artifact；陈旧 Worker 写回被拒绝。受控结果证明编排与权限，不证明真实模型修复能力。
+
+## 启用、审计与当前边界
+
+- 部署先执行增量 Prisma 迁移；API 和 Worker 设置 `DEVFLOW_TEAM_ENABLED=true`，创建 Run 时指定 `executionMode: "team"`（或受控对照 `single`）。缺少持久化、有效租约或预算账本时明确拒绝。默认 `workflow` 不受影响。
+- Coordinator/Investigator 的 `LLM_COORDINATOR_*` / `LLM_INVESTIGATOR_*` 分别继承 Planner/Localization。single 使用 Execute 模型贯穿求解。非敏感绑定哈希在首次团队初始化冻结，审批恢复时核对；不保存密钥。
+- `/api/v1/runs/:id/team` 返回任务板、消息及证据身份，现有 SSE 的 `WORKFLOW_CHECKPOINT` 带团队版本和状态。完整团队历史、每次实际请求投影保存在 HOST_ONLY Artifact；源码、模型判断和工具错误分别记录。过期任务结果标记非当前，不能作为当前源码事实。
+- Investigator 使用结构化决策表达只读动作，由宿主复用现有检索/图/源码接口执行，无 shell、写入、审批或测试裁决权。模型输出无效或截断时目前明确停止；不猜测修正动作。未知已派发结果阻断恢复，已确认回执可本地续处理。
+- 子 Agent 仍在同一 Run Worker 进程内，不能独立跨进程派发。内部 PARALLEL 报价支持已确认并行关键路径；生产独立子请求预约时间目前保守相加，尚不宣称最优并发利用率。
+- 关闭开关禁止创建新团队；排空或取消在途团队后再回退二进制。旧二进制不能接管未完成团队 Run。保留新增表及历史，禁止以删账本或新建 Agent 重新领取预算。

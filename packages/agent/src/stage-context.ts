@@ -3,7 +3,8 @@ import { DevflowError } from "@devflow/shared";
 import type { ModelMessage } from "./model.js";
 import { deduplicateContext, invalidateHistoricalReads } from "./working-set.js";
 
-export type ContextStage = "LOCALIZATION" | "PLANNER" | "EXECUTE" | "REPAIR" | "REVIEW";
+export type ContextStage =
+  "LOCALIZATION" | "PLANNER" | "EXECUTE" | "REPAIR" | "REVIEW" | "COORDINATOR" | "INVESTIGATOR";
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 const bytes = (v: unknown) => Buffer.byteLength(JSON.stringify(v));
 

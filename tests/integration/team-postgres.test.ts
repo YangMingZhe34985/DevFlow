@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { PrismaDatabaseAdapter } from "@devflow/database";
+import { PrismaDatabaseAdapter, databaseExecutionLease } from "@devflow/database";
 import type { TeamLease, TeamSnapshot } from "@devflow/shared";
 import { describe, expect, it } from "vitest";
 import { TeamEngine } from "../../apps/worker/src/team/engine.js";
@@ -12,6 +12,38 @@ import {
 describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
   "durable team transactions",
   () => {
+    it("fences inherited Coding artifacts and events after lease loss", async () =>
+      fixture(async (a, b, state, lease) => {
+        await databaseExecutionLease.run({ ...lease, runId: state.runId }, async () => {
+          await a.artifacts.create({
+            runId: state.runId,
+            kind: "OTHER",
+            name: "current",
+            content: "current",
+          });
+          await b.client.run.update({
+            where: { id: state.runId },
+            data: { executionOwner: "new-owner" },
+          });
+          await expect(
+            a.artifacts.create({
+              runId: state.runId,
+              kind: "OTHER",
+              name: "stale",
+              content: "stale",
+            }),
+          ).rejects.toMatchObject({ code: "CONFLICT" });
+          await expect(
+            a.events.append({
+              runId: state.runId,
+              type: "WORKFLOW_CHECKPOINT",
+              occurredAt: new Date().toISOString(),
+              payload: {},
+            }),
+          ).rejects.toMatchObject({ code: "CONFLICT" });
+          expect((await a.artifacts.list(state.runId)).map((r) => r.name)).toEqual(["current"]);
+        });
+      }));
     it("uses the real scheduler to atomically publish a result and settle its original Run reservation", async () =>
       fixture(async (a, b, state, lease) => {
         const scheduler = await ResourceBudgetScheduler.open({

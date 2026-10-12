@@ -26,12 +26,15 @@ import {
   resolveLocalFilesystemPath,
 } from "@devflow/sandbox";
 import type { RunQueuePort } from "@devflow/shared";
+import { ExecutionModeSchema, TeamConfigurationSchema, DevflowError } from "@devflow/shared";
 
 import { IdSchema, requiredRecord } from "../../common/validation.js";
 import { DATABASE, RUN_QUEUE } from "../../infrastructure/tokens.js";
 import { RunEventStreamService } from "./run-event-stream.service.js";
 
 const CreateRunSchema = z.strictObject({
+  executionMode: ExecutionModeSchema.optional(),
+  teamConfiguration: TeamConfigurationSchema.optional(),
   localizationMode: z.enum(["legacy", "legacy-dynamic", "prg"]).optional(),
   taskId: IdSchema,
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
@@ -69,6 +72,15 @@ export class RunsController {
   @Post()
   async create(@Body() body: unknown) {
     const input = CreateRunSchema.parse(body);
+    if (
+      input.executionMode &&
+      input.executionMode !== "workflow" &&
+      process.env.DEVFLOW_TEAM_ENABLED !== "true"
+    )
+      throw new DevflowError({
+        code: "VALIDATION_ERROR",
+        message: "Dynamic collaboration is disabled by the host.",
+      });
     const existing =
       input.idempotencyKey === undefined
         ? null
@@ -82,6 +94,15 @@ export class RunsController {
         : undefined;
     const persisted = await this.database.runs.create({
       ...input,
+      maxSteps:
+        input.maxSteps ??
+        existing?.maxSteps ??
+        z.coerce
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .parse(process.env.DEVFLOW_MAX_STEPS ?? 25),
       ...(initialArtifact === undefined ? {} : { initialArtifact }),
     });
     if (persisted.run.status === "QUEUED") {
@@ -140,6 +161,45 @@ export class RunsController {
   async detail(@Param("id") rawId: string) {
     const id = IdSchema.parse(rawId);
     return requiredRecord(await this.database.runs.findDetail(id), "Run", id);
+  }
+
+  @Get(":id/team")
+  async team(@Param("id") rawId: string) {
+    const id = IdSchema.parse(rawId);
+    await this.requireRun(id);
+    const state = await this.database.teams?.load(id);
+    if (!state) return { team: null };
+    // Private prompts/full source stay in host artifacts, not the task-board API.
+    return {
+      team: {
+        runId: id,
+        revision: state.revision,
+        status: state.status,
+        mode: state.mode,
+        stopReason: state.stopReason,
+        agents: state.agents.map(({ id, role, status, decisionCount, inboxCursor, sessionId }) => ({
+          id,
+          role,
+          status,
+          decisionCount,
+          inboxCursor,
+          sessionId,
+        })),
+        tasks: state.tasks,
+        messages: state.messages,
+        evidence: state.evidence.map(({ content, ...reference }) => ({
+          ...reference,
+          contentBytes: Buffer.byteLength(content),
+        })),
+        operations: state.operations.map(({ id, agentId, kind, status, error }) => ({
+          id,
+          agentId,
+          kind,
+          status,
+          error,
+        })),
+      },
+    };
   }
 
   @Get(":id")

@@ -56,13 +56,37 @@ export function localizationLease(input: {
     includeRepair: false,
     reviewRecoveryAvailable: true,
   });
+  // Stage views differ: Planner consumes retrieval records; Coding receives source/plan;
+  // format repair consumes the bounded previous answer/schema, not another full repository pack.
+  const stageInput = (id: string) => {
+    if (id === "planner:existing-recovery") return input.outputs.planner + growthAllowance;
+    if (id.startsWith("coding:"))
+      return (
+        estimateModelInput(
+          [
+            {
+              role: "USER",
+              content: JSON.stringify({
+                task: { title: input.title, description: input.description },
+                currentSource: source,
+                publicDiagnostics: id.endsWith("failure-decision")
+                  ? "Pending public validation diagnostics"
+                  : undefined,
+              }),
+            },
+          ],
+          [],
+        ) + growthAllowance
+      );
+    return requestInput;
+  };
   const request = (id: string, outputTokens: number): ResourceBudgetOperationPlan => ({
     kind: "OPERATION",
     id,
     requirement: "REQUIRED",
     state: "PENDING",
     resources: {
-      inputTokens: requestInput,
+      inputTokens: stageInput(id),
       outputTokens,
       modelCalls: 1,
       steps: 1,

@@ -40,12 +40,7 @@ export class PrismaTeamStore implements TeamStore {
     return this.client.$transaction(
       async (tx) => {
         // A DB clock prevents a paused/stale worker's local clock from reviving a lease.
-        const owners = await tx.$queryRaw<{ id: string }[]>`
-        SELECT "id" FROM "Run" WHERE "id" = ${runId}::uuid
-          AND "executionOwner" = ${lease.owner} AND "dispatchRevision" = ${lease.dispatchRevision}
-          AND "status" = 'RUNNING' AND "cancelRequestedAt" IS NULL
-          AND "leaseExpiresAt" > clock_timestamp() FOR UPDATE`;
-        if (owners.length !== 1) conflict("TEAM_LEASE_LOST_OR_CANCELLED");
+        await assertTeamLease(tx, runId, lease);
         const previous = await tx.runTeamState.findUnique({ where: { runId } });
         if ((previous?.revision ?? null) !== expectedRevision) return false;
         const old = previous?.state as unknown as TeamSnapshot | undefined;
@@ -146,6 +141,19 @@ export class PrismaTeamStore implements TeamStore {
   }
 }
 
+export async function assertTeamLease(
+  tx: Prisma.TransactionClient,
+  runId: string,
+  lease: TeamLease,
+): Promise<void> {
+  const owners = await tx.$queryRaw<{ id: string }[]>`
+    SELECT "id" FROM "Run" WHERE "id" = ${runId}::uuid
+    AND "executionOwner" = ${lease.owner} AND "dispatchRevision" = ${lease.dispatchRevision}
+    AND "status" = 'RUNNING' AND "cancelRequestedAt" IS NULL
+    AND "leaseExpiresAt" > clock_timestamp() FOR UPDATE`;
+  if (owners.length !== 1) conflict("TEAM_LEASE_LOST_OR_CANCELLED");
+}
+
 function changed<T extends { id: string }>(old: T[] | undefined, next: T[]): T[] {
   const hashes = new Map(old?.map((row) => [row.id, digest(row)]));
   return next.filter((row) => hashes.get(row.id) !== digest(row));
@@ -159,25 +167,55 @@ function validateTransition(old: TeamSnapshot | undefined, next: TeamSnapshot): 
   }
   if (
     old &&
-    (old.sourceIdentity !== next.sourceIdentity ||
-      old.mode !== next.mode ||
+    (old.mode !== next.mode ||
       old.repositoryId !== next.repositoryId ||
       digest(old.config) !== digest(next.config) ||
       digest(old.modelBindings) !== digest(next.modelBindings))
   )
     conflict("TEAM_FROZEN_CONFIGURATION_CHANGED");
+  if (old && old.sourceIdentity !== next.sourceIdentity) {
+    const transition = next.viewTransitions?.at(-1);
+    if (
+      !transition ||
+      transition.from !== old.sourceIdentity ||
+      transition.to !== next.sourceIdentity ||
+      next.viewTransitions?.length !== (old.viewTransitions?.length ?? 0) + 1 ||
+      transition.feedbackId !== next.feedback?.id
+    )
+      conflict("TEAM_SOURCE_TRANSITION_UNVERIFIED");
+  }
   if (
     next.agents.some((a) => a.runId !== next.runId) ||
     next.evidence.some(
       (e) =>
         e.runId !== next.runId ||
         e.repositoryId !== next.repositoryId ||
-        e.sourceIdentity !== next.sourceIdentity,
+        (e.valid && e.sourceIdentity !== next.sourceIdentity),
     )
   )
     conflict("TEAM_CROSS_RUN_IDENTITY_INVALID");
   if (old?.messages.some((m) => digest(m) !== digest(next.messages.find((r) => r.id === m.id))))
     conflict("TEAM_MESSAGE_IS_IMMUTABLE");
+  for (const evidence of old?.evidence ?? []) {
+    const current = next.evidence.find((e) => e.id === evidence.id)!;
+    if (
+      digest({ ...evidence, valid: false }) !== digest({ ...current, valid: false }) ||
+      (!evidence.valid && current.valid)
+    )
+      conflict("TEAM_EVIDENCE_CANNOT_BE_REWRITTEN_OR_REVALIDATED_WITHOUT_A_NEW_OBSERVATION");
+  }
+  for (const op of old?.operations ?? []) {
+    const current = next.operations.find((o) => o.id === op.id)!;
+    if (
+      op.agentId !== current.agentId ||
+      op.kind !== current.kind ||
+      digest(op.input) !== digest(current.input) ||
+      (op.status === "COMPLETED" &&
+        (current.status !== "COMPLETED" || digest(current.output) !== digest(op.output))) ||
+      (op.applied === true && current.applied !== true)
+    )
+      conflict("TEAM_OPERATION_CANNOT_REWIND");
+  }
   for (const agent of old?.agents ?? []) {
     const current = next.agents.find((a) => a.id === agent.id)!;
     if (

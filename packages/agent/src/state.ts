@@ -126,6 +126,8 @@ export const AgentStateSchema = z.object({
     })
     .optional(),
   schemaVersion: z.literal(1),
+  agentId: z.string().optional(),
+  sessionId: z.string().optional(),
   runId: z.string().uuid(),
   phase: AgentPhaseSchema,
   stepCount: z.number().int().nonnegative(),
@@ -200,6 +202,8 @@ export const AgentStateSchema = z.object({
   finalResult: RunResultSchema.optional(),
 });
 export interface AgentState {
+  agentId?: string;
+  sessionId?: string;
   contextProjection?: z.infer<typeof AgentStateSchema>["contextProjection"];
   hostToolState?: Record<string, unknown>;
   codingContinuations?: z.infer<typeof AgentStateSchema>["codingContinuations"];

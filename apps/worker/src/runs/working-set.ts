@@ -155,6 +155,8 @@ export class ExplorationBudget {
     readonly allowOutsideWorkingSet = false,
     /** Supplied only by the host from the persisted approved Plan. */
     necessaryReadPaths: readonly string[] = [],
+    /** Host-enabled, read-only collaboration uses the existing relocation quota. */
+    private readonly collaboration = false,
   ) {
     this.expanded = !workingSet.evidenceSufficient;
     this.necessary = new Set(necessaryReadPaths);
@@ -285,7 +287,8 @@ export class ExplorationBudget {
         (name === "searchCode" && !!this.investigation && this.investigation.navigation < 1) ||
         (this.expanded && this.searches < this.limits.broadSearches)
       );
-    if (name === "locateIssue") return this.expanded && this.relocations < this.limits.relocations;
+    if (name === "locateIssue")
+      return (this.expanded || this.collaboration) && this.relocations < this.limits.relocations;
     if (["readFile", "batchReadFiles"].includes(name))
       return (
         (name === "readFile" && !!this.investigation && this.investigation.reads < 2) ||

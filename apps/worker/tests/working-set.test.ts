@@ -16,6 +16,21 @@ import {
 import type { EvidencePack } from "../src/localization/contracts.js";
 const ws = { evidenceSufficient: true, relevantCode: [{ path: "a.ts" }] } as WorkingSet;
 
+it("team investigation consumes the existing relocation allowance and cannot renew it on resume", () => {
+  const limits = { targetedReads: 4, broadSearches: 2, relocations: 1 };
+  const legacy = new ExplorationBudget(ws, limits, true, ["a.ts"]);
+  expect(legacy.available("locateIssue")).toBe(false);
+  const team = new ExplorationBudget(ws, limits, true, ["a.ts"], true);
+  expect(team.authorize("locateIssue", { query: "Check public counterevidence" })).toBeUndefined();
+  expect(team.available("locateIssue")).toBe(false);
+  const restored = new ExplorationBudget(ws, limits, true, ["a.ts"], true);
+  restored.restore(team.snapshot(), true);
+  expect(restored.authorize("locateIssue", { query: "Repeat" })?.details).toMatchObject({
+    category: "EXPLORATION_LIMIT",
+  });
+  expect(restored.available("searchCode")).toBe(false);
+});
+
 it("persists a single bounded diagnostic investigation without replenishing ordinary exploration", () => {
   const budget = new ExplorationBudget(
     ws,

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { PrismaTeamStore } from "./prisma-team-store.js";
+import { PrismaTeamStore, assertTeamLease } from "./prisma-team-store.js";
+import { currentDatabaseLease } from "./execution-lease.js";
 
 import { PrismaPg } from "@prisma/adapter-pg";
 import type {
@@ -9,8 +10,12 @@ import type {
 } from "@devflow/github";
 import {
   assertCredentialFreeRepositoryUri,
+  ExecutionModeSchema,
+  TeamConfigurationSchema,
+  teamCanonicalJson,
   DevflowError,
   type AgentEvent,
+  type TeamLease,
   type AgentPlan,
   type DevflowErrorShape,
   type NewAgentEvent,
@@ -144,6 +149,32 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
 /** Whole-document CAS preserves unrelated Run metadata as well as ledger revisions. */
 class PrismaBudgetLedgerStore implements BudgetLedgerStore {
   constructor(private readonly client: PrismaClient) {}
+
+  forLease(lease: TeamLease): BudgetLedgerStore {
+    return {
+      get: this.get.bind(this),
+      compareAndSwap: async (runId, expectedRevision, value) =>
+        this.client.$transaction(async (tx) => {
+          await assertTeamLease(tx, runId, lease);
+          const run = await tx.run.findUniqueOrThrow({
+            where: { id: runId },
+            select: { metadata: true },
+          });
+          const { metadata, ledger } = readBudgetLedgerMetadata(run.metadata);
+          if ((ledger?.revision ?? null) !== expectedRevision) return false;
+          await tx.run.update({
+            where: { id: runId },
+            data: {
+              metadata: jsonInput({
+                ...metadata,
+                resourceBudgetLedger: { revision: (expectedRevision ?? -1) + 1, value },
+              }),
+            },
+          });
+          return true;
+        }),
+    };
+  }
 
   async get(runId: string): Promise<BudgetLedgerRecord | null> {
     return await databaseCall(async () => {
@@ -372,7 +403,11 @@ class PrismaRunStore implements RunRepository {
         const created = await this.client.run.create({
           data: {
             taskId: input.taskId,
-            metadata: { localizationMode: input.localizationMode ?? "legacy" },
+            metadata: {
+              localizationMode: input.localizationMode ?? "legacy",
+              executionMode: ExecutionModeSchema.parse(input.executionMode ?? "workflow"),
+              teamConfiguration: TeamConfigurationSchema.parse(input.teamConfiguration ?? {}),
+            },
             ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
             ...(input.modelName === undefined ? {} : { modelName: input.modelName }),
@@ -1168,9 +1203,10 @@ class PrismaArtifactStore implements ArtifactStore {
         message: "Artifact requires content or uri.",
       });
     }
-    return await databaseCall(async () =>
+    const lease = currentDatabaseLease(input.runId);
+    const create = async (client: Pick<PrismaClient, "artifact">) =>
       mapArtifact(
-        await this.client.artifact.create({
+        await client.artifact.create({
           data: {
             runId: input.runId,
             ...(input.stepId === undefined ? {} : { stepId: input.stepId }),
@@ -1184,7 +1220,14 @@ class PrismaArtifactStore implements ArtifactStore {
             ...(input.metadata === undefined ? {} : { metadata: jsonInput(input.metadata) }),
           },
         }),
-      ),
+      );
+    return databaseCall(() =>
+      lease
+        ? this.client.$transaction(async (tx) => {
+            await assertTeamLease(tx, input.runId, lease);
+            return create(tx);
+          })
+        : create(this.client),
     );
   }
 
@@ -1644,12 +1687,12 @@ class PrismaEventWriter implements EventStore {
     );
   }
 
-  async append(event: NewAgentEvent): Promise<AgentEvent> {
+  async append(event: NewAgentEvent, lease?: TeamLease): Promise<AgentEvent> {
     return await databaseCall(
       async () =>
-        await this.client.$transaction(
-          async (transaction) => await appendEvent(transaction, event),
-        ),
+        await this.client.$transaction(async (transaction) => {
+          return appendEvent(transaction, event, lease);
+        }),
     );
   }
 }
@@ -1687,7 +1730,10 @@ function assertEventQuery(afterSequence: number, limit: number): void {
 async function appendEvent(
   transaction: TransactionClient,
   event: NewAgentEvent,
+  explicitLease?: TeamLease,
 ): Promise<AgentEvent> {
+  const lease = explicitLease ?? currentDatabaseLease(event.runId);
+  if (lease) await assertTeamLease(transaction, event.runId, lease);
   const run = await transaction.run.update({
     where: { id: event.runId },
     data: { nextEventSequence: { increment: 1 } },
@@ -1859,6 +1905,10 @@ function mapRun(run: PrismaRun): RunRecord {
   const result = resultFromRun(run);
   return {
     localizationMode: localizationModeFromMetadata(run.metadata),
+    executionMode: executionModeFromMetadata(run.metadata),
+    teamConfiguration: TeamConfigurationSchema.parse(
+      recordValue(run.metadata).teamConfiguration ?? {},
+    ),
     id: run.id,
     taskId: run.taskId,
     ...(run.idempotencyKey === null ? {} : { idempotencyKey: run.idempotencyKey }),
@@ -2138,6 +2188,14 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
     throw conflict("Idempotency key is already associated with another task.");
   }
   const mismatches = [
+    executionModeFromMetadata(existing.metadata) !== (input.executionMode ?? "workflow")
+      ? "executionMode"
+      : undefined,
+    teamCanonicalJson(
+      TeamConfigurationSchema.parse(recordValue(existing.metadata).teamConfiguration ?? {}),
+    ) !== teamCanonicalJson(TeamConfigurationSchema.parse(input.teamConfiguration ?? {}))
+      ? "teamConfiguration"
+      : undefined,
     localizationModeFromMetadata(existing.metadata) !== (input.localizationMode ?? "legacy")
       ? "localizationMode"
       : undefined,
@@ -2159,6 +2217,12 @@ function localizationModeFromMetadata(metadata: unknown): "legacy" | "legacy-dyn
   if (mode === undefined || mode === "legacy") return "legacy";
   if (mode === "prg" || mode === "legacy-dynamic") return mode;
   throw conflict("Invalid persisted Localization mode; resume cannot choose a new mode.");
+}
+
+function executionModeFromMetadata(metadata: unknown) {
+  const parsed = ExecutionModeSchema.safeParse(recordValue(metadata).executionMode ?? "workflow");
+  if (!parsed.success) throw conflict("Invalid frozen execution mode.");
+  return parsed.data;
 }
 
 function canTransitionTask(current: TaskStatus, next: TaskStatus): boolean {

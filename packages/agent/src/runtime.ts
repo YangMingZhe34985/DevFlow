@@ -111,6 +111,8 @@ export interface AdaptiveStepBudgetController {
 export type CodingBudgetOperation = "CODING" | "SUBMIT_CURRENT";
 
 export interface AgentRunRequest {
+  /** Host-only continuation of the same solver across read-only planning and approved Coding. */
+  initialSession?: { agentId: string; sessionId: string; context: string };
   /** One cumulative Observe/Edit/Test session; finishing hands control to host validation. */
   codingSession?: boolean;
   /** Host-only, idempotent reopening after validation/review/new approval, never an Agent tool. */
@@ -261,11 +263,27 @@ export class DefaultAgentRuntime implements AgentRuntime {
           "You are a software engineering agent. Inspect the repository before editing, use only the provided tools, run the relevant tests after changes, inspect gitDiff, then give a concise final summary. Never invent tool results.",
       },
       ...buildUserMessages(request, context.task.title, context.task.description),
+      ...(request.initialSession
+        ? [{ role: "USER" as const, content: request.initialSession.context }]
+        : []),
     ];
     let state =
       restoredState ??
       createInitialAgentState(context.runId, initialMessages, new Date().toISOString());
     state = { ...state, phaseDeadlineAt };
+    if (request.initialSession) {
+      if (
+        restoredState &&
+        (state.agentId !== request.initialSession.agentId ||
+          state.sessionId !== request.initialSession.sessionId)
+      )
+        throw new DevflowError({ code: "CONFLICT", message: "SOLVER_SESSION_IDENTITY_CHANGED" });
+      state = {
+        ...state,
+        agentId: request.initialSession.agentId,
+        sessionId: request.initialSession.sessionId,
+      };
+    }
     if (restoredState === undefined && request.approvedPlan !== undefined) {
       state = { ...state, plan: request.approvedPlan };
     }

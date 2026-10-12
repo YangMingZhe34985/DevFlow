@@ -83,7 +83,13 @@ export interface TeamEvidence {
   runId: string;
   repositoryId: string;
   sourceIdentity: string;
-  kind: "SOURCE_OBSERVATION" | "VALIDATION_OBSERVATION" | "INTERPRETATION" | "HYPOTHESIS";
+  kind:
+    | "SOURCE_OBSERVATION"
+    | "VALIDATION_OBSERVATION"
+    | "RELATION_OBSERVATION"
+    | "TOOL_ERROR"
+    | "INTERPRETATION"
+    | "HYPOTHESIS";
   path?: string;
   fileSha256?: string;
   startLine?: number;
@@ -108,6 +114,7 @@ export interface TeamAgent {
   noProgress: number;
   seenActions: string[];
   observedEvidenceIds: string[];
+  acquiredEvidenceIds?: string[];
 }
 export interface TeamTask {
   id: string;
@@ -115,6 +122,8 @@ export interface TeamTask {
   parentTaskId?: string;
   agentId: string;
   goal: string;
+  /** The view on which this assignment/result was investigated. */
+  sourceIdentity?: string;
   dependsOn: string[];
   evidenceIds: string[];
   status: "READY" | "RUNNING" | "WAITING" | "COMPLETED" | "BLOCKED" | "CANCELLED";
@@ -146,6 +155,8 @@ export interface TeamOperation {
   /** Completed model decisions are replayed locally until their effects and history commit. */
   applied?: boolean;
   observedBefore?: string[];
+  visibleEvidenceIds?: string[];
+  acquiredBefore?: string[];
 }
 export interface TeamSnapshot {
   version: 1;
@@ -166,6 +177,13 @@ export interface TeamSnapshot {
   missing: string[];
   selectedEvidenceIds: string[];
   modelBindings?: Record<string, unknown>;
+  feedback?: { id: string; description: string; origin: "CODING" | "VALIDATION" | "REVIEW" };
+  viewTransitions?: {
+    from: string;
+    to: string;
+    feedbackId: string;
+    invalidatedEvidenceIds: string[];
+  }[];
 }
 
 /** PostgreSQL JSONB reorders object keys; identities must survive a round trip. */

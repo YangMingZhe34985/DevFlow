@@ -61,6 +61,8 @@ try {
       "run",
       "tests/integration/resource-budget-postgres.test.ts",
       "tests/integration/team-postgres.test.ts",
+      "tests/integration/team-workflow.test.ts",
+      "tests/integration/team-coding.test.ts",
     ],
     env,
   );

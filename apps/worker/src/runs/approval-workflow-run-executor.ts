@@ -1,11 +1,14 @@
 import { ContinuationTools } from "./continuation-tools.js";
+import { databaseExecutionLease } from "@devflow/database";
+import { investigateWithTeam } from "../team/workflow-bridge.js";
+import { solverSessionView } from "../team/solver-session.js";
 import { buildRepositoryAtlas, atlasSource } from "../localization/repository-atlas.js";
 import { BehaviorRetriever } from "../localization/behavior-retriever.js";
 import {
   validateInvestigationResume,
   type LocalizationInvestigationState,
 } from "../localization/investigation-state.js";
-import { ResourceBudgetScheduler } from "./resource-budget-scheduler.js";
+import { ResourceBudgetScheduler, type ResourceBudgetLedger } from "./resource-budget-scheduler.js";
 import {
   ResourceBudgetRuntime,
   resourceBudgetContext,
@@ -316,7 +319,31 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     const execute = async (): Promise<RunExecutionOutcome> => {
       if (run.currentStage === "PUSH" || run.currentStage === "CREATE_PR")
         return this.executeObserved(run, signal);
-      const store = this.database.budgetLedgers;
+      const baseStore = this.database.budgetLedgers;
+      const teamMode = run.executionMode && run.executionMode !== "workflow";
+      if (teamMode) {
+        const teamState = await this.database.teams?.load(run.id);
+        for (const [stage, saved] of Object.entries(teamState?.modelBindings ?? {})) {
+          const current = resolveStageModel(stage as ModelStage, this.environment, run).provenance;
+          if (recordValue(saved).configurationHash !== current.configurationHash)
+            throw new DevflowError({
+              code: "CONFLICT",
+              message: `TEAM_MODEL_BINDING_CHANGED: ${stage}`,
+              details: { requestIssued: false },
+            });
+        }
+      }
+      if (teamMode && (!run.executionOwner || !baseStore?.forLease))
+        throw new DevflowError({
+          code: "CONFLICT",
+          message: "Persistent team execution requires lease-fenced resource accounting.",
+        });
+      const store = teamMode
+        ? baseStore!.forLease!({
+            owner: run.executionOwner!,
+            dispatchRevision: run.dispatchRevision,
+          })
+        : baseStore;
       if (!store)
         throw new DevflowError({
           code: "CONFLICT",
@@ -342,30 +369,34 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             "LEGACY_COST_UNCONFIRMED: cannot initialize a cost-limited ledger from historical token metrics without verified historical cost.",
           details: { requestIssued: false },
         });
+      const savedResources = await store.get(run.id);
       const scheduler = await ResourceBudgetScheduler.open({
         runId: run.id,
         store,
         startedAt: timing.startedAt,
         deadlineAt: timing.deadlineAt,
-        limits: {
-          tokens: this.environment.DEVFLOW_MAX_TOTAL_TOKENS,
-          modelCalls:
-            this.environment.DEVFLOW_MAX_MODEL_CALLS ??
-            run.maxSteps + 2 * (run.maxReviewRetries + 2),
-          logicalToolCalls:
-            this.environment.DEVFLOW_MAX_TOOL_CALLS ?? Math.max(12, 3 * run.maxSteps),
-          steps: run.maxSteps,
-          timeMs: timing.timeoutMs,
-          ...(this.environment.DEVFLOW_MAX_TOOL_EXECUTIONS === undefined
-            ? {}
-            : { toolExecutions: this.environment.DEVFLOW_MAX_TOOL_EXECUTIONS }),
-          ...(this.environment.DEVFLOW_MAX_IO_BYTES === undefined
-            ? {}
-            : { ioBytes: this.environment.DEVFLOW_MAX_IO_BYTES }),
-          ...(this.environment.DEVFLOW_MAX_COST_MICROS === undefined
-            ? {}
-            : { costMicros: this.environment.DEVFLOW_MAX_COST_MICROS }),
-        },
+        limits: savedResources
+          ? (savedResources.value as ResourceBudgetLedger).limits
+          : {
+              tokens: this.environment.DEVFLOW_MAX_TOTAL_TOKENS,
+              modelCalls:
+                this.environment.DEVFLOW_MAX_MODEL_CALLS ??
+                run.maxSteps + 2 * (run.maxReviewRetries + 2),
+              logicalToolCalls:
+                this.environment.DEVFLOW_MAX_TOOL_CALLS ??
+                Math.min(75, Math.max(12, 3 * run.maxSteps)),
+              steps: run.maxSteps,
+              timeMs: timing.timeoutMs,
+              ...(this.environment.DEVFLOW_MAX_TOOL_EXECUTIONS === undefined
+                ? {}
+                : { toolExecutions: this.environment.DEVFLOW_MAX_TOOL_EXECUTIONS }),
+              ...(this.environment.DEVFLOW_MAX_IO_BYTES === undefined
+                ? {}
+                : { ioBytes: this.environment.DEVFLOW_MAX_IO_BYTES }),
+              ...(this.environment.DEVFLOW_MAX_COST_MICROS === undefined
+                ? {}
+                : { costMicros: this.environment.DEVFLOW_MAX_COST_MICROS }),
+            },
         initialConsumed: {
           tokens: prior.tokenUsage.totalTokens,
           inputTokens: prior.tokenUsage.inputTokens,
@@ -402,9 +433,16 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         }
       });
     };
-    return this.environment.DEVFLOW_EFFICIENCY_TRACE_ENABLED
-      ? this.traces.run(trace, execute)
-      : execute();
+    const dispatch = () =>
+      this.environment.DEVFLOW_EFFICIENCY_TRACE_ENABLED
+        ? this.traces.run(trace, execute)
+        : execute();
+    return run.executionMode && run.executionMode !== "workflow" && run.executionOwner
+      ? databaseExecutionLease.run(
+          { runId: run.id, owner: run.executionOwner, dispatchRevision: run.dispatchRevision },
+          dispatch,
+        )
+      : dispatch();
   }
 
   async observedMetrics(run: RunExecutionRecord): Promise<RunMetrics> {
@@ -552,7 +590,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             })
           : undefined;
       if (atlas) planningSource = atlasSource(planningSource, atlas);
-      const planningEvidence =
+      let planningEvidence =
         savedInvestigation?.planningEvidence ??
         (await this.retrieveEvidence(
           run,
@@ -640,6 +678,24 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
       });
       const issueLocalization = await (async () => {
+        if (run.executionMode && run.executionMode !== "workflow") {
+          planningEvidence = await investigateWithTeam({
+            database: this.database,
+            run,
+            environment: this.environment,
+            source: planningSource,
+            baseCommit: planningBaseCommit,
+            evidence: planningEvidence,
+            signal: planSignal,
+            metrics,
+            ...(benchmarkConfiguration?.modelParameters
+              ? { parameters: benchmarkConfiguration.modelParameters }
+              : {}),
+            roleModelFactory: (stage) =>
+              this.createTeamModel(run, stage, benchmarkConfiguration?.modelParameters),
+          });
+          return undefined;
+        }
         const prior = await this.database.artifacts.list(run.id);
         const completed = prior.findLast((a) => a.name === "issue-localization-agent-plan-v1.json");
         if (completed?.content) {
@@ -1015,6 +1071,9 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
       };
       const result = await new PlanAgent().run({
+        ...(run.executionMode === "single"
+          ? { priorSolverSession: solverSessionView(await this.database.teams?.load(run.id)) }
+          : {}),
         allowUnknownDiscovery: true,
         title: run.task.title,
         description: run.task.description,
@@ -1638,19 +1697,65 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               "Localization expansion limit reached; use a specific readFile anchor.",
             );
           localizationCalls++;
-          return await this.retrieveEvidence(
-            run,
+          const liveSource =
             localSnapshot === undefined
               ? run.task.baseCommitSha
                 ? gitWorkspaceSource(run.task.baseCommitSha, localizationView.sandbox)
                 : sandboxSource(localizationView.sandbox)
-              : overlaySource(localSnapshot, localizationView.sandbox),
+              : overlaySource(localSnapshot, localizationView.sandbox);
+          const retrieved = await this.retrieveEvidence(
+            run,
+            liveSource,
             localizationView.revision(),
             toolSignal,
             "EXECUTE",
             Math.max(0, budget.remainingTotalTokens(metrics) - 16_000),
             query,
           );
+          if (run.executionMode !== "team") return retrieved;
+          const savedTeam = await this.database.teams?.load(run.id);
+          if (!savedTeam || (savedTeam.viewTransitions?.length ?? 0) >= 2)
+            throw new DevflowError({
+              code: "INSUFFICIENT_EVIDENCE",
+              message:
+                "The existing two Coding localization expansions are exhausted or cannot be recovered.",
+              details: { requestIssued: false },
+            });
+          const viewIdentity = contentHash(
+            JSON.stringify({
+              base: run.task.baseCommitSha ?? localSnapshot?.sourceHead,
+              sandbox: activeSandbox.id,
+              revision: localizationView.revision(),
+              sources: retrieved.evidence.map((e) => [e.path, e.contentHash]),
+            }),
+          );
+          const feedback = {
+            id: contentHash(JSON.stringify({ query, viewIdentity })),
+            description: JSON.stringify({
+              request: query,
+              approvedScope: plan.approvalScope,
+              plan: plan.proposal,
+              policy:
+                "Read-only investigation while Coding awaits this result. New targets require existing Replan and a new approval.",
+            }),
+            origin: "CODING" as const,
+          };
+          return investigateWithTeam({
+            database: this.database,
+            run,
+            environment: this.environment,
+            source: { ...liveSource, identity: viewIdentity },
+            baseCommit: run.task.baseCommitSha ?? localSnapshot!.sourceHead,
+            evidence: retrieved,
+            signal: toolSignal,
+            metrics,
+            feedback,
+            ...(benchmark?.configuration.modelParameters
+              ? { parameters: benchmark.configuration.modelParameters }
+              : {}),
+            roleModelFactory: (stage) =>
+              this.createTeamModel(run, stage, benchmark?.configuration.modelParameters),
+          });
         },
         async (input, toolSignal) => {
           toolSignal.throwIfAborted();
@@ -1665,6 +1770,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           }
           return readRepairEvidence(input, evidence);
         },
+        run.executionMode === "team" ? 180_000 : undefined,
       );
       const implementationModel = this.createModel(run, benchmark?.configuration.modelParameters);
       const codingArtifacts = await this.database.artifacts.list(run.id);
@@ -5144,6 +5250,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             },
             input.plan.proposalVersion === "plan-proposal-v1",
             necessaryReadPaths,
+            input.run.executionMode === "team",
           )
         : undefined;
     const wholeFileWrite =
@@ -5233,8 +5340,20 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               ),
           )
         : undefined;
+    const singleSolver =
+      input.run.executionMode === "single"
+        ? solverSessionView(await this.database.teams?.load(input.run.id))
+        : undefined;
     const cumulativeResult = await runtime.run(
       {
+        ...(input.run.executionMode === "single"
+          ? {
+              initialSession: (() => {
+                const s = singleSolver!;
+                return { agentId: s.agentId, sessionId: s.sessionId, context: JSON.stringify(s) };
+              })(),
+            }
+          : {}),
         ...(input.codingSession ? { codingSession: true, repairMode: true } : {}),
         ...(input.hostContinuation ? { hostContinuation: input.hostContinuation } : {}),
         approvedPlan: input.plan,
@@ -6676,7 +6795,27 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     parameters?: VercelAiModelParameters,
     stage: ModelStage = "EXECUTE",
   ): LanguageModelPort {
-    return this.bindStageModel(run, stage, parameters, this.modelFactory?.(run, parameters));
+    return this.bindStageModel(
+      run,
+      run.executionMode === "single" && stage !== "REVIEW" ? "EXECUTE" : stage,
+      parameters,
+      this.modelFactory?.(run, parameters),
+    );
+  }
+
+  /** Team decisions have their own stable operation receipt; do not wrap a second budget here. */
+  protected createTeamModel(
+    run: RunExecutionRecord,
+    stage: ModelStage,
+    parameters?: VercelAiModelParameters,
+  ): LanguageModelPort {
+    const injected = this.modelFactory?.(run, parameters);
+    if (injected) return injected;
+    const binding = resolveStageModel(stage, this.environment, run);
+    return createConfiguredLanguageModel({
+      ...binding.config,
+      ...(parameters ? { parameters } : {}),
+    });
   }
 
   private async restoreCompressionState(
@@ -6866,6 +7005,7 @@ export function createTools(
     },
     signal: AbortSignal,
   ) => Promise<unknown>,
+  localizationTimeoutMs?: number,
 ): {
   executor: DefaultToolExecutor;
   tools: readonly ModelToolDescriptor[];
@@ -6899,7 +7039,7 @@ export function createTools(
       inputSchema: z.object({ query: z.string().min(1).max(8000) }),
       outputSchema: z.unknown(),
       permission: "READ",
-      timeoutMs: 25_000,
+      timeoutMs: localizationTimeoutMs ?? 25_000,
       readOnly: true,
       parallelSafe: false,
       mutatesWorkspace: false,

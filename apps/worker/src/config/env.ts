@@ -43,6 +43,11 @@ const WorkerEnvironmentSchema = z.object({
   LLM_STRUCTURED_OUTPUT_MODE: z.enum(["auto", "json-schema", "json-object"]).default("auto"),
   LLM_REASONING_PROFILE: z.enum(["efficient", "provider-default"]).default("efficient"),
   DEVFLOW_MAX_RETRIES: z.coerce.number().int().min(0).default(2),
+  DEVFLOW_TEAM_ENABLED: z
+    .enum(["true", "false"])
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
   DEVFLOW_RELATION_GRAPH_ENABLED: z
     .enum(["true", "false"])
     .default("true")

@@ -27,12 +27,22 @@ export interface TeamDecisionView {
   role: TeamAgent["role"];
   task: { title: string; description: string };
   assignments: TeamSnapshot["tasks"];
-  board: { id: string; agentId: string; goal: string; status: string; result?: unknown }[];
+  board: {
+    id: string;
+    agentId: string;
+    goal: string;
+    status: string;
+    sourceIdentity?: string;
+    current: boolean;
+    result?: unknown;
+  }[];
   inbox: TeamSnapshot["messages"];
+  counterevidence?: TeamSnapshot["messages"];
   evidence: TeamEvidence[];
   /** Only the recipient's history, never other agents' hidden turns. */
   history: TeamAgent["history"];
   limits: TeamConfiguration;
+  feedback?: TeamSnapshot["feedback"];
 }
 export interface TeamEnginePorts {
   store: TeamStore;
@@ -50,6 +60,57 @@ export interface TeamEnginePorts {
 /** A bounded collaboration service inside the owning Run, not a second workflow engine. */
 export class TeamEngine {
   constructor(private readonly ports: TeamEnginePorts) {}
+
+  /** Host-only handoff while the single Coding writer is paused; no quotas/history are reset. */
+  async reopen(
+    runId: string,
+    sourceIdentity: string,
+    evidence: TeamEvidence[],
+    feedback: NonNullable<TeamSnapshot["feedback"]>,
+  ) {
+    const prior = await this.load(runId);
+    if (prior.feedback?.id === feedback.id) {
+      if (prior.sourceIdentity !== sourceIdentity) fail("TEAM_FEEDBACK_SOURCE_CHANGED");
+      return;
+    }
+    if (
+      prior.status === "RUNNING" ||
+      prior.operations.some(
+        (o) =>
+          o.status === "INFLIGHT" ||
+          o.status === "UNKNOWN" ||
+          (o.kind === "MODEL" && o.status === "COMPLETED" && !o.applied),
+      )
+    )
+      fail("TEAM_FEEDBACK_REQUIRES_SETTLED_INVESTIGATION");
+    await this.change(runId, (s) => {
+      const invalidated = s.evidence.filter((e) => e.valid && e.sourceIdentity !== sourceIdentity);
+      for (const e of invalidated) e.valid = false;
+      for (const e of evidence) {
+        if (
+          e.runId !== runId ||
+          e.repositoryId !== s.repositoryId ||
+          e.sourceIdentity !== sourceIdentity ||
+          e.contentSha256 !== teamDigest(e.content)
+        )
+          fail("TEAM_FEEDBACK_EVIDENCE_INVALID");
+        if (!s.evidence.some((row) => row.id === e.id)) s.evidence.push(e);
+      }
+      (s.viewTransitions ??= []).push({
+        from: s.sourceIdentity,
+        to: sourceIdentity,
+        feedbackId: feedback.id,
+        invalidatedEvidenceIds: invalidated.map((e) => e.id),
+      });
+      s.sourceIdentity = sourceIdentity;
+      s.feedback = feedback;
+      s.status = "RUNNING";
+      s.missing = [];
+      s.selectedEvidenceIds = [];
+      delete s.stopReason;
+      s.agents.find((a) => a.id === s.coordinatorId)!.status = "READY";
+    });
+  }
 
   async initialize(input: {
     runId: string;
@@ -188,10 +249,16 @@ export class TeamEngine {
       (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
     );
     const inbox = state.messages.filter((m) => m.to === agentId && m.sequence > agent.inboxCursor);
+    const counterevidence = state.messages.filter(
+      (m) =>
+        m.to === agentId && m.type === "CHALLENGE" && m.sourceIdentity === state.sourceIdentity,
+    );
     const allowed = new Set([
       ...agent.observedEvidenceIds,
+      ...(agent.acquiredEvidenceIds ?? []),
       ...assignments.flatMap((t) => t.evidenceIds),
       ...inbox.flatMap((m) => m.evidenceIds),
+      ...counterevidence.flatMap((m) => m.evidenceIds),
     ]);
     const view: TeamDecisionView = {
       runId,
@@ -205,14 +272,18 @@ export class TeamEngine {
         agentId: t.agentId,
         goal: t.goal,
         status: t.status,
+        ...(t.sourceIdentity ? { sourceIdentity: t.sourceIdentity } : {}),
+        current: t.sourceIdentity === state.sourceIdentity,
         ...(t.result ? { result: t.result } : {}),
       })),
       inbox,
+      counterevidence,
       evidence: state.evidence.filter(
         (e) => e.valid && (agent.role !== "INVESTIGATOR" || allowed.has(e.id)),
       ),
       history: agent.history,
       limits: state.config,
+      ...(state.feedback ? { feedback: state.feedback } : {}),
     };
     const id = `team:${agentId}:decision:${agent.decisionCount + 1}`;
     const operation: TeamOperation = {
@@ -223,6 +294,7 @@ export class TeamEngine {
       status: "PREPARED",
       input: view,
       observedBefore: [...agent.observedEvidenceIds],
+      acquiredBefore: [...(agent.acquiredEvidenceIds ?? [])],
     };
     await this.change(runId, (s) => {
       if (!s.operations.some((o) => o.id === id)) s.operations.push(operation);
@@ -251,13 +323,15 @@ export class TeamEngine {
     try {
       response = await this.ports.decide(view, operation);
     } catch (error) {
+      if ((await this.load(runId)).operations.find((o) => o.id === id)?.status === "COMPLETED")
+        throw error;
       const notIssued =
         error instanceof DevflowError &&
         (error.details as { requestIssued?: boolean } | undefined)?.requestIssued === false;
       await this.change(runId, (s) => {
         const op = s.operations.find((o) => o.id === id)!;
         op.status = notIssued ? "NOT_ISSUED" : "UNKNOWN";
-        op.error = error instanceof Error ? error.message : String(error);
+        op.error = error instanceof Error ? (error.stack ?? error.message) : String(error);
       });
       throw error;
     }
@@ -292,6 +366,7 @@ export class TeamEngine {
     const id = operation.id;
     const inbox = view.inbox;
     const originalEvidence = new Set(operation.observedBefore ?? []);
+    const originalAcquired = new Set([...(operation.acquiredBefore ?? []), ...originalEvidence]);
     let state = await this.load(runId);
     let duplicateOnly = true;
     for (let index = 0; index < decision.actions.length; index++) {
@@ -317,13 +392,39 @@ export class TeamEngine {
       if (op.applied) return;
       op.applied = true;
       const current = s.agents.find((a) => a.id === agentId)!;
-      const observed =
-        current.role === "INVESTIGATOR"
-          ? [...new Set([...view.evidence.map((e) => e.id), ...current.observedEvidenceIds])]
-          : s.evidence.filter((e) => e.valid).map((e) => e.id);
-      const progress = observed.some((id) => !originalEvidence.has(id));
+      const observed = [
+        ...new Set([
+          ...current.observedEvidenceIds,
+          ...(op.visibleEvidenceIds ?? view.evidence.map((e) => e.id)),
+        ]),
+      ];
+      const gained = [...observed, ...(current.acquiredEvidenceIds ?? [])];
+      const progress = observed.some(
+        (id) =>
+          !originalEvidence.has(id) &&
+          s.evidence.some(
+            (e) =>
+              e.id === id &&
+              ["SOURCE_OBSERVATION", "VALIDATION_OBSERVATION", "RELATION_OBSERVATION"].includes(
+                e.kind,
+              ),
+          ),
+      );
+      // Host acquisition and model visibility are distinct audit records.
+      const acquisitionProgress = gained.some(
+        (id) =>
+          !originalAcquired.has(id) &&
+          s.evidence.some(
+            (e) =>
+              e.id === id &&
+              e.valid &&
+              ["SOURCE_OBSERVATION", "VALIDATION_OBSERVATION", "RELATION_OBSERVATION"].includes(
+                e.kind,
+              ),
+          ),
+      );
       current.observedEvidenceIds = observed;
-      current.noProgress = progress ? 0 : current.noProgress + 1;
+      current.noProgress = progress || acquisitionProgress ? 0 : current.noProgress + 1;
       current.inboxCursor = Math.max(current.inboxCursor, ...inbox.map((m) => m.sequence));
       // History records preserve a bounded view without recursively embedding its own history.
       current.history.push({ input: { ...view, history: undefined }, output: decision });
@@ -388,7 +489,8 @@ export class TeamEngine {
               fail("TEAM_EVIDENCE_IDENTITY_INVALID");
             if (!s.evidence.some((row) => row.id === e.id)) s.evidence.push(e);
             const a = s.agents.find((a) => a.id === agentId)!;
-            if (!a.observedEvidenceIds.includes(e.id)) a.observedEvidenceIds.push(e.id);
+            a.acquiredEvidenceIds ??= [];
+            if (!a.acquiredEvidenceIds.includes(e.id)) a.acquiredEvidenceIds.push(e.id);
           }
           const op = s.operations.find((o) => o.id === operationId)!;
           op.status = "COMPLETED";
@@ -404,8 +506,16 @@ export class TeamEngine {
           throw error;
         await this.change(runId, (s) => {
           const op = s.operations.find((o) => o.id === operationId)!;
-          op.status = "UNKNOWN";
+          const notIssued =
+            error instanceof DevflowError &&
+            (error.details as { requestIssued?: boolean } | undefined)?.requestIssued === false;
+          op.status = notIssued ? "NOT_ISSUED" : "UNKNOWN";
           op.error = String(error);
+          if (notIssued) {
+            s.status = "STOPPED";
+            s.stopReason = "BUDGET_STOP";
+            s.missing = [op.error];
+          }
         });
         throw error;
       }
@@ -437,6 +547,7 @@ export class TeamEngine {
             key: action.key,
             agentId: child.id,
             goal: action.goal,
+            sourceIdentity: s.sourceIdentity,
             dependsOn: action.dependsOn,
             evidenceIds: action.evidenceIds,
             status: "READY",

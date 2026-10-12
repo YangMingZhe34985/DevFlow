@@ -51,3 +51,4 @@ Coordinator 选择 delegate/request_evidence/challenge/cancel/propose_plan/stop�
 ## 验收日志
 
 - Phase 0：基线审计完成；后续验收待执行。
+- Phase 1：新增动态任务板核心及独立 Agent Session；受控测试证明零/单/多调查委派、反证改变另一 Agent 的实际读取、重复探索停止、未知调用恢复阻断及引用校验。3 个相关测试文件 34 PASS；build:core 和新增代码 ESLint PASS。此阶段尚未接入真实 Provider，不代表真实修复能力。

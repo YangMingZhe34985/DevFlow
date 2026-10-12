@@ -1,0 +1,501 @@
+import { createHash, randomUUID } from "node:crypto";
+import type { TeamStore } from "@devflow/database";
+import {
+  DevflowError,
+  TeamConfigurationSchema,
+  TeamDecisionSchema,
+  type TeamSnapshot,
+  type TeamAgent,
+  type TeamAction,
+  type TeamDecision,
+  type TeamEvidence,
+  type TeamLease,
+  type TeamOperation,
+  type TeamConfiguration,
+} from "@devflow/shared";
+
+export const teamDigest = (value: unknown) =>
+  createHash("sha256").update(JSON.stringify(value)).digest("hex");
+function fail(message: string): never {
+  throw new DevflowError({ code: "CONFLICT", message });
+}
+export interface TeamDecisionView {
+  runId: string;
+  sourceIdentity: string;
+  agentId: string;
+  role: TeamAgent["role"];
+  task: { title: string; description: string };
+  assignments: TeamSnapshot["tasks"];
+  board: { id: string; agentId: string; goal: string; status: string; result?: unknown }[];
+  inbox: TeamSnapshot["messages"];
+  evidence: TeamEvidence[];
+  /** Only the recipient's history, never other agents' hidden turns. */
+  history: TeamAgent["history"];
+  limits: TeamConfiguration;
+}
+export interface TeamEnginePorts {
+  store: TeamStore;
+  lease: TeamLease;
+  signal: AbortSignal;
+  decide(view: TeamDecisionView, operation: TeamOperation): Promise<TeamDecision>;
+  observe(
+    action: Extract<TeamAction, { type: "READ" | "SEARCH" | "RELATIONS" }>,
+    operation: TeamOperation,
+  ): Promise<TeamEvidence[]>;
+  beforeDecision?(view: TeamDecisionView, operation: TeamOperation): Promise<void>;
+  onChange?(snapshot: TeamSnapshot): Promise<void>;
+}
+
+/** A bounded collaboration service inside the owning Run, not a second workflow engine. */
+export class TeamEngine {
+  constructor(private readonly ports: TeamEnginePorts) {}
+
+  async initialize(input: {
+    runId: string;
+    repositoryId: string;
+    sourceIdentity: string;
+    mode: "team" | "single";
+    evidence?: TeamEvidence[];
+    config?: Partial<TeamConfiguration>;
+    modelBindings?: Record<string, unknown>;
+  }): Promise<TeamSnapshot> {
+    const saved = await this.ports.store.load(input.runId);
+    if (saved) {
+      if (
+        saved.sourceIdentity !== input.sourceIdentity ||
+        saved.mode !== input.mode ||
+        saved.repositoryId !== input.repositoryId
+      )
+        fail("TEAM_SOURCE_OR_MODE_MISMATCH");
+      if (
+        input.modelBindings &&
+        teamDigest(input.modelBindings) !== teamDigest(saved.modelBindings)
+      )
+        fail("TEAM_MODEL_BINDING_CHANGED");
+      if (saved.operations.some((o) => o.status === "INFLIGHT" || o.status === "UNKNOWN"))
+        fail("TEAM_OPERATION_OUTCOME_UNKNOWN");
+      return saved;
+    }
+    const id = randomUUID();
+    const next: TeamSnapshot = {
+      version: 1,
+      ...input,
+      revision: 0,
+      config: TeamConfigurationSchema.parse(input.config ?? {}),
+      status: "RUNNING",
+      coordinatorId: id,
+      agents: [this.agent(input.runId, id, input.mode === "single" ? "SOLVER" : "COORDINATOR")],
+      tasks: [],
+      messages: [],
+      evidence: input.evidence ?? [],
+      operations: [],
+      missing: [],
+      selectedEvidenceIds: [],
+    };
+    if (!(await this.ports.store.compareAndSwap(input.runId, null, next, this.ports.lease)))
+      return this.initialize(input);
+    return next;
+  }
+
+  async run(
+    runId: string,
+    task: TeamDecisionView["task"],
+    maxDecisions: number,
+  ): Promise<TeamSnapshot> {
+    let state = await this.load(runId);
+    const already = state.agents.reduce((n, a) => n + a.decisionCount, 0);
+    let attempts = already;
+    while (state.status === "RUNNING" && attempts < maxDecisions) {
+      this.ports.signal.throwIfAborted();
+      await this.turn(runId, state.coordinatorId, task);
+      attempts++;
+      state = await this.load(runId);
+      if (state.status !== "RUNNING") break;
+      const runnable = state.agents.filter(
+        (a) =>
+          a.role === "INVESTIGATOR" &&
+          a.status === "READY" &&
+          state.tasks.some(
+            (t) =>
+              t.agentId === a.id &&
+              ["READY", "RUNNING"].includes(t.status) &&
+              t.dependsOn.every((id) =>
+                state.tasks.some((parent) => parent.id === id && parent.status === "COMPLETED"),
+              ),
+          ),
+      );
+      const selected = runnable.slice(
+        0,
+        Math.min(state.config.concurrency, maxDecisions - attempts),
+      );
+      // Every selected task shares the same immutable view; no Coding writer is running here.
+      const outcomes = await Promise.allSettled(
+        selected.map(async (a) => {
+          while (attempts < maxDecisions) {
+            const current = await this.load(runId);
+            if (
+              current.status !== "RUNNING" ||
+              current.agents.find((row) => row.id === a.id)?.status !== "READY"
+            )
+              break;
+            // Synchronous allocation before await prevents parallel siblings using the same remaining slot.
+            if (attempts >= maxDecisions) break;
+            attempts++;
+            await this.turn(runId, a.id, task);
+          }
+        }),
+      );
+      for (const outcome of outcomes) if (outcome.status === "rejected") throw outcome.reason;
+      await this.change(runId, (s) => {
+        for (const t of s.tasks)
+          if (
+            ["READY", "RUNNING", "WAITING"].includes(t.status) &&
+            t.dependsOn.some((id) =>
+              s.tasks.some((p) => p.id === id && ["BLOCKED", "CANCELLED"].includes(p.status)),
+            )
+          ) {
+            t.status = "BLOCKED";
+            t.reason = "DEPENDENCY_UNAVAILABLE";
+          }
+      });
+      state = await this.load(runId);
+    }
+    if (state.status === "RUNNING")
+      await this.stop(runId, "BUDGET_STOP", [
+        "Remaining Run decisions cannot fund another collaboration turn.",
+      ]);
+    return this.load(runId);
+  }
+
+  private async turn(runId: string, agentId: string, task: TeamDecisionView["task"]) {
+    this.ports.signal.throwIfAborted();
+    let state = await this.load(runId);
+    const agent = state.agents.find((a) => a.id === agentId)!;
+    if (["CANCELLED", "BLOCKED"].includes(agent.status)) return;
+    const assignments = state.tasks.filter(
+      (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+    );
+    const inbox = state.messages.filter((m) => m.to === agentId && m.sequence > agent.inboxCursor);
+    const allowed = new Set([
+      ...agent.observedEvidenceIds,
+      ...assignments.flatMap((t) => t.evidenceIds),
+      ...inbox.flatMap((m) => m.evidenceIds),
+    ]);
+    const view: TeamDecisionView = {
+      runId,
+      sourceIdentity: state.sourceIdentity,
+      agentId,
+      role: agent.role,
+      task,
+      assignments,
+      board: state.tasks.map((t) => ({
+        id: t.id,
+        agentId: t.agentId,
+        goal: t.goal,
+        status: t.status,
+        ...(t.result ? { result: t.result } : {}),
+      })),
+      inbox,
+      evidence: state.evidence.filter(
+        (e) => e.valid && (agent.role !== "INVESTIGATOR" || allowed.has(e.id)),
+      ),
+      history: agent.history,
+      limits: state.config,
+    };
+    const id = `team:${agentId}:decision:${agent.decisionCount + 1}`;
+    const operation: TeamOperation = {
+      id,
+      agentId,
+      ...(assignments[0] ? { taskId: assignments[0].id } : {}),
+      kind: "MODEL",
+      status: "PREPARED",
+      input: view,
+    };
+    await this.change(runId, (s) => {
+      if (!s.operations.some((o) => o.id === id)) s.operations.push(operation);
+    });
+    // A rejected quote has a durable known-not-issued result; no phantom inflight request.
+    try {
+      await this.ports.beforeDecision?.(view, operation);
+    } catch (error) {
+      await this.change(runId, (s) => {
+        s.operations.find((o) => o.id === id)!.status = "NOT_ISSUED";
+      });
+      await this.stop(runId, "BUDGET_STOP", [
+        error instanceof Error ? error.message : String(error),
+      ]);
+      return;
+    }
+    await this.change(runId, (s) => {
+      const current = s.agents.find((a) => a.id === agentId)!;
+      if (current.decisionCount !== agent.decisionCount || current.status === "CANCELLED")
+        fail("TEAM_STALE_DECISION");
+      current.decisionCount++;
+      current.status = "RUNNING";
+      s.operations.find((o) => o.id === id)!.status = "INFLIGHT";
+    });
+    let decision: TeamDecision;
+    try {
+      decision = TeamDecisionSchema.parse(await this.ports.decide(view, operation));
+      await this.change(runId, (s) => {
+        const op = s.operations.find((o) => o.id === id)!;
+        op.status = "COMPLETED";
+        op.output = decision;
+      });
+    } catch (error) {
+      const notIssued =
+        error instanceof DevflowError &&
+        (error.details as { requestIssued?: boolean } | undefined)?.requestIssued === false;
+      await this.change(runId, (s) => {
+        const op = s.operations.find((o) => o.id === id)!;
+        op.status = notIssued ? "NOT_ISSUED" : "UNKNOWN";
+        op.error = error instanceof Error ? error.message : String(error);
+      });
+      throw error;
+    }
+    const originalEvidence = new Set(agent.observedEvidenceIds);
+    let duplicateOnly = true;
+    for (let index = 0; index < decision.actions.length; index++) {
+      state = await this.load(runId);
+      if (state.status !== "RUNNING") break;
+      const action = decision.actions[index]!;
+      const actionKey = teamDigest({ action, source: state.sourceIdentity });
+      if (state.agents.find((a) => a.id === agentId)!.seenActions.includes(actionKey)) continue;
+      duplicateOnly = false;
+      await this.apply(runId, agentId, action, `${id}:action:${index}`, decision.summary);
+      await this.change(runId, (s) => {
+        s.agents.find((a) => a.id === agentId)!.seenActions.push(actionKey);
+      });
+    }
+    await this.change(runId, (s) => {
+      const current = s.agents.find((a) => a.id === agentId)!;
+      const observed =
+        current.role === "INVESTIGATOR"
+          ? [...new Set([...view.evidence.map((e) => e.id), ...current.observedEvidenceIds])]
+          : s.evidence.filter((e) => e.valid).map((e) => e.id);
+      const progress = observed.some((id) => !originalEvidence.has(id));
+      current.observedEvidenceIds = observed;
+      current.noProgress = progress ? 0 : current.noProgress + 1;
+      current.inboxCursor = Math.max(current.inboxCursor, ...inbox.map((m) => m.sequence));
+      // History records preserve a bounded view without recursively embedding its own history.
+      current.history.push({ input: { ...view, history: undefined }, output: decision });
+      if (current.status === "RUNNING") current.status = "READY";
+      if (duplicateOnly || current.noProgress >= 2) {
+        current.status = "BLOCKED";
+        for (const t of s.tasks.filter(
+          (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+        )) {
+          t.status = "BLOCKED";
+          t.reason = "STALLED";
+        }
+        if (agentId === s.coordinatorId && s.status === "RUNNING") {
+          s.status = "STOPPED";
+          s.stopReason = "STALLED";
+          s.missing.push("Repeated actions or two turns without new observed evidence.");
+        }
+      }
+    });
+  }
+
+  private async apply(
+    runId: string,
+    agentId: string,
+    action: TeamAction,
+    operationId: string,
+    summary: string,
+  ) {
+    const state = await this.load(runId),
+      agent = state.agents.find((a) => a.id === agentId)!;
+    const manager = agent.role !== "INVESTIGATOR";
+    if (["DELEGATE", "CANCEL", "PROPOSE_PLAN", "STOP"].includes(action.type) && !manager)
+      fail("TEAM_ROLE_DENIED");
+    if (action.type === "DELEGATE" && state.mode === "single") fail("SINGLE_CANNOT_DELEGATE");
+    if (action.type === "READ" || action.type === "SEARCH" || action.type === "RELATIONS") {
+      if (agent.role === "COORDINATOR") fail("COORDINATOR_MUST_DELEGATE_SOURCE_IO");
+      const operation: TeamOperation = {
+        id: operationId,
+        agentId,
+        kind: "TOOL",
+        status: "INFLIGHT",
+        input: action,
+      };
+      await this.change(runId, (s) => s.operations.push(operation));
+      try {
+        const evidence = await this.ports.observe(action, operation);
+        await this.change(runId, (s) => {
+          for (const e of evidence) {
+            if (
+              e.runId !== runId ||
+              e.repositoryId !== s.repositoryId ||
+              e.sourceIdentity !== s.sourceIdentity ||
+              e.contentSha256 !== teamDigest(e.content)
+            )
+              fail("TEAM_EVIDENCE_IDENTITY_INVALID");
+            if (!s.evidence.some((row) => row.id === e.id)) s.evidence.push(e);
+            const a = s.agents.find((a) => a.id === agentId)!;
+            if (!a.observedEvidenceIds.includes(e.id)) a.observedEvidenceIds.push(e.id);
+          }
+          const op = s.operations.find((o) => o.id === operationId)!;
+          op.status = "COMPLETED";
+          op.output = evidence.map((e) => e.id);
+        });
+      } catch (error) {
+        await this.change(runId, (s) => {
+          const op = s.operations.find((o) => o.id === operationId)!;
+          op.status = "UNKNOWN";
+          op.error = String(error);
+        });
+        throw error;
+      }
+      return;
+    }
+    await this.change(runId, (s) => {
+      if ("evidenceIds" in action) this.refs(s, action.evidenceIds);
+      switch (action.type) {
+        case "DELEGATE": {
+          if (s.tasks.some((t) => t.key === action.key)) fail("TEAM_DUPLICATE_TASK");
+          if (s.tasks.length >= s.config.maxTasks) fail("TEAM_TASK_LIMIT");
+          if (action.dependsOn.some((id) => !s.tasks.some((t) => t.id === id)))
+            fail("TEAM_DEPENDENCY_UNKNOWN");
+          let child = s.agents.find((a) => a.role === "INVESTIGATOR" && a.status === "COMPLETED");
+          if (!child) {
+            if (
+              s.agents.filter((a) => a.role === "INVESTIGATOR").length >= s.config.maxInvestigators
+            )
+              fail("TEAM_AGENT_LIMIT");
+            child = this.agent(runId, randomUUID(), "INVESTIGATOR");
+            s.agents.push(child);
+          }
+          const taskId = randomUUID();
+          child.status = "READY";
+          child.taskIds.push(taskId);
+          s.tasks.push({
+            id: taskId,
+            key: action.key,
+            agentId: child.id,
+            goal: action.goal,
+            dependsOn: action.dependsOn,
+            evidenceIds: action.evidenceIds,
+            status: "READY",
+          });
+          break;
+        }
+        case "SEND": {
+          if (s.messages.some((m) => m.idempotencyKey === operationId)) break;
+          if (s.messages.length >= s.config.maxMessages) fail("TEAM_MESSAGE_LIMIT");
+          const target = s.agents.find((a) => a.id === action.toAgentId);
+          const relatedTask = s.tasks.find((t) => t.id === action.taskId);
+          if (
+            !target ||
+            !relatedTask ||
+            (!manager && relatedTask.agentId !== agentId && relatedTask.agentId !== target.id)
+          )
+            fail("TEAM_MESSAGE_TARGET_INVALID");
+          if (
+            action.replyTo &&
+            !s.messages.some((m) => m.id === action.replyTo && m.to === agentId)
+          )
+            fail("TEAM_REPLY_ID_INVALID");
+          s.messages.push({
+            id: randomUUID(),
+            sequence: s.messages.length + 1,
+            from: agentId,
+            to: target.id,
+            taskId: action.taskId,
+            type: action.messageType,
+            body: action.body,
+            evidenceIds: action.evidenceIds,
+            ...(action.replyTo ? { replyTo: action.replyTo } : {}),
+            idempotencyKey: operationId,
+            sourceIdentity: s.sourceIdentity,
+          });
+          if (target.status === "COMPLETED") {
+            target.status = "READY";
+            if (relatedTask.agentId === target.id) relatedTask.status = "READY";
+          }
+          break;
+        }
+        case "CANCEL": {
+          const t = s.tasks.find((t) => t.id === action.taskId);
+          if (!t) fail("TEAM_TASK_UNKNOWN");
+          t!.status = "CANCELLED";
+          t!.reason = action.reason;
+          s.agents.find((a) => a.id === t!.agentId)!.status = "CANCELLED";
+          break;
+        }
+        case "RESULT": {
+          if (manager) fail("TEAM_RESULT_REQUIRES_ASSIGNMENT");
+          for (const t of s.tasks.filter(
+            (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+          )) {
+            t.status = "COMPLETED";
+            t.result = {
+              summary,
+              evidenceIds: action.evidenceIds,
+              hypotheses: action.hypotheses,
+              missing: action.missing,
+            };
+          }
+          s.agents.find((a) => a.id === agentId)!.status = "COMPLETED";
+          break;
+        }
+        case "PROPOSE_PLAN":
+          s.status = "READY_FOR_PLAN";
+          s.selectedEvidenceIds = action.evidenceIds;
+          s.missing = action.missing;
+          break;
+        case "STOP":
+          s.status = "STOPPED";
+          s.stopReason = action.reason;
+          s.missing = action.missing;
+          break;
+      }
+    });
+  }
+
+  private refs(s: TeamSnapshot, ids: string[]) {
+    if (ids.some((id) => !s.evidence.some((e) => e.id === id && e.valid)))
+      fail("TEAM_EVIDENCE_REFERENCE_INVALID");
+  }
+  private agent(runId: string, id: string, role: TeamAgent["role"]): TeamAgent {
+    return {
+      id,
+      runId,
+      role,
+      sessionId: randomUUID(),
+      status: "READY",
+      taskIds: [],
+      decisionCount: 0,
+      inboxCursor: 0,
+      history: [],
+      noProgress: 0,
+      seenActions: [],
+      observedEvidenceIds: [],
+    };
+  }
+  private async stop(runId: string, reason: string, missing: string[]) {
+    await this.change(runId, (s) => {
+      s.status = "STOPPED";
+      s.stopReason = reason;
+      s.missing = missing;
+    });
+  }
+  private async load(runId: string) {
+    const s = await this.ports.store.load(runId);
+    return s ?? fail("TEAM_NOT_INITIALIZED");
+  }
+  private async change(runId: string, mutate: (state: TeamSnapshot) => unknown) {
+    for (let i = 0; i < 16; i++) {
+      this.ports.signal.throwIfAborted();
+      const state = await this.load(runId),
+        revision = state.revision;
+      mutate(state);
+      state.revision++;
+      if (await this.ports.store.compareAndSwap(runId, revision, state, this.ports.lease)) {
+        await this.ports.onChange?.(state);
+        return;
+      }
+    }
+    fail("TEAM_CONCURRENT_UPDATE_CONFLICT");
+  }
+}

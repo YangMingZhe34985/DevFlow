@@ -498,6 +498,23 @@ export async function optimizeContextProjection(input: {
       }
       current = await measure(render());
     }
+  // Small references can cost more than their original payload. Prefer the whole validated
+  // source view when it fits and is cheaper; never restore pre-invalidation history.
+  if (fits() && (references.length || sourceReferences.length || omitted.length)) {
+    const plainView = await measure({ ...requestBase, messages: source });
+    if (
+      plainView.prepared &&
+      plainView.bytes <= current.bytes &&
+      plainView.bytes <= input.maxBytes &&
+      plainView.tokens <= (input.maxInputTokens ?? Number.MAX_SAFE_INTEGER)
+    ) {
+      current = plainView;
+      references.length = 0;
+      sourceReferences.length = 0;
+      omitted.length = 0;
+      rows.forEach((row) => retained.add(row.index));
+    }
+  }
   const artifact: ContextProjectionArtifact = {
     version: "context-projection-v1",
     historySha256: identity(input.history ?? input.request.messages),

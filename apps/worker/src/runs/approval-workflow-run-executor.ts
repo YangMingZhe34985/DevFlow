@@ -5704,6 +5704,14 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           ? {
               contextCompression: {
                 model: this.modelBindings.get(input.model)!.raw,
+                ...(() => {
+                  const binding = this.modelBindings.get(input.model)!.provenance;
+                  const prices = JSON.parse(
+                    this.environment.DEVFLOW_MODEL_PRICES_JSON ?? "{}",
+                  ) as Record<string, ModelResourcePrice>;
+                  const price = prices[`${binding.provider}:${binding.model}`];
+                  return price ? { mainPrice: price } : {};
+                })(),
                 maxCalls: this.environment.DEVFLOW_CONTEXT_COMPRESSION_MAX_CALLS ?? 1,
                 maxInputTokens: Math.min(
                   this.environment.DEVFLOW_CONTEXT_COMPRESSION_MAX_INPUT_TOKENS ?? 6000,
@@ -5722,6 +5730,22 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                     input.codingSession || input.purpose === "IMPLEMENTATION" ? "EXECUTE" : "REPAIR"
                   ]?.maxOutputTokens ?? 8192,
                 onRecord: async (summary, context) => {
+                  if (!summary.requestIssued && summary.status !== "REUSED") {
+                    await this.database.events.append({
+                      runId: input.run.id,
+                      type: "WORKFLOW_CHECKPOINT",
+                      occurredAt: new Date().toISOString(),
+                      payload: asJson({
+                        purpose: input.purpose,
+                        contextCompression: {
+                          status: summary.status,
+                          requestIssued: false,
+                          viewSha256: context.viewSha256,
+                        },
+                      }),
+                    });
+                    return;
+                  }
                   const content = JSON.stringify({
                     version: "context-compression-artifact-v1",
                     purpose: input.purpose,

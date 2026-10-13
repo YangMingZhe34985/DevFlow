@@ -3,6 +3,7 @@ import { z } from "zod";
 import { prepareStageContext, type ContextStage } from "./stage-context.js";
 import {
   prepareCompressedStageContext,
+  summarizeCodingProjection,
   type ContextCompressionOptions,
   type ContextCompressionState,
 } from "./context-compression.js";
@@ -648,6 +649,133 @@ export class DefaultAgentRuntime implements AgentRuntime {
           }
           const priorCompressionReserve = state.contextCompression?.pendingTokenReserve ?? 0;
           const compressionStepId = randomUUID();
+          const compressionOptions: ContextCompressionOptions | undefined =
+            !request.contextCompression ||
+            (!request.codingSession && (prePatch || postPatch?.active))
+              ? undefined
+              : {
+                  ...request.contextCompression,
+                  onRequest: async (reservation) => {
+                    state = await checkpoint(context, {
+                      ...state,
+                      stepCount: state.stepCount + 1,
+                      contextCompression: reservation.state,
+                      metrics: {
+                        ...state.metrics,
+                        modelCalls: state.metrics.modelCalls + 1,
+                      },
+                    });
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "STEP_STARTED",
+                      occurredAt: new Date().toISOString(),
+                      payload: { step: state.stepCount, contextCompression: true },
+                    });
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "WORKFLOW_CHECKPOINT",
+                      occurredAt: new Date().toISOString(),
+                      payload: {
+                        contextCompressionReservation: { delta: reservation.tokens },
+                      },
+                    });
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "LLM_REQUEST",
+                      occurredAt: new Date().toISOString(),
+                      payload: {
+                        contextCompression: true,
+                        contextCompressionState: jsonValue(reservation.state),
+                        outputReserveTokens: request.contextCompression!.maxOutputTokens ?? 2048,
+                      },
+                    });
+                    await request.contextCompression?.onRequest?.(reservation);
+                  },
+                  onResponse: async (summary) => {
+                    const reserve =
+                      (state.contextCompression?.pendingTokenReserve ?? 0) -
+                      priorCompressionReserve;
+                    state = await checkpoint(context, {
+                      ...state,
+                      contextCompression: {
+                        ...state.contextCompression!,
+                        pendingTokenReserve: priorCompressionReserve,
+                      },
+                      metrics: {
+                        ...state.metrics,
+                        modelLatencyMs:
+                          state.metrics.modelLatencyMs + nonnegativeInteger(summary.latencyMs),
+                        reasoningTokens:
+                          state.metrics.reasoningTokens +
+                          nonnegativeInteger(summary.reasoningTokens ?? 0),
+                        tokenUsage: {
+                          inputTokens:
+                            state.metrics.tokenUsage.inputTokens + summary.usage.inputTokens,
+                          outputTokens:
+                            state.metrics.tokenUsage.outputTokens + summary.usage.outputTokens,
+                          totalTokens:
+                            state.metrics.tokenUsage.totalTokens + summary.usage.totalTokens,
+                        },
+                      },
+                    });
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "WORKFLOW_CHECKPOINT",
+                      occurredAt: new Date().toISOString(),
+                      payload: { contextCompressionReservation: { delta: -reserve } },
+                    });
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "LLM_RESPONSE",
+                      occurredAt: new Date().toISOString(),
+                      payload: {
+                        ok: true,
+                        contextCompression: true,
+                        finishReason: summary.finishReason,
+                        latencyMs: summary.latencyMs,
+                        usage: jsonValue(summary.usage),
+                        reasoningTokens: summary.reasoningTokens ?? 0,
+                      },
+                    });
+                    assertExecutionBudget(
+                      request,
+                      "totalTokens",
+                      state.metrics.tokenUsage.totalTokens +
+                        (state.contextCompression?.pendingTokenReserve ?? 0),
+                    );
+                    await request.contextCompression?.onResponse?.(summary);
+                  },
+                  onError: async (latencyMs, error) => {
+                    state = await checkpoint(context, {
+                      ...state,
+                      metrics: {
+                        ...state.metrics,
+                        modelLatencyMs:
+                          state.metrics.modelLatencyMs + nonnegativeInteger(latencyMs),
+                      },
+                    });
+                    await context.emit({
+                      runId: context.runId,
+                      stepId: compressionStepId,
+                      type: "LLM_RESPONSE",
+                      level: "WARN",
+                      occurredAt: new Date().toISOString(),
+                      payload: {
+                        ok: false,
+                        contextCompression: true,
+                        latencyMs,
+                        unknownUsageReservedTokens:
+                          state.contextCompression?.pendingTokenReserve ?? 0,
+                      },
+                    });
+                    await request.contextCompression?.onError?.(latencyMs, error);
+                  },
+                };
           let projectedMessages = request.codingSession
             ? currentMessages
             : request.contextStage
@@ -682,138 +810,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
                         request.modelSettings?.maxOutputTokens ??
                         8192,
                     },
-                    ...(!request.contextCompression || prePatch || postPatch?.active
-                      ? {}
-                      : {
-                          compression: {
-                            ...request.contextCompression,
-                            onRequest: async (reservation) => {
-                              state = await checkpoint(context, {
-                                ...state,
-                                stepCount: state.stepCount + 1,
-                                contextCompression: reservation.state,
-                                metrics: {
-                                  ...state.metrics,
-                                  modelCalls: state.metrics.modelCalls + 1,
-                                },
-                              });
-                              await context.emit({
-                                runId: context.runId,
-                                stepId: compressionStepId,
-                                type: "STEP_STARTED",
-                                occurredAt: new Date().toISOString(),
-                                payload: { step: state.stepCount, contextCompression: true },
-                              });
-                              await context.emit({
-                                runId: context.runId,
-                                stepId: compressionStepId,
-                                type: "WORKFLOW_CHECKPOINT",
-                                occurredAt: new Date().toISOString(),
-                                payload: {
-                                  contextCompressionReservation: { delta: reservation.tokens },
-                                },
-                              });
-                              await context.emit({
-                                runId: context.runId,
-                                stepId: compressionStepId,
-                                type: "LLM_REQUEST",
-                                occurredAt: new Date().toISOString(),
-                                payload: {
-                                  contextCompression: true,
-                                  contextCompressionState: jsonValue(reservation.state),
-                                  outputReserveTokens:
-                                    request.contextCompression!.maxOutputTokens ?? 2048,
-                                },
-                              });
-                              await request.contextCompression?.onRequest?.(reservation);
-                            },
-                            onResponse: async (summary) => {
-                              const reserve =
-                                (state.contextCompression?.pendingTokenReserve ?? 0) -
-                                priorCompressionReserve;
-                              state = await checkpoint(context, {
-                                ...state,
-                                contextCompression: {
-                                  ...state.contextCompression!,
-                                  pendingTokenReserve: priorCompressionReserve,
-                                },
-                                metrics: {
-                                  ...state.metrics,
-                                  modelLatencyMs:
-                                    state.metrics.modelLatencyMs +
-                                    nonnegativeInteger(summary.latencyMs),
-                                  reasoningTokens:
-                                    state.metrics.reasoningTokens +
-                                    nonnegativeInteger(summary.reasoningTokens ?? 0),
-                                  tokenUsage: {
-                                    inputTokens:
-                                      state.metrics.tokenUsage.inputTokens +
-                                      summary.usage.inputTokens,
-                                    outputTokens:
-                                      state.metrics.tokenUsage.outputTokens +
-                                      summary.usage.outputTokens,
-                                    totalTokens:
-                                      state.metrics.tokenUsage.totalTokens +
-                                      summary.usage.totalTokens,
-                                  },
-                                },
-                              });
-                              await context.emit({
-                                runId: context.runId,
-                                stepId: compressionStepId,
-                                type: "WORKFLOW_CHECKPOINT",
-                                occurredAt: new Date().toISOString(),
-                                payload: { contextCompressionReservation: { delta: -reserve } },
-                              });
-                              await context.emit({
-                                runId: context.runId,
-                                stepId: compressionStepId,
-                                type: "LLM_RESPONSE",
-                                occurredAt: new Date().toISOString(),
-                                payload: {
-                                  ok: true,
-                                  contextCompression: true,
-                                  finishReason: summary.finishReason,
-                                  latencyMs: summary.latencyMs,
-                                  usage: jsonValue(summary.usage),
-                                  reasoningTokens: summary.reasoningTokens ?? 0,
-                                },
-                              });
-                              assertExecutionBudget(
-                                request,
-                                "totalTokens",
-                                state.metrics.tokenUsage.totalTokens +
-                                  (state.contextCompression?.pendingTokenReserve ?? 0),
-                              );
-                              await request.contextCompression?.onResponse?.(summary);
-                            },
-                            onError: async (latencyMs, error) => {
-                              state = await checkpoint(context, {
-                                ...state,
-                                metrics: {
-                                  ...state.metrics,
-                                  modelLatencyMs:
-                                    state.metrics.modelLatencyMs + nonnegativeInteger(latencyMs),
-                                },
-                              });
-                              await context.emit({
-                                runId: context.runId,
-                                stepId: compressionStepId,
-                                type: "LLM_RESPONSE",
-                                level: "WARN",
-                                occurredAt: new Date().toISOString(),
-                                payload: {
-                                  ok: false,
-                                  contextCompression: true,
-                                  latencyMs,
-                                  unknownUsageReservedTokens:
-                                    state.contextCompression?.pendingTokenReserve ?? 0,
-                                },
-                              });
-                              await request.contextCompression?.onError?.(latencyMs, error);
-                            },
-                          },
-                        }),
+                    ...(compressionOptions ? { compression: compressionOptions } : {}),
                   }).then(async (artifact) => {
                     if (artifact.compression.requestIssued)
                       await context.emit({
@@ -1217,7 +1214,68 @@ export class DefaultAgentRuntime implements AgentRuntime {
               : tool,
           );
           execution.effectiveTools = new Map(availableTools.map((tool) => [tool.name, tool]));
-          const finalProjection = await projectionFor(availableTools);
+          let finalProjection = await projectionFor(availableTools);
+          if (finalProjection) {
+            const continuation = request.continuationReserve?.(budgetOperation());
+            const compressed = await summarizeCodingProjection({
+              projection: finalProjection,
+              ...(compressionOptions ? { options: compressionOptions } : {}),
+              ...(state.contextCompression ? { state: state.contextCompression } : {}),
+              workspaceRevision: execution.workspaceRevision,
+              maxBytes: request.contextMaxBytes ?? 96000,
+              maxInputTokens:
+                request.contextInputTokens ?? Math.floor((request.contextMaxBytes ?? 96000) / 3),
+              remainingTokens:
+                (request.executionBudget?.maxTotalTokens ?? Number.MAX_SAFE_INTEGER) -
+                state.metrics.tokenUsage.totalTokens,
+              remainingCalls:
+                (request.executionBudget?.maxModelCalls ?? request.maxSteps) -
+                state.metrics.modelCalls +
+                1,
+              remainingSteps:
+                (adaptiveStepBudget?.currentLimit ?? request.maxSteps) - state.stepCount + 1,
+              remainingTimeMs: phaseDeadlineAt - Date.now(),
+              mainCalls:
+                !submissionOnly && !execution.editCorrectionUsed && !correctingEdit ? 2 : 1,
+              mainTimeoutMs: request.timeReserve?.requestMs ?? 60000,
+              downstream: {
+                ...continuation,
+                logicalToolCalls: request.continuationTools?.(budgetOperation()) ?? 0,
+              },
+              ...(this.model.prepareRequest
+                ? { prepare: (r: ModelRequest) => this.model.prepareRequest!(r, { signal }) }
+                : {}),
+              signal,
+            });
+            const released =
+              (state.contextCompression?.pendingTokenReserve ?? 0) -
+              compressed.compression.state.pendingTokenReserve;
+            if (released > 0)
+              await context.emit({
+                runId: context.runId,
+                stepId: compressionStepId,
+                type: "WORKFLOW_CHECKPOINT",
+                occurredAt: new Date().toISOString(),
+                payload: { contextCompressionReservation: { delta: -released } },
+              });
+            state = await checkpoint(context, {
+              ...state,
+              contextCompression: compressed.compression.state,
+            });
+            if (compressed.compression.requestIssued)
+              await context.emit({
+                runId: context.runId,
+                stepId: compressionStepId,
+                type: "STEP_COMPLETED",
+                occurredAt: new Date().toISOString(),
+                payload: { contextCompression: true, summaryStatus: compressed.compression.status },
+              });
+            finalProjection = compressed;
+            finalProjection.artifact.semanticCompression = {
+              status: compressed.compression.status,
+              requestIssued: compressed.compression.requestIssued,
+            };
+          }
           if (finalProjection) {
             await context.onContextProjection?.(finalProjection.artifact);
             projectedMessages = [...finalProjection.request.messages];

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { LanguageModelPort, ModelRequest, ModelResponse } from "@devflow/agent";
 import { readFileContent } from "@devflow/sandbox";
 import {
+  DevflowError,
   PlanProposalSchema,
   type AgentPlan,
   type ExecutionContract,
@@ -147,6 +148,8 @@ export interface PlanAttempt {
     preflight: PlanPreflight;
     finishReason?: ModelResponse["finishReason"];
     actualTokens?: number;
+    /** Undefined means transport outcome is unknown, never infer dispatch from attempt count. */
+    requestIssued?: boolean;
   }[];
   outputRegeneration?: {
     trigger: "LENGTH" | "COMPACT_SCHEMA";
@@ -399,7 +402,16 @@ class PlanSession {
             ? value.code
             : "PLAN_PREPARATION_FAILED",
       error instanceof Error ? error.message : String(error),
-      error instanceof Blocked ? error.details : undefined,
+      error instanceof Blocked
+        ? error.details
+        : error instanceof DevflowError && error.details && typeof error.details === "object"
+          ? Object.fromEntries(
+              Object.entries(error.details).filter(
+                ([, value]) =>
+                  value === null || ["string", "number", "boolean"].includes(typeof value),
+              ),
+            )
+          : undefined,
     );
   }
   async finish(): Promise<void> {
@@ -992,6 +1004,14 @@ class PlanSession {
       );
     } catch (error) {
       this.attempt.metrics.modelLatencyMs += Date.now() - started;
+      if (
+        error instanceof DevflowError &&
+        error.details &&
+        typeof error.details === "object" &&
+        "requestIssued" in error.details &&
+        typeof error.details.requestIssued === "boolean"
+      )
+        row.requestIssued = error.details.requestIssued;
       await this.hooks.onGenerationError?.({
         purpose,
         formatRepair,
@@ -1001,6 +1021,7 @@ class PlanSession {
       throw error;
     }
     const metrics = this.attempt.metrics;
+    row.requestIssued = true;
     metrics.inputTokens += response.usage.inputTokens;
     metrics.outputTokens += response.usage.outputTokens;
     metrics.totalTokens += response.usage.totalTokens;

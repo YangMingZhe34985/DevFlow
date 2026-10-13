@@ -148,7 +148,9 @@ for (const invalid of ["none", "changed", "incomplete", "stale", "used"] as cons
       edit(),
       async (request) => {
         expect(JSON.stringify(request.messages)).toContain("lineEndingMode=MATCH_FILE");
-        expect((await stateStore.load(f.context.runId))?.executionConvergence?.noProgressStreak).toBe(2);
+        expect(
+          (await stateStore.load(f.context.runId))?.executionConvergence?.noProgressStreak,
+        ).toBe(2);
         return fakeModelResponse({
           toolCalls: [...edit().toolCalls, ...response("finishPhase").toolCalls],
         });

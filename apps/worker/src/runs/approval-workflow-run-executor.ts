@@ -1198,7 +1198,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       });
       if (!result.plan)
         throw new DevflowError({
-          code: "INSUFFICIENT_EVIDENCE",
+          code: result.attempt.diagnostics.some((d) =>
+            /PREFLIGHT_BLOCKED|BUDGET|TOKEN_RESERVE/u.test(d.code),
+          )
+            ? "EXECUTION_BUDGET_EXCEEDED"
+            : "INSUFFICIENT_EVIDENCE",
           message: `PlanAgent stopped with ${result.attempt.status}; inspect its attempt diagnostics before changing scope or retrying.`,
           details: asJson({ status: result.attempt.status, attempt: result.attempt }),
         });
@@ -3779,7 +3783,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               : "INSUFFICIENT_EVIDENCE",
             message: `REPLAN_NO_VERIFIED_APPROVABLE_SCOPE: ${replan.attempt.diagnostics.map((d) => `${d.code}: ${d.message}`).join("; ")}`,
             details: asJson({
-              requestIssued: replan.attempt.metrics.modelCalls > 0,
+              requestIssued: replan.attempt.requests.some((r) => r.requestIssued === true)
+                ? true
+                : replan.attempt.requests.some((r) => r.requestIssued === undefined)
+                  ? null
+                  : false,
               diagnostics: replan.attempt.diagnostics,
             }),
           });

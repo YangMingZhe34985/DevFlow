@@ -1,7 +1,31 @@
 import { createHash } from "node:crypto";
+import { DevflowError } from "@devflow/shared";
 import { expect, it, vi } from "vitest";
 import { PlanAgent } from "../src/runs/plan-agent.js";
 import { codingPlannerTokenLease } from "../src/runs/coding-budget.js";
+
+it("preserves Scheduler non-dispatch diagnostics instead of equating a decision attempt with HTTP", async () => {
+  const f = fixture();
+  const result = await new PlanAgent().run({
+    ...f.input,
+    model: {
+      generate: async () => {
+        throw new DevflowError({
+          code: "EXECUTION_BUDGET_EXCEEDED",
+          message: "required continuation exceeds remaining cost",
+          details: { requestIssued: false, missingCostMicros: 10 },
+        });
+      },
+    },
+  });
+  expect(result.status).toBe("BLOCKED");
+  expect(result.attempt.metrics.modelCalls).toBe(1);
+  expect(result.attempt.requests[0]?.requestIssued).toBe(false);
+  expect(result.attempt.diagnostics.at(-1)).toMatchObject({
+    code: "EXECUTION_BUDGET_EXCEEDED",
+    details: { requestIssued: false, missingCostMicros: 10 },
+  });
+});
 
 const content = Array.from(
   { length: 60 },

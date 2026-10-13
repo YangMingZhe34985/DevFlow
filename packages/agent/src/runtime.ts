@@ -357,6 +357,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
           call.callId !== undefined &&
           hostVerificationCalls.delete(call.callId);
         if (
+          execution.effectiveTools &&
+          !execution.effectiveTools.has(call.name) &&
+          !hostVerification
+        )
+          return runtimeRejection(
+            `TOOL_NOT_AVAILABLE: ${call.name} is not available in this decision. Use only the advertised tools: ${[...execution.effectiveTools.keys()].join(", ")}. No tool was executed; this does not reopen exploration or grant parameter recovery.`,
+            "EXPLORATION_LIMIT",
+          );
+        if (
           submissionOnly &&
           call.name !== "finishPhase" &&
           !(

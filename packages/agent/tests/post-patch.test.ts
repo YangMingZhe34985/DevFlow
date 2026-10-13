@@ -25,6 +25,17 @@ const finish: ModelToolCall = {
 };
 const read: ModelToolCall = { id: "r", name: "readFile", input: { path: "a.ts" } };
 
+it("does not reopen unavailable search or grant recovery after a stable patch", async () => {
+  const result = await run({
+    calls: [[write], [{ id: "search", name: "searchCode", input: { pattern: "value" } }], [finish]],
+  });
+  expect(result.result.status).toBe("SUCCEEDED");
+  expect(JSON.stringify(result.model.requests[2]?.messages)).toContain("TOOL_NOT_AVAILABLE");
+  expect(JSON.stringify(result.model.requests[2]?.messages)).not.toContain(
+    "PROTOCOL_CORRECTION_REQUIRED",
+  );
+});
+
 it("retains approved Plan inspect reads after a mutation without adding them to write scope", () => {
   const controller = new PostPatchController(["a.ts"]);
   controller.necessaryReadPaths = ["a.ts", "interface.ts"];

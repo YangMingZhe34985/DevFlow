@@ -336,3 +336,36 @@ it("still rejects an unauthorized path and provides only the existing bounded sc
     authorizationHandoffUsed: true,
   });
 });
+
+it.each([
+  { pattern: "value", path: sourcePath },
+  { query: "value", path: sourcePath },
+])(
+  "rejects an unavailable registered search before execution or parameter recovery (%j)",
+  async (input) => {
+    const f = fixture([
+      async (request) => {
+        expect(request.tools.map((tool) => tool.name)).not.toContain("searchCode");
+        return toolCall("searchCode", input);
+      },
+      async (request) => {
+        expect(JSON.stringify(request.messages)).toContain("TOOL_NOT_AVAILABLE");
+        expect(JSON.stringify(request.messages)).toContain("EXPLORATION_LIMIT");
+        expect(request.tools.map((tool) => tool.name)).not.toContain("searchCode");
+        expect((await f.store.load(f.context.runId))?.executionRecovery).toMatchObject({
+          used: false,
+          authorizationHandoffUsed: false,
+        });
+        return finish();
+      },
+    ]);
+    f.context.tools.push(f.registry.get("searchCode")!);
+    f.context.executeTool = async () => {
+      throw new Error("Unavailable tools must never reach the executor.");
+    };
+    expect((await f.run()).status).toBe("SUCCEEDED");
+    expect(f.model.requests).toHaveLength(2);
+    expect(f.readInputs).toHaveLength(0);
+    expect(f.source()).toBe("export const value = 1;\n");
+  },
+);

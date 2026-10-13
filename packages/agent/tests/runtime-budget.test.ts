@@ -552,7 +552,20 @@ function createContext(stateStore?: AgentStateStore): {
         description: "Exercise hard execution limits.",
       },
       signal: new AbortController().signal,
-      tools: [],
+      tools: [
+        {
+          name: "readFile",
+          description: "Read source",
+          inputSchema: z.object({ path: z.string() }),
+          readOnly: true,
+        },
+        {
+          name: "writeFile",
+          description: "Write source",
+          inputSchema: z.object({ path: z.string(), content: z.string() }),
+          mutatesWorkspace: true,
+        },
+      ],
       ...(stateStore === undefined ? {} : { stateStore }),
       async emit(event) {
         events.push(event);

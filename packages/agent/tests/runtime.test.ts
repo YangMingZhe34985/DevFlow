@@ -37,7 +37,13 @@ function createContext(
         description: "Inspect the failure, fix it and run tests.",
       },
       signal,
-      tools: [],
+      tools: ["readFile", "writeFile", "applyPatch", "replaceText", "exec", "finishPhase"].map(
+        (name) => ({
+          name,
+          description: `Fixture ${name}`,
+          inputSchema: z.record(z.string(), z.unknown()),
+        }),
+      ),
       ...(stateStore === undefined ? {} : { stateStore }),
       async emit(event) {
         events.push(event);

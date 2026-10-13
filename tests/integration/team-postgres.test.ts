@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { PrismaDatabaseAdapter, databaseExecutionLease } from "@devflow/database";
-import type { TeamLease, TeamSnapshot } from "@devflow/shared";
+import type { TeamLease, TeamSnapshot, TeamMessageArgumentIssue } from "@devflow/shared";
 import { describe, expect, it } from "vitest";
 import { TeamEngine } from "../../apps/worker/src/team/engine.js";
 import { teamBudgetStore } from "../../apps/worker/src/team/budget-store.js";
@@ -12,21 +12,159 @@ import {
 describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
   "durable team transactions",
   () => {
-    it("persists the message correction credit and refuses to renew it across connections", async () =>
+    it.each(["evidence", "blocked-target"] as const)(
+      "resumes %s rejection after a committed crash without replaying the original decision",
+      async (kind) =>
+        fixture(async (a, b, state, lease) => {
+          const agentId = randomUUID(),
+            taskId = randomUUID();
+          if (kind === "blocked-target") {
+            const seeded = structuredClone(state);
+            seeded.revision++;
+            seeded.agents.push({
+              ...structuredClone(state.agents[0]!),
+              id: agentId,
+              sessionId: randomUUID(),
+              role: "INVESTIGATOR",
+              status: "BLOCKED",
+              taskIds: [taskId],
+            });
+            seeded.tasks.push({
+              id: taskId,
+              key: "consumer",
+              agentId,
+              goal: "Check consumer",
+              sourceIdentity: "base",
+              dependsOn: [],
+              evidenceIds: [],
+              status: "BLOCKED",
+              reason: "BUDGET_STOP",
+            });
+            await a.teams.compareAndSwap(state.runId, state.revision, seeded, lease);
+          }
+          let originalCalls = 0,
+            correctionCalls = 0;
+          const first = new TeamEngine({
+            store: a.teams,
+            lease,
+            signal: AbortSignal.timeout(5000),
+            observe: async () => [],
+            decide: async () => {
+              originalCalls++;
+              return {
+                summary: "Frozen invalid protocol action",
+                actions:
+                  kind === "evidence"
+                    ? [{ type: "PROPOSE_PLAN", evidenceIds: ["guessed-id"], missing: [] }]
+                    : [
+                        {
+                          type: "SEND",
+                          toAgentId: agentId,
+                          taskId,
+                          messageType: "REQUEST_EVIDENCE",
+                          body: "Continue",
+                          evidenceIds: [],
+                        },
+                      ],
+              };
+            },
+            onChange: async (snapshot) => {
+              if (snapshot.agents[0]!.messageRecovery) throw Error("Crash after rejection commit");
+            },
+          });
+          await expect(
+            first.run(state.runId, { title: "Task", description: "Task" }, 8),
+          ).rejects.toThrow("Crash after rejection commit");
+          const saved = (await b.teams.load(state.runId))!;
+          expect(saved.agents[0]!.messageRecovery?.correctionOperationId).toBeUndefined();
+          const resumed = new TeamEngine({
+            store: b.teams,
+            lease,
+            signal: AbortSignal.timeout(5000),
+            observe: async () => [],
+            decide: async (view) => {
+              correctionCalls++;
+              expect(view.messageValidationFeedback?.issue.field).toBe(
+                kind === "evidence" ? "evidenceIds" : "toAgentId/taskId",
+              );
+              return {
+                summary: "Preserve the unresolved gap",
+                actions: [
+                  {
+                    type: "STOP",
+                    reason: "INSUFFICIENT_EVIDENCE",
+                    missing: ["Need a valid investigation target/evidence"],
+                  },
+                ],
+              };
+            },
+          });
+          await resumed.initialize({
+            runId: state.runId,
+            repositoryId: state.repositoryId,
+            sourceIdentity: "base",
+            mode: "team",
+          });
+          const final = await resumed.run(state.runId, { title: "Task", description: "Task" }, 8);
+          expect([originalCalls, correctionCalls]).toEqual([1, 1]);
+          expect(final.agents[0]!.decisionCount).toBe(2);
+          expect(final.agents[0]!.messageRecovery).toMatchObject({
+            originOperationId: saved.agents[0]!.messageRecovery!.originOperationId,
+            resolved: true,
+          });
+          expect(
+            final.operations.filter((o) => o.kind === "CONTROL" && o.status === "NOT_ISSUED"),
+          ).toHaveLength(1);
+          expect(final.messages).toEqual([]);
+          expect(final.selectedEvidenceIds).toEqual([]);
+          if (kind === "blocked-target")
+            expect(final.agents.find((x) => x.id === agentId)?.status).toBe("BLOCKED");
+          expect((await a.teams.load(state.runId))?.revision).toBe(final.revision);
+        }),
+    );
+
+    it.each<TeamMessageArgumentIssue>([
+      {
+        field: "replyTo",
+        expected: "messageId",
+        actual: "task-id",
+        reason: "TASK_ID_IN_MESSAGE_FIELD",
+        availableReplies: [],
+        guidance: "Omit replyTo for a new message.",
+      },
+      {
+        field: "evidenceIds",
+        expected: "currentVisibleEvidenceIds",
+        actual: "unknown",
+        reason: "EVIDENCE_ID_UNKNOWN_OR_STALE",
+        availableReplies: [],
+        invalidEvidenceIds: ["unknown"],
+        availableEvidence: [{ id: "source-1", path: "src.ts", fileSha256: "a".repeat(64) }],
+        guidance: "Choose a current visible evidence ID.",
+      },
+      {
+        field: "toAgentId/taskId",
+        expected: "availableAgentTaskPair",
+        actual: "investigator/task",
+        reason: "TARGET_UNAVAILABLE",
+        availableReplies: [],
+        target: {
+          agentId: "investigator",
+          status: "BLOCKED",
+          taskId: "task",
+          taskStatus: "BLOCKED",
+          reason: "BUDGET_STOP",
+        },
+        guidance: "Do not revive the blocked agent.",
+      },
+    ])("persists $field correction credit and refuses renewal across connections", async (issue) =>
       fixture(async (a, b, state, lease) => {
         const granted = structuredClone(state);
         granted.revision++;
         granted.agents[0]!.messageRecovery = {
           originOperationId: "decision-1:send",
           sourceIdentity: "base",
-          issue: {
-            field: "replyTo",
-            expected: "messageId",
-            actual: "task-id",
-            reason: "TASK_ID_IN_MESSAGE_FIELD",
-            availableReplies: [],
-            guidance: "Omit replyTo for a new message.",
-          },
+          issue,
         };
         expect(await a.teams.compareAndSwap(state.runId, state.revision, granted, lease)).toBe(
           true,
@@ -59,7 +197,8 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           reserved.agents[0]!.messageRecovery,
         );
         expect((await a.teams.load(state.runId))!.revision).toBe(reserved.revision);
-      }));
+      }),
+    );
     it("fences inherited Coding artifacts and events after lease loss", async () =>
       fixture(async (a, b, state, lease) => {
         await databaseExecutionLease.run({ ...lease, runId: state.runId }, async () => {

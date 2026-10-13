@@ -555,9 +555,13 @@ describe("dynamic collaboration core", () => {
         observe: async () => [],
       });
       await engine.initialize({ runId: "run", repositoryId: "repo", sourceIdentity: "base", mode });
-      await expect(engine.run("run", task, 12)).rejects.toThrow(
-        mode === "team" ? "REFERENCE_INVALID" : "CANNOT_DELEGATE",
-      );
+      if (mode === "team") {
+        const stopped = await engine.run("run", task, 12);
+        expect(stopped.status).toBe("STOPPED");
+        expect(stopped.stopReason).toBe("MESSAGE_CORRECTION_EXHAUSTED");
+        expect(stopped.selectedEvidenceIds).toEqual([]);
+        expect(stopped.agents[0]!.decisionCount).toBe(2);
+      } else await expect(engine.run("run", task, 12)).rejects.toThrow("CANNOT_DELEGATE");
     }
   });
 });

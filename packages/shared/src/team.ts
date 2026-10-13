@@ -131,11 +131,25 @@ export interface TeamAgent {
   };
 }
 export interface TeamMessageArgumentIssue {
-  field: "replyTo";
-  expected: "messageId";
+  field: "replyTo" | "evidenceIds" | "toAgentId/taskId";
+  expected: "messageId" | "currentVisibleEvidenceIds" | "availableAgentTaskPair";
   actual: string;
-  reason: "TASK_ID_IN_MESSAGE_FIELD" | "MESSAGE_ID_NOT_FOUND";
+  reason:
+    | "TASK_ID_IN_MESSAGE_FIELD"
+    | "MESSAGE_ID_NOT_FOUND"
+    | "EVIDENCE_ID_UNKNOWN_OR_STALE"
+    | "TARGET_UNAVAILABLE";
   availableReplies: { messageId: string; fromAgentId: string; taskId: string }[];
+  availableEvidence?: { id: string; path?: string; fileSha256?: string }[];
+  invalidEvidenceIds?: string[];
+  omittedEvidenceCount?: number;
+  target?: {
+    agentId: string;
+    status: TeamAgent["status"];
+    taskId: string;
+    taskStatus: string;
+    reason?: string;
+  };
   guidance: string;
 }
 export interface TeamTask {

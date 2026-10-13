@@ -81,6 +81,302 @@ async function setup(ports: Omit<TeamEnginePorts, "store" | "lease" | "signal">)
 }
 
 describe("bounded team message argument recovery", () => {
+  it("delivers only the explicitly corrected evidence reference and lets the recipient act on it", async () => {
+    let calls = 0;
+    const reads: string[] = [];
+    const { engine, store } = await setup({
+      decide: async (view) => {
+        if (view.role === "INVESTIGATOR") {
+          expect(view.inbox[0]?.evidenceIds).toEqual(["counterexample.ts"]);
+          return decision(
+            { type: "READ", path: "consumer.ts", startLine: 1, endLine: 1 },
+            { type: "RESULT", evidenceIds: ["counterexample.ts"], hypotheses: [], missing: [] },
+          );
+        }
+        calls++;
+        if (calls <= 2) {
+          if (calls === 2)
+            expect(view.messageValidationFeedback?.issue.invalidEvidenceIds).toEqual(["typo"]);
+          return decision({ ...send(), evidenceIds: [calls === 1 ? "typo" : "counterexample.ts"] });
+        }
+        return decision({ type: "PROPOSE_PLAN", evidenceIds: ["consumer.ts"], missing: [] });
+      },
+      observe: async (action) => {
+        if (action.type !== "READ") throw Error("Expected the recipient to read");
+        reads.push(action.path);
+        return [evidence(action.path)];
+      },
+    });
+    const old = (await store.load("run"))!;
+    await store.compareAndSwap("run", old.revision, {
+      ...old,
+      revision: old.revision + 1,
+      evidence: [evidence("counterexample.ts")],
+    });
+    const state = await engine.run("run", task, 8);
+    expect(state.status).toBe("READY_FOR_PLAN");
+    expect(state.messages).toHaveLength(1);
+    expect(state.messages[0]?.evidenceIds).toEqual(["counterexample.ts"]);
+    expect(reads).toEqual(["consumer.ts"]);
+    expect(state.operations.filter((o) => o.status === "NOT_ISSUED")).toHaveLength(1);
+    expect(state.agents[0]?.messageRecovery?.resolved).toBe(true);
+  });
+
+  for (const mismatch of ["unknown-agent", "wrong-task-owner", "superseded-task"] as const)
+    it(`reports ${mismatch} without delivering to or resetting the recipient`, async () => {
+      let calls = 0;
+      const { engine, store } = await setup({
+        decide: async (view) => {
+          calls++;
+          if (calls === 1)
+            return decision({
+              ...send(),
+              ...(mismatch === "unknown-agent" ? { toAgentId: "missing" } : {}),
+            });
+          expect(view.messageValidationFeedback?.issue.field).toBe("toAgentId/taskId");
+          return decision({
+            type: "STOP",
+            reason: "INSUFFICIENT_EVIDENCE",
+            missing: ["Target unavailable"],
+          });
+        },
+        observe: async () => {
+          throw Error("No investigation should dispatch");
+        },
+      });
+      const old = (await store.load("run"))!,
+        next = structuredClone(old);
+      next.revision++;
+      if (mismatch === "wrong-task-owner") next.tasks[0]!.agentId = next.coordinatorId;
+      if (mismatch === "superseded-task") {
+        next.agents[1]!.status = "READY";
+        next.tasks.push({ ...next.tasks[0]!, id: "new", key: "new", status: "WAITING" });
+      }
+      await store.compareAndSwap("run", old.revision, next);
+      const state = await engine.run("run", task, 6);
+      expect(state.status).toBe("STOPPED");
+      expect(state.messages).toEqual([]);
+      expect(state.agents[1]?.decisionCount).toBe(0);
+      expect(calls).toBe(2);
+    });
+
+  for (const violation of ["foreign-run", "corrupt-source", "hidden-evidence"] as const)
+    it(`never turns ${violation} evidence into a correctable authorized reference`, async () => {
+      const { engine, store } = await setup({
+        decide: async (view) =>
+          view.role === "INVESTIGATOR"
+            ? decision({ type: "RESULT", evidenceIds: ["secret.ts"], hypotheses: [], missing: [] })
+            : violation === "hidden-evidence"
+              ? decision(send())
+              : decision({ type: "PROPOSE_PLAN", evidenceIds: ["secret.ts"], missing: [] }),
+        observe: async () => [],
+      });
+      const old = (await store.load("run"))!;
+      const next = structuredClone(old);
+      next.revision++;
+      next.evidence.push({
+        ...evidence("secret.ts"),
+        ...(violation === "foreign-run"
+          ? { runId: "other-run" }
+          : violation === "corrupt-source"
+            ? { content: "tampered" }
+            : {}),
+      });
+      await store.compareAndSwap("run", old.revision, next);
+      await expect(engine.run("run", task, 8)).rejects.toThrow(
+        violation === "hidden-evidence"
+          ? "TEAM_MESSAGE_EVIDENCE_NOT_VISIBLE"
+          : "TEAM_EVIDENCE_IDENTITY_INVALID",
+      );
+      expect((await store.load("run"))!.selectedEvidenceIds).toEqual([]);
+      expect((await store.load("run"))!.agents.every((a) => !a.messageRecovery)).toBe(true);
+    });
+
+  it("does not cancel a reused Investigator's new assignment when cancelling its old task", async () => {
+    const { engine, store } = await setup({
+      decide: async () =>
+        decision(
+          { type: "CANCEL", taskId: "task", reason: "Old investigation no longer needed" },
+          { type: "STOP", reason: "INSUFFICIENT_EVIDENCE", missing: ["New task deferred"] },
+        ),
+      observe: async () => [],
+    });
+    const old = (await store.load("run"))!,
+      next = structuredClone(old);
+    next.revision++;
+    next.agents[1]!.status = "READY";
+    next.agents[1]!.taskIds.push("new-task");
+    next.tasks.push({ ...next.tasks[0]!, id: "new-task", key: "new", status: "READY" });
+    await store.compareAndSwap("run", old.revision, next);
+    const state = await engine.run("run", task, 4);
+    expect(state.tasks[0]!.status).toBe("CANCELLED");
+    expect(state.tasks[1]!.status).toBe("READY");
+    expect(state.agents[1]!.status).toBe("READY");
+  });
+  it("corrects an Investigator RESULT reference without losing evidence, accepting guessed IDs or stopping siblings", async () => {
+    let investigator = 0;
+    const { engine } = await setup({
+      decide: async (view) => {
+        if (view.role === "COORDINATOR") {
+          if (view.messageValidationFeedback) return decision(send());
+          if (!view.evidence.length) return decision(send("task"));
+          return decision({
+            type: "PROPOSE_PLAN",
+            evidenceIds: view.evidence.map((e) => e.id),
+            missing: [],
+          });
+        }
+        investigator++;
+        if (investigator === 1)
+          return decision({ type: "READ", path: "consumer.ts", startLine: 1, endLine: 1 });
+        if (investigator === 2)
+          return decision({
+            type: "RESULT",
+            evidenceIds: ["a".repeat(64)],
+            hypotheses: ["Unconfirmed consumer defect"],
+            missing: [],
+          });
+        expect(view.messageValidationFeedback?.issue).toMatchObject({
+          field: "evidenceIds",
+          invalidEvidenceIds: ["a".repeat(64)],
+          availableEvidence: [{ id: "consumer.ts" }],
+        });
+        expect(view.assignments).toHaveLength(1);
+        return decision({
+          type: "RESULT",
+          evidenceIds: ["consumer.ts"],
+          hypotheses: ["Unconfirmed consumer defect"],
+          missing: [],
+        });
+      },
+      observe: async () => [evidence("consumer.ts")],
+    });
+    const state = await engine.run("run", task, 12);
+    expect(state.status).toBe("READY_FOR_PLAN");
+    expect(investigator).toBe(3);
+    expect(state.tasks[0]?.result?.evidenceIds).toEqual(["consumer.ts"]);
+    expect(state.agents.find((a) => a.id === "investigator")?.messageRecovery?.resolved).toBe(true);
+    expect(
+      state.operations.filter((o) => o.failure?.message === "TEAM_EVIDENCE_REFERENCE_INVALID"),
+    ).toHaveLength(1);
+    expect(state.evidence.map((e) => e.id)).toEqual(["consumer.ts"]);
+  });
+
+  for (const terminal of ["BLOCKED", "CANCELLED"] as const)
+    it(`reports ${terminal} target and preserves its state while Coordinator chooses a legal handoff`, async () => {
+      let calls = 0;
+      const { engine, store } = await setup({
+        decide: async (view) => {
+          calls++;
+          expect(view.board[0]).toMatchObject({
+            status: terminal,
+            agentStatus: terminal,
+            reason: "BUDGET_STOP: insufficient followup capacity",
+          });
+          if (calls === 1) return decision(send());
+          expect(view.messageValidationFeedback?.issue).toMatchObject({
+            field: "toAgentId/taskId",
+            reason: "TARGET_UNAVAILABLE",
+            target: { status: terminal },
+          });
+          return decision({
+            type: "PROPOSE_PLAN",
+            evidenceIds: [],
+            missing: ["Consumer behavior remains unverified; investigator cannot continue."],
+          });
+        },
+        observe: async () => {
+          throw new Error("Blocked target must not execute");
+        },
+      });
+      const before = (await store.load("run"))!;
+      const next = structuredClone(before);
+      next.revision++;
+      next.agents[1]!.status = terminal;
+      next.tasks[0]!.status = terminal;
+      next.tasks[0]!.reason = "BUDGET_STOP: insufficient followup capacity";
+      await store.compareAndSwap("run", before.revision, next);
+      const state = await engine.run("run", task, 8);
+      expect(state.status).toBe("READY_FOR_PLAN");
+      expect(state.messages).toHaveLength(0);
+      expect(state.agents[1]!.status).toBe(terminal);
+      expect(state.agents[1]!.decisionCount).toBe(0);
+      expect(state.agents[0]!.noProgress).toBe(3);
+      expect(calls).toBe(2);
+      await engine.run("run", task, 8);
+      expect(calls).toBe(2);
+    });
+
+  for (const id of ["unknown", "stale"] as const)
+    it(`rejects repeated ${id} references once, including after durable rejection crash`, async () => {
+      let calls = 0,
+        crashed = false;
+      const { engine, store, config } = await setup({
+        decide: async () => {
+          calls++;
+          return decision({ type: "PROPOSE_PLAN", evidenceIds: [id], missing: [] });
+        },
+        observe: async () => [],
+        onChange: async (s) => {
+          if (
+            !crashed &&
+            s.operations.some((o) => o.failure?.message === "TEAM_EVIDENCE_REFERENCE_INVALID")
+          ) {
+            crashed = true;
+            throw new Error("after rejection commit");
+          }
+        },
+      });
+      if (id === "stale") {
+        const old = (await store.load("run"))!;
+        const next = structuredClone(old);
+        next.revision++;
+        next.evidence.push({ ...evidence(id), sourceIdentity: "prior-view", valid: true });
+        await store.compareAndSwap("run", old.revision, next);
+      }
+      await expect(engine.run("run", task, 10)).rejects.toThrow("after rejection commit");
+      const resumed = new TeamEngine({ ...config, onChange: undefined });
+      const state = await resumed.run("run", task, 10);
+      expect(calls).toBe(2);
+      expect(state.stopReason).toBe("MESSAGE_CORRECTION_EXHAUSTED");
+      expect(state.selectedEvidenceIds).toEqual([]);
+      expect(state.messages).toEqual([]);
+      expect(
+        state.operations.filter((o) => o.failure?.message === "TEAM_EVIDENCE_REFERENCE_INVALID"),
+      ).toHaveLength(2);
+    });
+
+  it("keeps an unavailable-target correction reserved across a budget denial without reviving its target", async () => {
+    let calls = 0;
+    const { engine, store } = await setup({
+      beforeDecision: async (view) => {
+        if (view.messageValidationFeedback)
+          throw new DevflowError({
+            code: "EXECUTION_BUDGET_EXCEEDED",
+            message: "no capacity",
+            details: { requestIssued: false },
+          });
+      },
+      decide: async () => {
+        calls++;
+        return decision(send());
+      },
+      observe: async () => [],
+    });
+    const old = (await store.load("run"))!;
+    const next = structuredClone(old);
+    next.revision++;
+    next.agents[1]!.status = "BLOCKED";
+    next.tasks[0]!.status = "BLOCKED";
+    await store.compareAndSwap("run", old.revision, next);
+    const state = await engine.run("run", task, 10);
+    expect(calls).toBe(1);
+    expect(state.stopReason).toBe("BUDGET_STOP");
+    expect(state.agents[0]!.messageRecovery?.correctionOperationId).toBeDefined();
+    expect(state.agents[1]!.status).toBe("BLOCKED");
+    await engine.run("run", task, 10);
+    expect(calls).toBe(1);
+  });
   it("delivers A's challenge, changes B's actual read, then changes Coordinator's next delegation", async () => {
     const store = new InMemoryTeamStore(),
       reads: string[] = [],
@@ -536,6 +832,6 @@ describe("bounded team message argument recovery", () => {
     const state = await engine.run("run", task, 3);
     expect(state.status).toBe("READY_FOR_PLAN");
     expect(state.messages).toHaveLength(1);
-    expect(state.agents[0]!.messageRecovery?.resolved).toBe(false);
+    expect(state.agents[0]!.messageRecovery?.resolved).toBe(true);
   });
 });

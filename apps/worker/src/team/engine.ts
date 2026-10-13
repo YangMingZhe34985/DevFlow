@@ -35,6 +35,8 @@ export interface TeamDecisionView {
     status: string;
     sourceIdentity?: string;
     current: boolean;
+    agentStatus?: TeamAgent["status"] | undefined;
+    reason?: string;
     result?: unknown;
   }[];
   inbox: TeamSnapshot["messages"];
@@ -46,7 +48,7 @@ export interface TeamDecisionView {
   feedback?: TeamSnapshot["feedback"];
   /** Host quote after shared downstream reservations; informative, never authorization. */
   resourceAvailability?: Record<string, number>;
-  /** Host rejection of a prior SEND; a correction still needs ordinary Run admission. */
+  /** Host rejection of a prior control action; correction needs ordinary Run admission. */
   messageValidationFeedback?: TeamAgent["messageRecovery"];
 }
 export interface TeamEnginePorts {
@@ -104,12 +106,17 @@ export function teamDecisionView(
       status: t.status,
       ...(t.sourceIdentity ? { sourceIdentity: t.sourceIdentity } : {}),
       current: t.sourceIdentity === state.sourceIdentity,
+      agentStatus: state.agents.find((a) => a.id === t.agentId)?.status,
+      ...(t.reason ? { reason: t.reason } : {}),
       ...(t.result ? { result: t.result } : {}),
     })),
     inbox,
     counterevidence,
     evidence: state.evidence.filter(
-      (e) => e.valid && (agent.role !== "INVESTIGATOR" || allowed.has(e.id)),
+      (e) =>
+        e.valid &&
+        e.sourceIdentity === state.sourceIdentity &&
+        (agent.role !== "INVESTIGATOR" || allowed.has(e.id)),
     ),
     history: agent.history,
     limits: state.config,
@@ -468,7 +475,7 @@ export class TeamEngine {
       const receipt = state.operations.find((o) => o.id === actionId);
       if (receipt?.status === "COMPLETED") {
         duplicateOnly = false;
-        if (action.type === "SEND") correctedMessage = true;
+        correctedMessage = true;
         continue;
       }
       if (receipt?.status === "NOT_ISSUED" && receipt.failure?.code === "VALIDATION_ERROR") {
@@ -483,7 +490,11 @@ export class TeamEngine {
         if (
           !(error instanceof DevflowError) ||
           error.code !== "VALIDATION_ERROR" ||
-          error.message !== "TEAM_REPLY_ID_INVALID"
+          ![
+            "TEAM_REPLY_ID_INVALID",
+            "TEAM_EVIDENCE_REFERENCE_INVALID",
+            "TEAM_MESSAGE_TARGET_UNAVAILABLE",
+          ].includes(error.message)
         )
           throw error;
         const issue = error.details as TeamMessageArgumentIssue;
@@ -520,16 +531,14 @@ export class TeamEngine {
             if (agentId === s.coordinatorId) {
               s.status = "STOPPED";
               s.stopReason = "MESSAGE_CORRECTION_EXHAUSTED";
-              s.missing.push(
-                `${error.message}: ${issue.field} must reference a current inbox message, or be omitted for a new message.`,
-              );
+              s.missing.push(`${error.message}: ${issue.guidance}`);
             }
           }
         });
         rejectedMessage = true;
-        break; // Do not let later actions hide the rejected SEND.
+        break; // Later actions must not hide a rejected reference or message.
       }
-      if (action.type === "SEND") correctedMessage = true;
+      correctedMessage = true;
       await this.change(runId, (s) => {
         s.agents.find((a) => a.id === agentId)!.seenActions.push(actionKey);
       });
@@ -682,7 +691,7 @@ export class TeamEngine {
     }
     await this.change(runId, (s) => {
       if (s.operations.some((o) => o.id === operationId)) return;
-      if ("evidenceIds" in action) this.refs(s, action.evidenceIds);
+      if ("evidenceIds" in action) this.refs(s, action.evidenceIds, agentId);
       switch (action.type) {
         case "DELEGATE": {
           if (s.tasks.some((t) => t.key === action.key)) fail("TEAM_DUPLICATE_TASK");
@@ -718,11 +727,21 @@ export class TeamEngine {
           if (s.messages.length >= s.config.maxMessages) fail("TEAM_MESSAGE_LIMIT");
           const target = s.agents.find((a) => a.id === action.toAgentId);
           const relatedTask = s.tasks.find((t) => t.id === action.taskId);
-          if (
-            !target ||
-            !relatedTask ||
-            (!manager && relatedTask.agentId !== agentId && relatedTask.agentId !== target.id)
-          )
+          if (!target || !relatedTask)
+            throw new DevflowError({
+              code: "VALIDATION_ERROR",
+              message: "TEAM_MESSAGE_TARGET_UNAVAILABLE",
+              details: {
+                field: "toAgentId/taskId",
+                expected: "availableAgentTaskPair",
+                actual: `${action.toAgentId}/${action.taskId}`,
+                reason: "TARGET_UNAVAILABLE",
+                availableReplies: [],
+                guidance:
+                  "Message was not delivered: agent or task ID does not exist in this Run. Choose an exact current pair from the task board, preserve the gap, or STOP. The host does not substitute recipients or expose another Run.",
+              } satisfies TeamMessageArgumentIssue,
+            });
+          if (!manager && relatedTask.agentId !== agentId && relatedTask.agentId !== target.id)
             fail("TEAM_MESSAGE_TARGET_INVALID");
           if (!manager) {
             const visible = new Set([
@@ -742,9 +761,35 @@ export class TeamEngine {
             target.status === "CANCELLED" ||
             target.status === "BLOCKED" ||
             relatedTask.sourceIdentity !== s.sourceIdentity ||
-            ["CANCELLED", "BLOCKED"].includes(relatedTask.status)
+            ["CANCELLED", "BLOCKED"].includes(relatedTask.status) ||
+            (target.role === "INVESTIGATOR" && relatedTask.agentId !== target.id) ||
+            (target.role === "INVESTIGATOR" &&
+              relatedTask.status === "COMPLETED" &&
+              s.tasks.some(
+                (t) =>
+                  t.agentId === target.id && ["READY", "RUNNING", "WAITING"].includes(t.status),
+              ))
           )
-            fail("TEAM_MESSAGE_TARGET_UNAVAILABLE");
+            throw new DevflowError({
+              code: "VALIDATION_ERROR",
+              message: "TEAM_MESSAGE_TARGET_UNAVAILABLE",
+              details: {
+                field: "toAgentId/taskId",
+                expected: "availableAgentTaskPair",
+                actual: `${target.id}/${relatedTask.id}`,
+                reason: "TARGET_UNAVAILABLE",
+                availableReplies: [],
+                target: {
+                  agentId: target.id,
+                  status: target.status,
+                  taskId: relatedTask.id,
+                  taskStatus: relatedTask.status,
+                  ...(relatedTask.reason ? { reason: relatedTask.reason } : {}),
+                },
+                guidance:
+                  "Message was not delivered. BLOCKED/CANCELLED tasks cannot be revived by SEND. Check current board status/reason and source identity; select a legal current target, explicitly delegate within remaining limits, submit supported evidence with gaps, or STOP. No budget or task state is reset.",
+              } satisfies TeamMessageArgumentIssue,
+            });
           if (action.replyTo !== undefined) {
             const reply = s.messages.find((m) => m.id === action.replyTo);
             if (!reply) {
@@ -801,7 +846,14 @@ export class TeamEngine {
           if (!t) fail("TEAM_TASK_UNKNOWN");
           t!.status = "CANCELLED";
           t!.reason = action.reason;
-          s.agents.find((a) => a.id === t!.agentId)!.status = "CANCELLED";
+          if (
+            !s.tasks.some(
+              (other) =>
+                other.agentId === t.agentId &&
+                ["READY", "RUNNING", "WAITING"].includes(other.status),
+            )
+          )
+            s.agents.find((a) => a.id === t.agentId)!.status = "CANCELLED";
           break;
         }
         case "RESULT": {
@@ -851,9 +903,47 @@ export class TeamEngine {
     });
   }
 
-  private refs(s: TeamSnapshot, ids: string[]) {
-    if (ids.some((id) => !s.evidence.some((e) => e.id === id && e.valid)))
-      fail("TEAM_EVIDENCE_REFERENCE_INVALID");
+  private refs(s: TeamSnapshot, ids: string[], agentId: string) {
+    const available = teamDecisionView(s, agentId, { title: "", description: "" }).evidence;
+    const invalid = ids.filter(
+      (id) =>
+        !s.evidence.some((e) => e.id === id && e.valid && e.sourceIdentity === s.sourceIdentity),
+    );
+    if (invalid.length)
+      throw new DevflowError({
+        code: "VALIDATION_ERROR",
+        message: "TEAM_EVIDENCE_REFERENCE_INVALID",
+        details: {
+          field: "evidenceIds",
+          expected: "currentVisibleEvidenceIds",
+          actual: JSON.stringify(invalid),
+          reason: "EVIDENCE_ID_UNKNOWN_OR_STALE",
+          invalidEvidenceIds: invalid,
+          availableReplies: [],
+          availableEvidence: available.slice(-64).map((e) => ({
+            id: e.id,
+            ...(e.path ? { path: e.path } : {}),
+            ...(e.fileSha256 ? { fileSha256: e.fileSha256 } : {}),
+          })),
+          omittedEvidenceCount: Math.max(0, available.length - 64),
+          guidance:
+            "Action was not applied. evidenceIds must be exact current evidence record IDs, not file SHA, paths or guessed IDs. Select verified evidence shown in your view; preserve unsupported claims as hypotheses/missing information or stop. The host will not substitute IDs or accept stale evidence.",
+        } satisfies TeamMessageArgumentIssue,
+      });
+    if (ids.some((id) => !available.some((e) => e.id === id)))
+      fail("TEAM_MESSAGE_EVIDENCE_NOT_VISIBLE");
+    if (
+      ids.some((id) =>
+        s.evidence.some(
+          (e) =>
+            e.id === id &&
+            (e.runId !== s.runId ||
+              e.repositoryId !== s.repositoryId ||
+              e.contentSha256 !== teamDigest(e.content)),
+        ),
+      )
+    )
+      fail("TEAM_EVIDENCE_IDENTITY_INVALID");
   }
   private agent(runId: string, id: string, role: TeamAgent["role"]): TeamAgent {
     return {

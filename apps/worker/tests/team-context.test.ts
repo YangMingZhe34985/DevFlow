@@ -138,6 +138,63 @@ it("blocks when mandatory evidence cannot fit and does not treat configuration e
   ).rejects.toThrow("bad model setting");
 });
 
+it("keeps exact evidence correction IDs and blocked task reasons in the dispatched view", async () => {
+  const input = view();
+  input.board = [
+    {
+      id: "task",
+      agentId: "peer",
+      goal: "Investigate consumer",
+      status: "BLOCKED",
+      current: true,
+      agentStatus: "BLOCKED",
+      reason: "BUDGET_STOP: request not issued",
+    },
+  ];
+  input.messageValidationFeedback = {
+    originOperationId: "result-1",
+    sourceIdentity: "base",
+    issue: {
+      field: "evidenceIds",
+      expected: "currentVisibleEvidenceIds",
+      actual: "guessed-sha",
+      reason: "EVIDENCE_ID_UNKNOWN_OR_STALE",
+      availableReplies: [],
+      invalidEvidenceIds: ["guessed-sha"],
+      availableEvidence: [
+        { id: "counterexample", path: "consumer.ts", fileSha256: "a".repeat(64) },
+      ],
+      guidance: "Use exact evidence IDs; missing evidence remains a gap.",
+    },
+  };
+  input.history = [
+    {
+      input: {},
+      output: {
+        summary: "old explanation".repeat(1000),
+        actions: [{ type: "STOP", reason: "STALLED", missing: [] }],
+      },
+    },
+  ];
+  const projected = await projectTeamRequest(
+    input,
+    {
+      generate: async () => {
+        throw Error("not issued");
+      },
+    },
+    AbortSignal.timeout(1000),
+    { bytes: 10000, tokens: 8000, outputTokens: 1000 },
+  );
+  const payload = JSON.parse(
+    projected.request.messages.find((m) => m.role === "USER")!.content as string,
+  );
+  expect(payload.messageValidationFeedback).toEqual(input.messageValidationFeedback);
+  expect(payload.board).toEqual(input.board);
+  expect(payload.history).toEqual([]);
+  expect(projected.request.messages[0]!.content).toContain("SEND never revives BLOCKED/CANCELLED");
+});
+
 it("projects overlapping evidence through a visible owner and preserves each legal ID and source SHA", async () => {
   const input = view();
   input.counterevidence = [];

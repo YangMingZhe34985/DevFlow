@@ -193,6 +193,7 @@ export const AgentStateSchema = z.object({
       authorizationHandoffUsed: z.boolean().optional(),
       evidenceRefreshUsed: z.boolean().optional(),
       submissionOnly: z.boolean().optional(),
+      currentScopeOnly: z.boolean().optional(),
       correctionTool: z.string().optional(),
       correctionInput: z.string().optional(),
       correctionReason: z
@@ -219,6 +220,7 @@ export interface AgentState {
     authorizationHandoffUsed?: boolean;
     evidenceRefreshUsed?: boolean;
     submissionOnly?: boolean;
+    currentScopeOnly?: boolean;
     correctionReason?: "FORMAT_INVALID" | "CONTEXT_MISMATCH" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
     correctionTool?: string;
     correctionInput?: string;

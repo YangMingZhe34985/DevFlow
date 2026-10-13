@@ -79,7 +79,10 @@ export function codingBranchFrontier(input: {
   const replanning = input.replanning && capacity(input.replanning);
   if (input.selectedBranch === "REPLAN" && !replanning)
     throw new Error("A selected REPLAN branch requires its operation projection.");
-  const selectedBranch = input.operation === "SUBMIT_CURRENT" ? "CONTINUE" : input.selectedBranch;
+  const selectedBranch =
+    input.operation === "SUBMIT_CURRENT" || input.operation === "CURRENT_SCOPE"
+      ? "CONTINUE"
+      : input.selectedBranch;
   const selected =
     selectedBranch === "CONTINUE"
       ? capacityOperation("coding:continue", continuing)

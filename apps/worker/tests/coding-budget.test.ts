@@ -106,6 +106,10 @@ it("admits the E07 submission boundary without promising the unselected replan b
   };
   const coding = codingBranchFrontier({ ...common, operation: "CODING" });
   const submission = codingBranchFrontier({ ...common, operation: "SUBMIT_CURRENT" });
+  const currentScope = codingBranchFrontier({ ...common, operation: "CURRENT_SCOPE" });
+  expect(currentScope.required).toEqual(sharedFinal);
+  expect(currentScope.released).toEqual(replanning);
+  expect(currentScope.selectedBranch).toBe("CONTINUE");
   expect(32838 + coding.required.tokens - 125638).toBe(2828);
   expect(submission.required).toEqual(sharedFinal);
   expect(32838 + submission.required.tokens).toBe(76412);

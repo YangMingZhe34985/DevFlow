@@ -109,7 +109,7 @@ export interface AdaptiveStepBudgetController {
 }
 
 /** Host admission for the next decision only; never approval to edit a new scope. */
-export type CodingBudgetOperation = "CODING" | "SUBMIT_CURRENT";
+export type CodingBudgetOperation = "CODING" | "CURRENT_SCOPE" | "SUBMIT_CURRENT";
 
 export interface AgentRunRequest {
   /** Host-only continuation of the same solver across read-only planning and approved Coding. */
@@ -326,7 +326,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
     const originalAuthorize = context.authorizeTool;
     let correctingEdit = false;
     let protocolCorrectionCalls = 0;
-    let explorationClosed = state.executionRecovery?.explorationClosed ?? false;
+    let currentScopeOnly = state.executionRecovery?.currentScopeOnly ?? false;
+    let explorationClosed =
+      (state.executionRecovery?.explorationClosed ?? false) || currentScopeOnly;
     let closingDecisionPending = state.executionRecovery?.handoffPending ?? false;
     let authorizationHandoffUsed = state.executionRecovery?.authorizationHandoffUsed ?? false;
     let evidenceRefreshUsed = state.executionRecovery?.evidenceRefreshUsed ?? false;
@@ -377,7 +379,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
           return "HOST_SUBMISSION_RESERVE: only finishPhase is available; preserve the candidate and report remaining work.";
         const required =
           request.continuationTools?.(
-            request.codingSession && submissionOnly ? "SUBMIT_CURRENT" : "CODING",
+            request.codingSession && submissionOnly
+              ? "SUBMIT_CURRENT"
+              : currentScopeOnly
+                ? "CURRENT_SCOPE"
+                : "CODING",
           ) ?? 0;
         const remaining =
           (request.executionBudget?.maxToolCalls ?? Number.MAX_SAFE_INTEGER) -
@@ -502,6 +508,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             authorizationHandoffUsed,
             evidenceRefreshUsed,
             submissionOnly,
+            currentScopeOnly,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -560,6 +567,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             authorizationHandoffUsed,
             evidenceRefreshUsed,
             submissionOnly,
+            currentScopeOnly,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -877,7 +885,11 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 ).includes(t.name)),
           );
           const budgetOperation = (): CodingBudgetOperation =>
-            request.codingSession && submissionOnly ? "SUBMIT_CURRENT" : "CODING";
+            request.codingSession && submissionOnly
+              ? "SUBMIT_CURRENT"
+              : currentScopeOnly
+                ? "CURRENT_SCOPE"
+                : "CODING";
           let submissionProjected = false;
           const projectSubmission = async () => {
             submissionOnly = true;
@@ -904,10 +916,35 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 authorizationHandoffUsed,
                 evidenceRefreshUsed,
                 submissionOnly,
+                currentScopeOnly,
+              },
+            });
+          };
+          const projectCurrentScope = async () => {
+            currentScopeOnly = true;
+            explorationClosed = true;
+            projectedMessages = [
+              ...projectedMessages,
+              {
+                role: "USER",
+                content:
+                  "HOST_CURRENT_SCOPE_RESERVE: optional exploration and the hypothetical replan branch are closed. Approved edits, the existing bounded source refresh, correction and finishPhase remain available. Preserve unfinished requirements. A real scope conflict requires separate resource admission and new PLAN approval; no new target is writable.",
+              },
+            ];
+            state = await checkpoint(context, {
+              ...state,
+              executionRecovery: {
+                ...state.executionRecovery,
+                pending: execution.editCorrectionPending,
+                used: execution.editCorrectionUsed,
+                explorationClosed,
+                submissionOnly,
+                currentScopeOnly,
               },
             });
           };
           if (submissionOnly) await projectSubmission();
+          else if (currentScopeOnly) await projectCurrentScope();
           const projectionFor = async (tools: readonly ModelToolDescriptor[]) =>
             request.codingSession
               ? optimizeContextProjection({
@@ -983,6 +1020,17 @@ export class DefaultAgentRuntime implements AgentRuntime {
               additionalDownstreamMs = Math.max(0, downstreamTimeMs - fixedDownstreamMs);
               remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
             }
+            if (
+              request.codingSession &&
+              !submissionOnly &&
+              !currentScopeOnly &&
+              remainingTimeMs < request.timeReserve.requestMs
+            ) {
+              await projectCurrentScope();
+              downstreamTimeMs = requiredTime();
+              additionalDownstreamMs = Math.max(0, downstreamTimeMs - fixedDownstreamMs);
+              remainingTimeMs = phaseDeadlineAt - Date.now() - additionalDownstreamMs;
+            }
             explorationClosed ||= remainingTimeMs < 3 * request.timeReserve.requestMs;
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
@@ -1044,7 +1092,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           if (request.convergenceReserve && !prePatch) {
             let continuation = request.continuationReserve?.(budgetOperation());
             const requiredDownstream = () =>
-              budgetOperation() === "SUBMIT_CURRENT" && continuation
+              budgetOperation() !== "CODING" && continuation
                 ? continuation.tokens
                 : Math.max(request.convergenceReserve!.downstreamTokens, continuation?.tokens ?? 0);
             let downstreamTokens = requiredDownstream();
@@ -1100,6 +1148,20 @@ export class DefaultAgentRuntime implements AgentRuntime {
               downstreamTools = request.continuationTools?.(budgetOperation()) ?? 0;
               reserveTokens = correctionReserve() + completionTokens + downstreamTokens;
             }
+            if (
+              request.codingSession &&
+              !submissionOnly &&
+              !currentScopeOnly &&
+              (remainingTokens < nextTokens + reserveTokens ||
+                remainingTools <= downstreamTools + 3 ||
+                remainingSteps <= unleasedDownstreamSteps + 2)
+            ) {
+              await projectCurrentScope();
+              continuation = request.continuationReserve?.(budgetOperation());
+              downstreamTokens = requiredDownstream();
+              downstreamTools = request.continuationTools?.(budgetOperation()) ?? 0;
+              reserveTokens = correctionReserve() + completionTokens + downstreamTokens;
+            }
             if (explorationClosed) {
               availableTools = availableTools.filter((t) =>
                 [
@@ -1131,6 +1193,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
               (await inputFor(availableTools)) +
               outputTokens +
               downstreamTokens +
+              (currentScopeOnly && !submissionOnly ? correctionReserve() : 0) +
               (explorationClosed && !submissionOnly && closingReadAllowed()
                 ? completionTokens + Math.ceil(16384 / 3)
                 : 0);
@@ -1138,7 +1201,9 @@ export class DefaultAgentRuntime implements AgentRuntime {
               downstreamTools +
               (budgetOperation() === "SUBMIT_CURRENT"
                 ? 1 + (postPatch?.needsVerification ? 1 : 0)
-                : 0);
+                : currentScopeOnly
+                  ? 3 + (execution.editCorrectionUsed || correctingEdit ? 0 : 2)
+                  : 0);
             const observation = {
               requestIssued: false,
               operation: budgetOperation(),
@@ -1159,6 +1224,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
               remainingTools,
               downstreamTools,
               submissionOnly,
+              currentScopeOnly,
             };
             await context.emit({
               runId: context.runId,
@@ -1357,14 +1423,36 @@ export class DefaultAgentRuntime implements AgentRuntime {
                 ? {
                     resourceContinuation: (() => {
                       const next = request.continuationReserve!(budgetOperation());
+                      // Pruning the optional replan must not remove this session's correction.
+                      const sameModelRecovery =
+                        currentScopeOnly &&
+                        !submissionOnly &&
+                        !execution.editCorrectionUsed &&
+                        !correctingEdit
+                          ? {
+                              inputTokens:
+                                finalProjection?.artifact.estimatedInputTokens ??
+                                estimateModelInput(projectedMessages, availableTools),
+                              outputTokens: request.modelSettings?.maxOutputTokens ?? 8192,
+                            }
+                          : undefined;
                       return {
-                        tokens: next.tokens,
-                        steps: next.steps,
+                        tokens:
+                          next.tokens +
+                          (sameModelRecovery
+                            ? sameModelRecovery.inputTokens + sameModelRecovery.outputTokens
+                            : 0),
+                        steps: next.steps + (sameModelRecovery ? 1 : 0),
+                        ...(sameModelRecovery ? { sameModelRecovery } : {}),
                         logicalToolCalls: request.continuationTools?.(budgetOperation()) ?? 0,
-                        timeMs: next.timeMs,
+                        timeMs:
+                          next.timeMs +
+                          (sameModelRecovery ? (request.timeReserve?.requestMs ?? 0) : 0),
                         ...(next.costMicros === undefined ? {} : { costMicros: next.costMicros }),
                         ...(next.costStatus === undefined ? {} : { costStatus: next.costStatus }),
-                        ...(next.modelCalls === undefined ? {} : { modelCalls: next.modelCalls }),
+                        ...(next.modelCalls === undefined
+                          ? {}
+                          : { modelCalls: next.modelCalls + (sameModelRecovery ? 1 : 0) }),
                         ...(next.audit === undefined ? {} : { audit: next.audit }),
                       };
                     })(),
@@ -1627,6 +1715,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             handoffPending: closingDecisionPending,
             authorizationHandoffUsed,
             submissionOnly,
+            currentScopeOnly,
             evidenceRefreshUsed,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
@@ -2058,6 +2147,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
             authorizationHandoffUsed,
             evidenceRefreshUsed,
             submissionOnly,
+            currentScopeOnly,
             ...(execution.correctionReason ? { correctionReason: execution.correctionReason } : {}),
             ...(execution.correctionTool ? { correctionTool: execution.correctionTool } : {}),
             ...(execution.correctionInput ? { correctionInput: execution.correctionInput } : {}),
@@ -2772,6 +2862,7 @@ function normalizeHostRejection(rejection: string | DevflowErrorShape): DevflowE
   const reasonCode = rejection.split(":", 1)[0];
   const explorationGates = new Set([
     "HOST_SUBMISSION_RESERVE",
+    "HOST_CURRENT_SCOPE_RESERVE",
     "CONTINUATION_TOOL_RESERVE",
     "EDIT_CORRECTION_REQUIRED",
     "PROTOCOL_CORRECTION_REQUIRED",

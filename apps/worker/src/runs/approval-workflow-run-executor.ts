@@ -1478,7 +1478,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             : {}),
         });
         if (
-          operation === "SUBMIT_CURRENT" ||
+          operation !== "CODING" ||
           !codingReplanReachable(!!scopeReplan, repairAttempt, run.maxTestRetries)
         )
           return finalization.total;
@@ -1514,7 +1514,11 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           // Current edit, its host diff check and finish; an unused correction needs its own
           // edit + diff. The candidate checkpoint includes newly changed files before admission.
           const required = Math.max(
-            continuationToolCapacity("CODING", observeIdentity, paths),
+            continuationToolCapacity(
+              codingSession.state?.executionRecovery?.currentScopeOnly ? "CURRENT_SCOPE" : "CODING",
+              observeIdentity,
+              paths,
+            ),
             after.total + 3 + (codingSession.state?.executionRecovery?.used ? 0 : 2),
           );
           if (remainingTools >= required) return undefined;
@@ -1613,7 +1617,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
             },
             ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
-            submitCurrent: operation === "SUBMIT_CURRENT",
+            submitCurrent: operation !== "CODING",
           }),
         );
         return {
@@ -1630,7 +1634,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 continuationRecoveryAvailable,
               ),
               ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
-              submitCurrent: operation === "SUBMIT_CURRENT",
+              submitCurrent: operation !== "CODING",
             }),
             // Repository IO is individually guarded; this model/deadline quote does not price it as free.
             preparationAndRestoreTime: "GUARDED_PER_OPERATION_NOT_ESTIMATED_BY_THIS_TIME_PLAN",

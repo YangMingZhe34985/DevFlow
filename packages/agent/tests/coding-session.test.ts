@@ -772,3 +772,116 @@ it("persists host admission before IO and restores it through the same session c
   expect((await f.run()).status).toBe("SUCCEEDED");
   expect(admitted).toBe(2);
 });
+
+it("keeps approved repair available when only the unselected replan branch exceeds capacity", async () => {
+  const operations: CodingBudgetOperation[] = [];
+  const events: Record<string, unknown>[] = [];
+  const f = fixture(
+    [
+      async (request) => {
+        expect(request.tools.map((tool) => tool.name)).toContain("writeFile");
+        expect(request.tools.map((tool) => tool.name)).not.toContain("gitDiff");
+        expect(JSON.stringify(request.messages)).toContain("HOST_CURRENT_SCOPE_RESERVE");
+        expect(JSON.stringify(request.messages)).toContain(
+          "Validation and restoration are both required",
+        );
+        expect(request.resourceContinuation).toMatchObject({
+          logicalToolCalls: 4,
+          sameModelRecovery: { outputTokens: 512 },
+        });
+        expect(request.resourceContinuation!.tokens).toBeGreaterThan(1000);
+        expect((await f.stateStore.load(f.context.runId))!.executionRecovery).toMatchObject({
+          currentScopeOnly: true,
+          explorationClosed: true,
+          used: false,
+        });
+        return decision("REPAIRED_CANDIDATE");
+      },
+    ],
+    {
+      convergenceReserve: { downstreamSteps: 2, downstreamTokens: 90000 },
+      continuationReserve: (operation = "CODING") => {
+        operations.push(operation);
+        return { tokens: operation === "CODING" ? 120000 : 1000, steps: 2, timeMs: 1000 };
+      },
+      continuationTools: (operation) => (operation === "CODING" ? 40 : 4),
+    },
+  );
+  f.context.emit = async (event) => {
+    events.push(event.payload as Record<string, unknown>);
+  };
+  const result = await f.run();
+  expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+  expect(f.content()).toBe("REPAIRED_CANDIDATE");
+  expect(operations).toContain("CURRENT_SCOPE");
+  expect(f.model.requests).toHaveLength(1);
+  expect(events.find((event) => event.convergencePreflight)).toMatchObject({
+    convergencePreflight: {
+      operation: "CURRENT_SCOPE",
+      releasedDownstreamTokens: 119000,
+      releasedDownstreamTools: 36,
+      submissionOnly: false,
+      currentScopeOnly: true,
+    },
+  });
+  const saved = (await f.stateStore.load(f.context.runId))!;
+  const resumed = continueCodingSession(saved, feedback, f.request).state;
+  expect(resumed.executionRecovery?.currentScopeOnly).toBe(true);
+  expect(resumed.phaseDeadlineAt).toBe(saved.phaseDeadlineAt);
+  expect(resumed.metrics.tokenUsage).toEqual(saved.metrics.tokenUsage);
+});
+
+it.each(["TOKENS", "TOOLS", "TIME"] as const)(
+  "still refuses a current-scope decision when mandatory %s capacity is insufficient",
+  async (resource) => {
+    const f = fixture([decision("MUST_NOT_RUN")], {
+      convergenceReserve: { downstreamSteps: 2, downstreamTokens: 1000 },
+      continuationReserve: (operation) => ({
+        tokens: operation === "CODING" || resource === "TOKENS" ? 120000 : 1000,
+        steps: 2,
+        timeMs: operation === "CODING" || resource === "TIME" ? 100000 : 1000,
+      }),
+      continuationTools: (operation) => (operation === "CODING" || resource === "TOOLS" ? 40 : 4),
+      ...(resource === "TIME" ? { timeReserve: { downstreamMs: 1000, requestMs: 100 } } : {}),
+    });
+    const result = await f.run();
+    expect(result.error?.code).toBe("EXECUTION_BUDGET_EXCEEDED");
+    expect(result.error?.details).toMatchObject({
+      requestIssued: false,
+      operation: "CURRENT_SCOPE",
+    });
+    expect(f.model.requests).toHaveLength(0);
+    expect(f.content()).toBe("BASE_SOURCE");
+  },
+);
+
+it("reuses a saved current-scope branch without reopening searches or granting write authority", async () => {
+  const f = fixture([
+    decision("CANDIDATE"),
+    fakeModelResponse({
+      toolCalls: [
+        { id: "outside", name: "writeFile", input: { path: "other.ts", content: "forbidden" } },
+      ],
+    }),
+    completed(),
+  ]);
+  await f.run();
+  const previous = (await f.stateStore.load(f.context.runId))!;
+  const state = continueCodingSession(previous, feedback, f.request).state;
+  state.executionRecovery = { ...state.executionRecovery!, currentScopeOnly: true };
+  await f.stateStore.save(state);
+  const operations: CodingBudgetOperation[] = [];
+  await f.run({
+    convergenceReserve: { downstreamSteps: 2, downstreamTokens: 1000 },
+    continuationReserve: (operation = "CODING") => {
+      operations.push(operation);
+      return { tokens: 1000, steps: 2, timeMs: 1000 };
+    },
+  });
+  expect(operations).not.toContain("CODING");
+  expect(f.content()).toBe("CANDIDATE");
+  expect(f.model.requests[1]!.tools.map((tool) => tool.name)).not.toContain("gitDiff");
+  expect((await f.stateStore.load(f.context.runId))!.executionRecovery?.currentScopeOnly).toBe(
+    true,
+  );
+});

@@ -313,10 +313,27 @@ describe("unified Coding Loop through the real Worker orchestration", () => {
     expect(f.order).toEqual([]);
   });
 
-  it.each([false, true])(
-    "returns failed public validation to the same history, including unfinished=%s",
-    async (unfinished) => {
+  it.each([
+    { unfinished: false, bounded: false },
+    { unfinished: true, bounded: false },
+    { unfinished: false, bounded: true },
+  ])(
+    "returns failed validation to the same history: $unfinished; current-scope budget: $bounded",
+    async ({ unfinished, bounded }) => {
       const f = workerFixture();
+      if (bounded) {
+        f.environment.DEVFLOW_MAX_TOTAL_TOKENS = 50000;
+        Object.assign(f.plan, {
+          proposalVersion: "plan-proposal-v1",
+          approvalScope: {
+            version: "plan-approval-scope-v1",
+            mode: "READY",
+            baseCommitSha: "a".repeat(40),
+            workspaceRevision: 0,
+            files: [{ path: "a.ts", operation: "MODIFY" }],
+          },
+        });
+      }
       const model = new FakeLanguageModel([
         submitted(1, unfinished),
         async (request) => {
@@ -372,6 +389,10 @@ describe("unified Coding Loop through the real Worker orchestration", () => {
         "REVIEW",
       ]);
       expect(f.artifacts.filter((artifact) => artifact.kind === "TEST_REPORT")).toHaveLength(2);
+      if (bounded)
+        expect(
+          checkpoints.some((checkpoint) => checkpoint.state.executionRecovery?.currentScopeOnly),
+        ).toBe(true);
     },
   );
 

@@ -164,7 +164,9 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             DEVFLOW_TEAM_ENABLED: "true",
             DEVFLOW_MAX_TOTAL_TOKENS: "320000",
             DEVFLOW_MAX_TOOL_CALLS: "75",
-            DEVFLOW_TIMEOUT_MS: "1500000",
+            // Deliberately below downstream 1260s + configured 180s. The current
+            // request must use a real shorter deadline, not discard future work.
+            DEVFLOW_TIMEOUT_MS: "1400000",
             DEVFLOW_MAX_COST_MICROS: "4000000",
             DEVFLOW_MODEL_PRICES_JSON: JSON.stringify({
               "openai-compatible:glm-5.3": {
@@ -208,10 +210,22 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           ).toBe(true);
           const ledger = (await database.budgetLedgers.get(run!.id))!.value as {
             consumed: { modelCalls: number };
-            reservations: Record<string, { status: string }>;
+            reservations: Record<
+              string,
+              {
+                status: string;
+                executionDeadlineAt?: number;
+                quote: { resources: { timeMs: number } };
+              }
+            >;
           };
           expect(ledger.consumed.modelCalls).toBe(requests.length);
           expect(ledger.reservations["team:shared-downstream"]?.status).toBe("RELEASED");
+          const firstDecision = state.operations.find((op) => op.kind === "MODEL")!;
+          expect(ledger.reservations[firstDecision.id]?.quote.resources.timeMs).toBeLessThan(
+            180000,
+          );
+          expect(ledger.reservations[firstDecision.id]?.executionDeadlineAt).toBeTypeOf("number");
           const durable = (await database.budgetLedgers.get(run!.id))!.value as {
             reservations: Record<string, { quote: { dispatchGroup?: string } }>;
             violations: unknown[];

@@ -48,6 +48,53 @@ function setup(overrides: Partial<ResourceBudgetSchedulerOptions> = {}) {
 }
 
 describe("resource operation planning", () => {
+  it("allocates the available request deadline without consuming downstream or renewing it after recovery", async () => {
+    const fixture = setup({ limits: { tokens: 1000, timeMs: 1500000 }, deadlineAt: 1501000 });
+    const scheduler = await fixture.open();
+    await scheduler.replaceHold(
+      "future",
+      operation("validation-and-review", { timeMs: 1260000, tokens: 100 }),
+    );
+    fixture.setTime(91000);
+    const request = operation("decision", { timeMs: 180000, tokens: 100 });
+    expect((await scheduler.quote(request)).fits).toBe(false);
+    await scheduler.parallelDispatch("wave", async () => {
+      const first = await scheduler.reserve("a", request, { fitDeadline: true });
+      expect(first.reserved).toBe(true);
+      expect(first.quote.resources.timeMs).toBe(150000);
+      expect(first.reservation?.executionDeadlineAt).toBe(241000);
+      fixture.setTime(92000);
+      expect((await scheduler.admit("a")).admitted).toBe(true);
+      const second = await scheduler.reserve("b", request, { fitDeadline: true });
+      expect(second.reserved).toBe(true);
+      expect(second.reservation?.executionDeadlineAt).toBe(241000);
+      expect((await scheduler.admit("b")).admitted).toBe(true);
+    });
+    const resumed = await fixture.open();
+    expect((await resumed.snapshot()).reservations.a?.executionDeadlineAt).toBe(241000);
+    expect((await resumed.admit("a")).reason).toBe("ALREADY_ADMITTED");
+    expect((await resumed.snapshot()).reservations.future?.quote.resources.timeMs).toBe(1260000);
+    expect((await resumed.snapshot()).consumed.tokens).toBe(0);
+    fixture.setTime(241000);
+    expect((await resumed.reserve("expired", request, { fitDeadline: true })).reserved).toBe(false);
+  });
+
+  it("does not turn an expired prepared request or token shortage into an admitted call", async () => {
+    const fixture = setup();
+    const scheduler = await fixture.open();
+    const req = operation("request", { tokens: 100, timeMs: 20000 });
+    expect((await scheduler.reserve("call", req, { fitDeadline: true })).reserved).toBe(true);
+    fixture.setTime(11000);
+    expect((await scheduler.admit("call")).admitted).toBe(false);
+    const other = await setup().open();
+    const short = await other.reserve(
+      "too-many-tokens",
+      operation("large", { tokens: 2000, timeMs: 20000 }),
+      { fitDeadline: true },
+    );
+    expect(short.reserved).toBe(false);
+    expect(short.quote.shortfalls.tokens).toBeGreaterThan(0);
+  });
   it("preserves downstream time and adds costs while quoting the actual investigator dispatch group", async () => {
     const fixture = setup({
       limits: { tokens: 1000, costMicros: 1000, timeMs: 1500000 },

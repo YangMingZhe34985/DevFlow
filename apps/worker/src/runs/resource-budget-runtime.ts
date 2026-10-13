@@ -10,6 +10,7 @@ import type {
   ResourceBudgetScheduler,
   ResourceBudgetOperationPlan,
   ResourceVector,
+  ResourceBudgetReservation,
 } from "./resource-budget-scheduler.js";
 
 export interface ModelResourcePrice {
@@ -188,8 +189,12 @@ export class ResourceBudgetRuntime {
     return wrapped;
   }
 
-  private async admit(id: string, plan: ResourceBudgetOperationPlan): Promise<void> {
-    const reserved = await this.scheduler.reserve(id, plan);
+  private async admit(
+    id: string,
+    plan: ResourceBudgetOperationPlan,
+    options: { fitDeadline?: boolean } = {},
+  ): Promise<ResourceBudgetReservation> {
+    const reserved = await this.scheduler.reserve(id, plan, options);
     if (!reserved.reserved) {
       await this.record({
         budgetScheduler: { operationId: id, action: "RESERVE", ...reserved, requestIssued: false },
@@ -201,6 +206,7 @@ export class ResourceBudgetRuntime {
       await this.record({ budgetScheduler: { operationId: id, action: "ADMIT", ...admission } });
       throw blocked(id, admission);
     }
+    return admission.reservation;
   }
 
   model(
@@ -217,6 +223,8 @@ export class ResourceBudgetRuntime {
       operationId?: string;
       /** Team decisions consume the same Run steps; Coding retains its state-store accounting. */
       decisionSteps?: number;
+      /** Host allows a shorter request lifetime within the remaining reserved execution path. */
+      fitDeadline?: boolean;
     },
   ): LanguageModelPort {
     this.continuationRate = options.continuationMicrosPerMillionTokens;
@@ -280,10 +288,14 @@ export class ResourceBudgetRuntime {
             `${options.stage}:request-and-continuation`,
           );
         }
-        await this.admit(id, {
-          ...operation(id, resources),
-          costStatus: priced ? "PRICED" : "UNPRICED",
-        });
+        const admission = await this.admit(
+          id,
+          {
+            ...operation(id, resources),
+            costStatus: priced ? "PRICED" : "UNPRICED",
+          },
+          { fitDeadline: options.fitDeadline ?? false },
+        );
         const started = Date.now();
         await this.record({
           budgetScheduler: {
@@ -291,15 +303,28 @@ export class ResourceBudgetRuntime {
             action: "INVOKE",
             stage: options.stage,
             dispatchStatus: "PENDING",
-            resources,
+            resources: admission.quote.resources,
+            configuredTimeoutMs: timeoutMs,
+            ...(admission.executionDeadlineAt === undefined
+              ? {}
+              : { executionDeadlineAt: admission.executionDeadlineAt }),
             settings: request.settings,
             inputFingerprint: estimatePlanRequest(request).fingerprint,
           },
         });
         let response;
         try {
+          const requestTimeout =
+            admission.executionDeadlineAt === undefined
+              ? timeoutMs
+              : admission.executionDeadlineAt - Date.now();
+          if (requestTimeout <= 0)
+            throw blocked(id, {
+              reason: "REQUEST_DEADLINE_EXPIRED_BEFORE_DISPATCH",
+              executionDeadlineAt: admission.executionDeadlineAt,
+            });
           response = await model.generate(request, {
-            signal: AbortSignal.any([requestOptions.signal, AbortSignal.timeout(timeoutMs)]),
+            signal: AbortSignal.any([requestOptions.signal, AbortSignal.timeout(requestTimeout)]),
           });
         } catch (error) {
           const knownUsage = {

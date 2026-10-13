@@ -314,6 +314,7 @@ export async function investigateWithTeam(input: {
         decisionSteps: 1,
         outputTokens: binding.settings.maxOutputTokens ?? 8192,
         timeoutMs: environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
+        fitDeadline: true,
         ...(allPrices[`${binding.provenance.provider}:${binding.provenance.model}`]
           ? { price: allPrices[`${binding.provenance.provider}:${binding.provenance.model}`]! }
           : {}),

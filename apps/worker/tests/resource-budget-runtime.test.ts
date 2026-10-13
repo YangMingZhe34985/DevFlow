@@ -25,6 +25,62 @@ import {
 
 const signal = () => new AbortController().signal;
 
+it("passes an admitted shorter deadline to the actual transport without shrinking output or future holds", async () => {
+  const startedAt = Date.now();
+  const scheduler = await ResourceBudgetScheduler.open({
+    runId: "short-request",
+    store: new InMemoryBudgetLedgerStore(),
+    limits: { tokens: 100000, timeMs: 30000 },
+    startedAt,
+    deadlineAt: startedAt + 30000,
+  });
+  await scheduler.replaceHold("future", {
+    kind: "OPERATION",
+    id: "future",
+    requirement: "REQUIRED",
+    state: "PENDING",
+    resources: { timeMs: 28000, tokens: 1000 },
+  });
+  let transportSignal: AbortSignal | undefined;
+  const runtime = new ResourceBudgetRuntime(scheduler, async () => {});
+  const raw = new FakeLanguageModel([
+    async (request, options) => {
+      transportSignal = options.signal;
+      expect(request.settings?.maxOutputTokens).toBe(8192);
+      return fakeModelResponse({
+        toolCalls: [],
+        text: "done",
+        usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+      });
+    },
+  ]);
+  const model = runtime.model(raw, {
+    stage: "INVESTIGATOR",
+    operationId: "decision",
+    timeoutMs: 180000,
+    outputTokens: 8192,
+    fitDeadline: true,
+  });
+  await model.generate(
+    {
+      messages: [{ role: "USER", content: "current evidence" }],
+      tools: [],
+      settings: { maxOutputTokens: 8192 },
+    },
+    { signal: signal() },
+  );
+  const ledger = await scheduler.snapshot();
+  expect(ledger.reservations.decision?.quote.resources.timeMs).toBeLessThanOrEqual(2000);
+  expect(ledger.reservations.decision?.executionDeadlineAt).toBe(startedAt + 2000);
+  expect(ledger.reservations.future?.quote.resources.timeMs).toBe(28000);
+  expect(ledger.consumed.tokens).toBe(12);
+  expect(transportSignal).toBeDefined();
+  await new Promise<void>((resolve) =>
+    transportSignal!.addEventListener("abort", () => resolve(), { once: true }),
+  );
+  expect(transportSignal!.aborted).toBe(true);
+});
+
 it("quotes and dispatches the identical prepared wire input through the stage wrapper", async () => {
   const { runtime, events } = await fixture();
   const { stageLanguageModel } = await import("../src/runs/stage-language-model.js");

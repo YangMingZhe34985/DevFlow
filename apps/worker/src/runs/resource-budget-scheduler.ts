@@ -94,6 +94,8 @@ export interface ResourceBudgetReservation {
   status: "RESERVED" | "ADMITTED" | "SETTLED" | "RELEASED";
   reservedAt: number;
   admittedAt?: number;
+  /** Absolute dispatch deadline for an operation admitted with an elastic request timeout. */
+  executionDeadlineAt?: number;
   settledAt?: number;
   actual?: ResourceVector;
   settlementDigest?: string;
@@ -268,10 +270,18 @@ export class ResourceBudgetScheduler {
   async reserve(
     operationId: string,
     plan: ResourceBudgetOperationPlan,
+    options: { fitDeadline?: boolean } = {},
   ): Promise<ResourceBudgetReservationResult> {
     identifier(operationId);
     const dispatchGroup = this.mutationLane.dispatchContext.getStore();
-    const planDigest = operationDigest(plan, dispatchGroup);
+    if (options.fitDeadline && (plan.kind !== "OPERATION" || !(plan.resources.timeMs! > 0)))
+      throw invalid(
+        "An elastic deadline requires one operation with a positive configured timeout.",
+      );
+    const originalDigest = operationDigest(plan, dispatchGroup);
+    const planDigest = options.fitDeadline
+      ? digest({ originalDigest, fitDeadline: true })
+      : originalDigest;
     return await this.change<ResourceBudgetReservationResult>((ledger) => {
       const existing = ledger.reservations[operationId];
       if (existing !== undefined) {
@@ -287,7 +297,17 @@ export class ResourceBudgetScheduler {
         };
       }
       const now = this.now();
-      const quote = quoteAgainst(ledger, plan, now, dispatchGroup);
+      const window = options.fitDeadline
+        ? Math.min(
+            plan.kind === "OPERATION" ? plan.resources.timeMs! : 0,
+            availableResources(ledger, now, undefined, dispatchGroup).timeMs ?? 0,
+          )
+        : undefined;
+      const boundedPlan =
+        window !== undefined && plan.kind === "OPERATION"
+          ? { ...plan, resources: { ...plan.resources, timeMs: Math.max(1, window) } }
+          : plan;
+      const quote = quoteAgainst(ledger, boundedPlan, now, dispatchGroup);
       ledger.lastDecision = { operationId, at: now, quote, requestIssued: false };
       if (!quote.fits) return { value: { reserved: false, quote }, changed: true };
       const reservation: ResourceBudgetReservation = {
@@ -296,6 +316,7 @@ export class ResourceBudgetScheduler {
         quote,
         status: "RESERVED",
         reservedAt: now,
+        ...(window === undefined ? {} : { executionDeadlineAt: now + window }),
       };
       ledger.reservations[operationId] = reservation;
       return { value: { reserved: true, quote, reservation }, changed: true };
@@ -318,17 +339,25 @@ export class ResourceBudgetScheduler {
           changed: false,
         };
       }
+      const now = this.now();
       const remaining = availableResources(
         ledger,
-        this.now(),
+        now,
         operationId,
         reservation.quote.dispatchGroup,
       );
       const shortfalls = resourceShortfalls(
-        withParallelTimeFloor(ledger, reservation.quote.resources, reservation.quote.dispatchGroup),
+        withParallelTimeFloor(
+          ledger,
+          { ...reservation.quote.resources, timeMs: remainingReservedTime(reservation, now) },
+          now,
+          reservation.quote.dispatchGroup,
+        ),
         remaining,
       );
       if (this.now() >= ledger.deadlineAt) shortfalls.timeMs = Math.max(1, shortfalls.timeMs ?? 0);
+      if (reservation.executionDeadlineAt !== undefined && now >= reservation.executionDeadlineAt)
+        shortfalls.timeMs = Math.max(1, shortfalls.timeMs ?? 0);
       if (hasHardViolation(ledger) || Object.keys(shortfalls).length > 0) {
         return {
           value: {
@@ -639,7 +668,7 @@ function quoteAgainst(
   const removed: string[] = [];
   const quote = (): ResourceBudgetQuote => {
     const shortfalls = resourceShortfalls(
-      withParallelTimeFloor(ledger, estimate.resources, dispatchGroup),
+      withParallelTimeFloor(ledger, estimate.resources, now, dispatchGroup),
       remaining,
     );
     if (now >= ledger.deadlineAt) shortfalls.timeMs = Math.max(1, shortfalls.timeMs ?? 0);
@@ -687,16 +716,30 @@ function availableResources(
       remaining[dimension] = Math.max(0, limit - ledger.consumed[dimension] - held[dimension]);
   }
   // The Run time limit is wall time; parallel tool latency is not charged twice.
-  remaining.timeMs = Math.max(0, ledger.deadlineAt - now - heldWallTime(active, parallelGroup));
+  remaining.timeMs = Math.max(
+    0,
+    ledger.deadlineAt - now - heldWallTime(active, now, parallelGroup),
+  );
   return remaining;
 }
 
-function heldWallTime(active: ResourceBudgetReservation[], parallelGroup?: string): number {
+function remainingReservedTime(entry: ResourceBudgetReservation, now: number): number {
+  const held = heldResources(entry).timeMs;
+  return entry.executionDeadlineAt === undefined
+    ? held
+    : Math.min(held, Math.max(0, entry.executionDeadlineAt - now));
+}
+
+function heldWallTime(
+  active: ResourceBudgetReservation[],
+  now: number,
+  parallelGroup?: string,
+): number {
   const groups = new Map<string, number>();
   let heldTime = 0;
   for (const entry of active) {
     const group = entry.quote.dispatchGroup;
-    const duration = heldResources(entry).timeMs;
+    const duration = remainingReservedTime(entry, now);
     if (!group) heldTime += duration;
     else if (group !== parallelGroup) groups.set(group, Math.max(groups.get(group) ?? 0, duration));
   }
@@ -711,13 +754,14 @@ function operationDigest(plan: ResourceBudgetOperationPlan, dispatchGroup?: stri
 function withParallelTimeFloor(
   ledger: ResourceBudgetLedger,
   resources: ResourceVector,
+  now: number,
   group?: string,
 ): ResourceVector {
   if (!group) return resources;
   let timeMs = resources.timeMs;
   for (const entry of Object.values(ledger.reservations))
     if (entry.quote.dispatchGroup === group && ["RESERVED", "ADMITTED"].includes(entry.status))
-      timeMs = Math.max(timeMs, heldResources(entry).timeMs);
+      timeMs = Math.max(timeMs, remainingReservedTime(entry, now));
   return { ...resources, timeMs };
 }
 
@@ -769,6 +813,14 @@ function validateLedger(value: unknown, runId: string): ResourceBudgetLedger {
       throw conflict("Budget reservation identity or state is invalid.");
     validateFullVector(reservation.quote.resources);
     if (reservation.quote.dispatchGroup !== undefined) identifier(reservation.quote.dispatchGroup);
+    if (reservation.executionDeadlineAt !== undefined) {
+      integer(reservation.executionDeadlineAt, "executionDeadlineAt");
+      if (
+        reservation.executionDeadlineAt <= reservation.reservedAt ||
+        reservation.executionDeadlineAt > ledger.deadlineAt
+      )
+        throw conflict("Operation deadline exceeds its persisted Run window.");
+    }
     if (
       reservation.status === "SETTLED" &&
       (reservation.actual === undefined || reservation.settlementDigest === undefined)
@@ -840,7 +892,7 @@ function recordHardViolations(
       dimension === "timeMs" ? ledger.deadlineAt - ledger.startedAt : ledger.limits[dimension];
     const committed =
       dimension === "timeMs"
-        ? Math.max(0, now - ledger.startedAt) + heldWallTime(active)
+        ? Math.max(0, now - ledger.startedAt) + heldWallTime(active, now)
         : ledger.consumed[dimension] + held[dimension];
     if (limit !== undefined && committed > limit)
       ledger.violations.push({ operationId, dimension, estimated: limit, actual: committed });

@@ -33,7 +33,7 @@ import { type ResourceBudgetLedger } from "../runs/resource-budget-scheduler.js"
 import { localizationLease } from "../runs/localization-lease.js";
 import { recordModelResponse, recordStageStep, recordToolWork } from "../runs/workflow-metrics.js";
 import { TeamEngine, teamDigest, teamDecisionView, type TeamDecisionView } from "./engine.js";
-import { estimatePlanRequest } from "../runs/plan-agent-context.js";
+import { estimatePlanRequest, type PlanRequestEstimate } from "../runs/plan-agent-context.js";
 import { teamBudgetStore } from "./budget-store.js";
 import { projectTeamRequest } from "./context.js";
 import { teamEvidencePack } from "./handoff.js";
@@ -221,6 +221,26 @@ export async function investigateWithTeam(input: {
       ...bindings[role === "INVESTIGATOR" ? "INVESTIGATOR" : "COORDINATOR"].config,
       ...(input.parameters ? { parameters: input.parameters } : {}),
     });
+  const quoteDecision = (binding: typeof bindings.COORDINATOR, estimate: PlanRequestEstimate) =>
+    runtime.scheduler.quote(
+      priceModelOperationPlan(
+        {
+          kind: "OPERATION",
+          id: "team:projected-decision",
+          requirement: "REQUIRED",
+          state: "PENDING",
+          resources: {
+            inputTokens: estimate.estimatedInputTokens,
+            outputTokens: binding.settings.maxOutputTokens ?? 8192,
+            steps: 1,
+            modelCalls: 1,
+          },
+          reason:
+            "Exact prepared request; downstream remains reserved. Atomic admission rechecks the elastic deadline and concurrent consumption.",
+        },
+        () => allPrices[`${binding.provenance.provider}:${binding.provenance.model}`],
+      ),
+    );
   const reserveDownstream = async (view: TeamDecisionView) => {
     const snapshot = (await store.load(run.id))!;
     const allEvidence = snapshot.evidence.filter((e) => e.valid);
@@ -339,6 +359,7 @@ export async function investigateWithTeam(input: {
           bytes: binding.contextTokens * 3,
           tokens: binding.contextTokens,
           outputTokens: binding.settings.maxOutputTokens ?? 8192,
+          quote: (estimate) => quoteDecision(binding, estimate),
         },
       );
       // Detect a known-not-issued budget stop before marking the decision INFLIGHT,
@@ -448,6 +469,7 @@ export async function investigateWithTeam(input: {
         bytes: binding.contextTokens * 3,
         tokens: binding.contextTokens,
         outputTokens: binding.settings.maxOutputTokens ?? 8192,
+        quote: (estimate) => quoteDecision(binding, estimate),
       });
       // Persist exactly what the prepared Provider request contains before dispatch.
       for (let attempt = 0; attempt < 16; attempt++) {

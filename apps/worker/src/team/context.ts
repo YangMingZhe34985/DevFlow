@@ -2,14 +2,21 @@ import { DevflowError, TeamDecisionSchema } from "@devflow/shared";
 import { sourceRangeReferences, type LanguageModelPort, type ModelRequest } from "@devflow/agent";
 import { teamWorkingMemory } from "./working-memory.js";
 import type { TeamDecisionView } from "./engine.js";
-import { estimatePlanRequest } from "../runs/plan-agent-context.js";
+import { estimatePlanRequest, type PlanRequestEstimate } from "../runs/plan-agent-context.js";
+import type { ResourceBudgetQuote } from "../runs/resource-budget-scheduler.js";
 
 /** Keep complete records and all unread counterevidence; full private history remains durable. */
 export async function projectTeamRequest(
   view: TeamDecisionView,
   model: LanguageModelPort,
   signal: AbortSignal,
-  capacity: { bytes: number; tokens: number; outputTokens: number },
+  capacity: {
+    bytes: number;
+    tokens: number;
+    outputTokens: number;
+    /** Advisory only; dispatch still requires atomic Scheduler admission. */
+    quote?: (estimate: PlanRequestEstimate) => Promise<ResourceBudgetQuote>;
+  },
 ) {
   const must = new Set([
     ...view.inbox.flatMap((m) => m.evidenceIds),
@@ -40,7 +47,10 @@ export async function projectTeamRequest(
   }));
   const kept = [...required, ...optional];
   const omitted: string[] = [];
+  let resourceQuote: ResourceBudgetQuote | undefined;
+  let resourceTrimmed = false;
   while (true) {
+    resourceQuote = undefined;
     // Recompute after selection: a reference may only point at an owner in this exact request.
     const rangeRefs = sourceRangeReferences(
       kept.flatMap((e) =>
@@ -142,7 +152,10 @@ export async function projectTeamRequest(
       const estimate = estimatePlanRequest(prepared);
       const bytes = estimate.serializedBytes;
       const tokens = estimate.estimatedInputTokens;
-      if (bytes <= capacity.bytes && tokens + capacity.outputTokens <= capacity.tokens)
+      const contextFits =
+        bytes <= capacity.bytes && tokens + capacity.outputTokens <= capacity.tokens;
+      if (contextFits && capacity.quote) resourceQuote = await capacity.quote(estimate);
+      if (contextFits && (!resourceQuote || resourceQuote.fits))
         return {
           request: prepared,
           shown: kept.map((e) => ({
@@ -155,6 +168,7 @@ export async function projectTeamRequest(
           omitted,
           audit: {
             version: "team-context-audit-v1",
+            ...(resourceQuote ? { resourceQuote, resourceTrimmed } : {}),
             serializedBytes: bytes,
             estimatedInputTokens: tokens,
             requestFingerprint: estimate.fingerprint,
@@ -199,20 +213,30 @@ export async function projectTeamRequest(
       )
         throw error;
     }
-    if (history.length) {
+    if (resourceQuote && !resourceQuote.fits) resourceTrimmed = true;
+    const irreducible =
+      resourceQuote?.reason === "COST_UNKNOWN" || resourceQuote?.reason === "LEDGER_VIOLATION";
+    if (history.length && !irreducible) {
       history = history.slice(1);
       continue;
     }
-    if (kept.length > required.length) {
+    if (kept.length > required.length && !irreducible) {
       omitted.push(kept.pop()!.id);
       continue;
     }
     throw new DevflowError({
-      code: "INSUFFICIENT_EVIDENCE",
-      message: "Mandatory task, assignments or counterevidence exceed the team request context.",
+      code:
+        resourceQuote && !resourceQuote.fits
+          ? "EXECUTION_BUDGET_EXCEEDED"
+          : "INSUFFICIENT_EVIDENCE",
+      message:
+        resourceQuote && !resourceQuote.fits
+          ? "Mandatory team context and configured output cannot fit remaining Run resources after downstream reservations."
+          : "Mandatory task, assignments or counterevidence exceed the team request context.",
       details: {
         requestIssued: false,
-        stopReason: "CONTEXT_CAPACITY",
+        stopReason: resourceQuote && !resourceQuote.fits ? "RESOURCE_CAPACITY" : "CONTEXT_CAPACITY",
+        ...(resourceQuote ? { quote: resourceQuote } : {}),
         requiredEvidenceIds: [...must],
         omittedEvidenceIds: omitted,
       },

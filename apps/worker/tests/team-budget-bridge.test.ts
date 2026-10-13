@@ -44,11 +44,18 @@ it("production bridge protects and transfers a current Coordinator projection, w
       return true;
     },
   };
+  const projections: string[] = [];
   const database = {
     teams,
     budgetLedgers: budgets,
     events: { append: async () => {} },
-    artifacts: { create: async () => ({ id: "artifact" }) },
+    artifacts: {
+      create: async (input: { name: string; content?: string }) => {
+        if (input.name.startsWith("team-request-") && input.content)
+          projections.push(input.content);
+        return { id: "artifact" };
+      },
+    },
   } as unknown as DatabaseAdapter;
   const env = loadWorkerEnvironment({
     DATABASE_URL: "postgresql://offline.invalid/test",
@@ -183,6 +190,15 @@ it("production bridge protects and transfers a current Coordinator projection, w
   );
   expect(coordinatorCalls).toBe(2);
   expect(investigatorCalls).toBe(1);
+  expect(projections).toHaveLength(3);
+  for (const saved of projections) {
+    const { projection } = JSON.parse(saved);
+    expect(projection.audit.resourceQuote.fits).toBe(true);
+    expect(projection.audit.resourceQuote.resources.inputTokens).toBe(
+      projection.audit.estimatedInputTokens,
+    );
+    expect(projection.audit.resourceQuote.resources.outputTokens).toBe(8192);
+  }
   const final = await scheduler.snapshot();
   expect(final.reservations["team:shared-downstream"]?.status).toBe("RELEASED");
   expect(final.consumed.modelCalls).toBe(3);

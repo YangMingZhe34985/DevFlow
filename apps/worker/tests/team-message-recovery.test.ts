@@ -6,7 +6,12 @@ import {
   type TeamDecision,
   type TeamEvidence,
 } from "@devflow/shared";
-import { TeamEngine, teamDigest, type TeamEnginePorts } from "../src/team/engine.js";
+import {
+  TeamEngine,
+  teamDigest,
+  teamEvidenceReferences,
+  type TeamEnginePorts,
+} from "../src/team/engine.js";
 
 const lease = { owner: "worker", dispatchRevision: 0 };
 const task = { title: "Reload remains stale", description: "Reload must expose the new value." };
@@ -81,6 +86,183 @@ async function setup(ports: Omit<TeamEnginePorts, "store" | "lease" | "signal">)
 }
 
 describe("bounded team message argument recovery", () => {
+  it("resolves only explicitly selected, current visible source handles and preserves the raw decision", async () => {
+    const source = evidence("consumer.ts");
+    const reference = Object.keys(teamEvidenceReferences([source]))[0]!;
+    const f = await setup({
+      decide: async () => decision({ type: "PROPOSE_PLAN", evidenceIds: [reference], missing: [] }),
+      observe: async () => [],
+    });
+    const old = (await f.store.load("run"))!;
+    await f.store.compareAndSwap("run", old.revision, {
+      ...old,
+      revision: old.revision + 1,
+      evidence: [source],
+    });
+    const state = await f.engine.run("run", task, 4);
+    expect(state.selectedEvidenceIds).toEqual([source.id]);
+    const model = state.operations.find((o) => o.kind === "MODEL")!;
+    expect((model.output as TeamDecision).actions[0]).toMatchObject({ evidenceIds: [reference] });
+    expect(state.agents[0]?.history[0]?.output.actions[0]).toMatchObject({
+      evidenceIds: [source.id],
+    });
+  });
+
+  it.each(["stale-source", "not-shown", "partial-handle", "prototype-key"])(
+    "rejects %s handles without guessing a source",
+    async (kind) => {
+      const source = evidence("consumer.ts");
+      const reference = Object.keys(
+        teamEvidenceReferences([
+          { ...source, ...(kind === "stale-source" ? { sourceIdentity: "old" } : {}) },
+        ]),
+      )[0]!;
+      let calls = 0;
+      const f = await setup({
+        decide: async (_view, op) => {
+          calls++;
+          if (calls > 1)
+            return decision({
+              type: "STOP",
+              reason: "INSUFFICIENT_EVIDENCE",
+              missing: ["Invalid handle"],
+            });
+          if (kind === "not-shown") {
+            const old = (await f.store.load("run"))!;
+            old.operations.find((o) => o.id === op.id)!.visibleEvidenceIds = [];
+            old.revision++;
+            await f.store.compareAndSwap("run", old.revision - 1, old);
+          }
+          return decision({
+            type: "PROPOSE_PLAN",
+            evidenceIds: [
+              kind === "partial-handle"
+                ? reference.slice(0, -1)
+                : kind === "prototype-key"
+                  ? "toString"
+                  : reference,
+            ],
+            missing: [],
+          });
+        },
+        observe: async () => [],
+      });
+      const old = (await f.store.load("run"))!;
+      await f.store.compareAndSwap("run", old.revision, {
+        ...old,
+        revision: old.revision + 1,
+        evidence: [source],
+      });
+      const state = await f.engine.run("run", task, 4);
+      expect(state.selectedEvidenceIds).toEqual([]);
+      expect(state.agents[0]?.messageRecovery?.issue.reason).toBe("EVIDENCE_ID_UNKNOWN_OR_STALE");
+      expect(calls).toBe(2);
+    },
+  );
+  it("recovers a strict decision schema error before delivering a corrected message", async () => {
+    let calls = 0;
+    const reads: string[] = [];
+    const { engine, store } = await setup({
+      decide: async (view) => {
+        if (view.role === "INVESTIGATOR") {
+          expect(view.inbox).toHaveLength(1);
+          return decision(
+            { type: "READ", path: "consumer.ts", startLine: 1, endLine: 1 },
+            { type: "RESULT", evidenceIds: ["consumer.ts"], hypotheses: [], missing: [] },
+          );
+        }
+        calls++;
+        if (calls === 1)
+          return {
+            summary: "Request consumer evidence",
+            actions: [{ ...send(), dependsOn: [] }],
+          } as unknown as TeamDecision;
+        if (calls === 2) {
+          expect((await store.load("run"))?.messages).toHaveLength(0);
+          expect(view.messageValidationFeedback?.issue).toMatchObject({
+            field: "decision",
+            reason: "DECISION_SCHEMA_INVALID",
+            fieldErrors: [{ path: "actions.0", code: "unrecognized_keys" }],
+          });
+          expect(view.messageValidationFeedback?.issue.fieldErrors?.[0]?.message).toContain(
+            "dependsOn",
+          );
+          return decision(send());
+        }
+        return decision({ type: "PROPOSE_PLAN", evidenceIds: ["consumer.ts"], missing: [] });
+      },
+      observe: async (action) => {
+        if (action.type !== "READ") throw Error("Expected read");
+        reads.push(action.path);
+        return [evidence(action.path)];
+      },
+    });
+    const result = await engine.run("run", task, 8);
+    expect(result.status).toBe("READY_FOR_PLAN");
+    expect(result.messages).toHaveLength(1);
+    expect(result.agents[0]?.messageRecovery?.resolved).toBe(true);
+    expect(reads).toEqual(["consumer.ts"]);
+    expect(
+      result.operations.filter((o) => o.failure?.message === "TEAM_DECISION_SCHEMA_INVALID"),
+    ).toHaveLength(1);
+  });
+
+  it("shares the existing correction credit with schema errors and never applies a later valid action in an invalid envelope", async () => {
+    let calls = 0;
+    const { engine } = await setup({
+      decide: async () => {
+        calls++;
+        return {
+          summary: "Invalid envelope",
+          actions: [
+            { ...send(), dependsOn: [] },
+            { type: "PROPOSE_PLAN", evidenceIds: [], missing: [] },
+          ],
+        } as unknown as TeamDecision;
+      },
+      observe: async () => {
+        throw Error("No IO");
+      },
+    });
+    const result = await engine.run("run", task, 8);
+    expect(calls).toBe(2);
+    expect(result.stopReason).toBe("MESSAGE_CORRECTION_EXHAUSTED");
+    expect(result.messages).toEqual([]);
+    expect(result.selectedEvidenceIds).toEqual([]);
+    expect(result.agents[0]?.noProgress).toBeGreaterThanOrEqual(3);
+  });
+
+  it("persists schema rejection before a crash and reuses only the original correction attempt", async () => {
+    let crash = true,
+      calls = 0;
+    const f = await setup({
+      onChange: async (s) => {
+        if (crash && s.agents[0]?.messageRecovery?.issue.reason === "DECISION_SCHEMA_INVALID") {
+          crash = false;
+          throw Error("CRASH_AFTER_REJECTION");
+        }
+      },
+      decide: async () => {
+        calls++;
+        return calls === 1
+          ? ({ summary: "bad", actions: [{ ...send(), dependsOn: [] }] } as unknown as TeamDecision)
+          : decision({
+              type: "STOP",
+              reason: "INSUFFICIENT_EVIDENCE",
+              missing: ["End investigation"],
+            });
+      },
+      observe: async () => [],
+    });
+    await expect(f.engine.run("run", task, 8)).rejects.toThrow("CRASH_AFTER_REJECTION");
+    const before = (await f.store.load("run"))!;
+    const after = await new TeamEngine(f.config).run("run", task, 8);
+    expect(after.agents[0]?.messageRecovery?.originOperationId).toBe(
+      before.agents[0]?.messageRecovery?.originOperationId,
+    );
+    expect(calls).toBe(2);
+    expect(after.messages).toEqual([]);
+  });
   it("delivers only the explicitly corrected evidence reference and lets the recipient act on it", async () => {
     let calls = 0;
     const reads: string[] = [];

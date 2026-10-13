@@ -97,7 +97,7 @@ it("keeps field correction feedback visible after trimming history and distingui
       },
     },
     AbortSignal.timeout(1000),
-    { bytes: 8000, tokens: 8000, outputTokens: 1000 },
+    { bytes: 9000, tokens: 8000, outputTokens: 1000 },
   );
   const user = JSON.parse(
     projected.request.messages.find((m) => m.role === "USER")!.content as string,
@@ -189,7 +189,7 @@ it("keeps exact evidence correction IDs and blocked task reasons in the dispatch
   const payload = JSON.parse(
     projected.request.messages.find((m) => m.role === "USER")!.content as string,
   );
-  expect(payload.messageValidationFeedback).toEqual(input.messageValidationFeedback);
+  expect(payload.messageValidationFeedback).toMatchObject(input.messageValidationFeedback!);
   expect(payload.board).toEqual(input.board);
   expect(payload.history).toEqual([]);
   expect(projected.request.messages[0]!.content).toContain("SEND never revives BLOCKED/CANCELLED");

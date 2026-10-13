@@ -18,6 +18,17 @@ import {
 
 export const teamDigest = (value: unknown) =>
   createHash("sha256").update(teamCanonicalJson(value)).digest("hex");
+/** Exact, source-bound handles; no prefix matching or model-generated aliases. */
+export function teamEvidenceReferences(evidence: readonly TeamEvidence[]): Record<string, string> {
+  const aliases: Record<string, string> = {};
+  for (const e of evidence) {
+    const reference = `ev_${teamDigest({ id: e.id, sourceIdentity: e.sourceIdentity }).slice(0, 16)}`;
+    if (aliases[reference] !== undefined && aliases[reference] !== e.id)
+      fail("TEAM_EVIDENCE_REFERENCE_COLLISION");
+    aliases[reference] = e.id;
+  }
+  return aliases;
+}
 function fail(message: string): never {
   throw new DevflowError({ code: "CONFLICT", message });
 }
@@ -447,16 +458,75 @@ export class TeamEngine {
     if (!parsed.success) {
       await this.change(runId, (s) => {
         const op = s.operations.find((o) => o.id === operation.id)!;
+        if (op.applied) return;
         op.applied = true;
         op.error = `TEAM_OUTPUT_INVALID: ${parsed.error.message}`;
-        s.status = "STOPPED";
-        s.stopReason = "MODEL_OUTPUT_INVALID";
-        s.missing = [op.error];
+        const current = s.agents.find((a) => a.id === operation.agentId)!;
+        const view = operation.input as TeamDecisionView;
+        // Invalid actions are never applied. Seeing a new error cannot reset progress.
+        current.observedEvidenceIds = [
+          ...new Set([
+            ...current.observedEvidenceIds,
+            ...(op.visibleEvidenceIds ?? view.evidence.map((e) => e.id)),
+          ]),
+        ];
+        current.noProgress++;
+        const raw = JSON.stringify(operation.output);
+        const issue: TeamMessageArgumentIssue = {
+          field: "decision",
+          expected: "schemaConformingDecision",
+          actual: operation.id,
+          reason: "DECISION_SCHEMA_INVALID",
+          availableReplies: [],
+          fieldErrors: parsed.error.issues
+            .slice(0, 12)
+            .map((e) => ({ path: e.path.join("."), code: e.code, message: e.message })),
+          ...(raw && Buffer.byteLength(raw) <= 8192 ? { rejectedDecision: operation.output } : {}),
+          guidance:
+            "No action in this invalid envelope was applied. Return one corrected decision matching the supplied schema; use only fields belonging to each action type. Do not invent evidence, task or Agent IDs. This uses the existing single Session correction, not a new allowance.",
+        };
+        const recoveryGranted = !current.messageRecovery;
+        if (recoveryGranted) {
+          current.messageRecovery = {
+            originOperationId: operation.id,
+            sourceIdentity: s.sourceIdentity,
+            issue,
+          };
+          current.status = "READY";
+        } else {
+          current.messageRecovery!.resolved = false;
+          current.status = "BLOCKED";
+          for (const t of s.tasks.filter(
+            (t) => t.agentId === current.id && ["READY", "RUNNING"].includes(t.status),
+          )) {
+            t.status = "BLOCKED";
+            t.reason = "MESSAGE_CORRECTION_EXHAUSTED";
+          }
+          if (current.id === s.coordinatorId) {
+            s.status = "STOPPED";
+            s.stopReason = "MESSAGE_CORRECTION_EXHAUSTED";
+            s.missing.push(op.error);
+          }
+        }
+        op.failure = {
+          code: "VALIDATION_ERROR",
+          message: "TEAM_DECISION_SCHEMA_INVALID",
+          details: { ...issue, recoveryGranted },
+        };
       });
       return;
     }
     const decision = parsed.data;
     const view = operation.input as TeamDecisionView;
+    const shown = new Set(operation.visibleEvidenceIds ?? view.evidence.map((e) => e.id));
+    const references = teamEvidenceReferences(view.evidence.filter((e) => shown.has(e.id)));
+    // Preserve the raw model output on the operation. Only explicit handles in this
+    // exact request are translated; the existing current-source/visibility checks follow.
+    for (const action of decision.actions)
+      if ("evidenceIds" in action)
+        action.evidenceIds = action.evidenceIds.map((id) =>
+          Object.hasOwn(references, id) ? references[id]! : id,
+        );
     const agentId = operation.agentId;
     const id = operation.id;
     const inbox = view.inbox;

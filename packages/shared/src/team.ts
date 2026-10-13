@@ -131,14 +131,22 @@ export interface TeamAgent {
   };
 }
 export interface TeamMessageArgumentIssue {
-  field: "replyTo" | "evidenceIds" | "toAgentId/taskId";
-  expected: "messageId" | "currentVisibleEvidenceIds" | "availableAgentTaskPair";
+  field: "replyTo" | "evidenceIds" | "toAgentId/taskId" | "decision";
+  expected:
+    | "messageId"
+    | "currentVisibleEvidenceIds"
+    | "availableAgentTaskPair"
+    | "schemaConformingDecision";
   actual: string;
   reason:
     | "TASK_ID_IN_MESSAGE_FIELD"
     | "MESSAGE_ID_NOT_FOUND"
     | "EVIDENCE_ID_UNKNOWN_OR_STALE"
-    | "TARGET_UNAVAILABLE";
+    | "TARGET_UNAVAILABLE"
+    | "DECISION_SCHEMA_INVALID";
+  fieldErrors?: { path: string; code: string; message: string }[];
+  /** Complete small rejected envelope only; full original output stays in its operation. */
+  rejectedDecision?: unknown;
   availableReplies: { messageId: string; fromAgentId: string; taskId: string }[];
   availableEvidence?: { id: string; path?: string; fileSha256?: string }[];
   invalidEvidenceIds?: string[];

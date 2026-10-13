@@ -1,7 +1,7 @@
 import { DevflowError, TeamDecisionSchema } from "@devflow/shared";
 import { sourceRangeReferences, type LanguageModelPort, type ModelRequest } from "@devflow/agent";
 import { teamWorkingMemory } from "./working-memory.js";
-import type { TeamDecisionView } from "./engine.js";
+import { teamEvidenceReferences, type TeamDecisionView } from "./engine.js";
 import { estimatePlanRequest, type PlanRequestEstimate } from "../runs/plan-agent-context.js";
 import type { ResourceBudgetQuote } from "../runs/resource-budget-scheduler.js";
 
@@ -68,12 +68,15 @@ export async function projectTeamRequest(
           : [],
       ),
     );
+    const evidenceReferences = teamEvidenceReferences(kept);
+    const referenceById = new Map(Object.entries(evidenceReferences).map(([ref, id]) => [id, ref]));
     const projectedEvidence = kept.map((e) => {
       const owner = rangeRefs.get(e.id);
       // Run/source identity comes from the envelope. Storage hashes and operation IDs remain
       // in SharedEvidence and the audit, not repeated in every model-facing source record.
       const record = {
         id: e.id,
+        reference: referenceById.get(e.id)!,
         kind: e.kind,
         path: e.path,
         fileSha256: e.fileSha256,
@@ -113,7 +116,7 @@ export async function projectTeamRequest(
             "Coordinator chooses zero or more focused tasks, can challenge or request evidence; only Investigators/Solver read, search or query relations.",
             "READ uses repository-relative path and inclusive positive startLine/endLine. Maximum 200 lines and 16 KiB per observation. SEARCH query must be specific. RELATIONS paths is an array.",
             "Only DELEGATE creates investigators. Do not recursively delegate. SEND toAgentId/taskId come from the task board; evidence IDs must already exist in your view. Optional replyTo is a message ID from your inbox, never a task ID. Reply to that message's sender about the same task and current source view; omit replyTo when starting a new message. No editing, shell execution, approval or test-pass declarations.",
-            "messageValidationFeedback records an unapplied action. One shared correction per Session uses Run budget. Use exact evidence IDs, not SHA or paths. Check board status/reason: SEND never revives BLOCKED/CANCELLED. Choose a legal action or stop; do not replay committed actions.",
+            "messageValidationFeedback records an unapplied action or invalid decision envelope. One shared correction per Session uses Run budget. Prefer the exact short reference shown on an evidence record in evidenceIds; full IDs remain accepted. Never use SHA, paths, guessed references or handles from another source view. Check board status/reason: SEND never revives BLOCKED/CANCELLED. Choose a legal action or stop; do not replay committed actions.",
             "Source presence is not proof of cause. Follow public assertions, implementations and consumers; distinguish current observation, counterevidence and hypothesis.",
             "Your private history is separate. Act on unread challenges: investigate, revise or explain rejection with source evidence. RESULT finishes an investigation; Coordinator then PROPOSE_PLAN with selected evidence or STOP with concrete missing information.",
             "workingMemory contains historical claims, not facts; workingMemoryDirection is its zero-based investigatedDirections index. assignmentRef uses assignments[].id. contentRef resolves exact source lines in a visible evidence owner; IDs remain usable. Omitted history does not imply missing implementation.",
@@ -139,6 +142,20 @@ export async function projectTeamRequest(
                 ? workingMemory
                 : undefined,
             evidence: projectedEvidence,
+            messageValidationFeedback: view.messageValidationFeedback
+              ? {
+                  ...view.messageValidationFeedback,
+                  issue: {
+                    ...view.messageValidationFeedback.issue,
+                    availableEvidence: view.messageValidationFeedback.issue.availableEvidence?.map(
+                      (e) => ({
+                        ...e,
+                        reference: projectedEvidence.find((shown) => shown.id === e.id)?.reference,
+                      }),
+                    ),
+                  },
+                }
+              : undefined,
             omittedEvidence: omitted,
             decisionSchema: undefined,
           }),
@@ -194,6 +211,7 @@ export async function projectTeamRequest(
             retainedHistoryTurns: history.length,
             archivedHistoryTurns: view.history.length - history.length,
             sourceReferences: [...rangeRefs].map(([id, owner]) => ({ id, ownerId: owner.id })),
+            evidenceReferences,
             semanticCompression: "NOT_USED_STRUCTURED_MEMORY",
             workingMemorySha256: workingMemory.historySha256,
           },

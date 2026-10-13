@@ -1857,10 +1857,30 @@ export class DefaultAgentRuntime implements AgentRuntime {
             })
           );
         });
+        const textCorrection = normalCalls.some(({ call, result }) => {
+          if (call.name !== "replaceText" || result.ok || result.error.code !== "CONFLICT")
+            return false;
+          const failure = objectValue(objectValue(result.error.details)?.textFailure);
+          const input = objectValue(call.input),
+            mutation = result.mutation;
+          return (
+            failure?.kind === "LINE_ENDING_MISMATCH" &&
+            failure.needsRead === false &&
+            typeof failure.path === "string" &&
+            failure.path === input?.path &&
+            failure.fileSha256 === input?.expectedSha256 &&
+            mutation?.observationComplete === true &&
+            !mutation.workspaceChanged &&
+            !mutation.mutationApplied &&
+            mutation.beforeRevision === mutation.afterRevision &&
+            failure.fileSha256 === mutation.currentHashes[failure.path]
+          );
+        });
         if (
           !execution.editCorrectionUsed &&
           !execution.editCorrectionPending &&
-          (contextCorrection ||
+          (textCorrection ||
+            contextCorrection ||
             normalCalls.some(({ call, result }) => {
               if (call.name !== "applyPatch") return false;
               const failure = objectValue(
@@ -1872,12 +1892,15 @@ export class DefaultAgentRuntime implements AgentRuntime {
             }))
         ) {
           execution.editCorrectionPending = true;
-          execution.correctionReason = contextCorrection ? "CONTEXT_MISMATCH" : "FORMAT_INVALID";
+          execution.correctionReason =
+            textCorrection || contextCorrection ? "CONTEXT_MISMATCH" : "FORMAT_INVALID";
           messages.push({
             role: "USER",
-            content: contextCorrection
-              ? "One shared bounded edit correction is available. Patch context did not match the verified unchanged source. The tool error includes complete current hunk neighborhoods and full file SHA from existing host verification. Use these exact lines for replaceText or a corrected patch, then finishPhase. Do not reread or search; no additional correction or budget is granted. Missing evidence must be reported as insufficient."
-              : "One bounded edit correction is available. The patch format was invalid and source is unchanged. Use the exact current evidence to correct the edit, preferably replaceText, then finishPhase. Do not reread or search. Hard budgets still apply.",
+            content: textCorrection
+              ? "One shared bounded edit correction is available. replaceText failed only because uniform line endings differ; the host verified the full unchanged SHA and unique normalized match. Explicitly set lineEndingMode=MATCH_FILE with the same current source evidence, or finish with INSUFFICIENT_EVIDENCE. No automatic text conversion, reread, search or new correction credit is granted."
+              : contextCorrection
+                ? "One shared bounded edit correction is available. Patch context did not match the verified unchanged source. The tool error includes complete current hunk neighborhoods and full file SHA from existing host verification. Use these exact lines for replaceText or a corrected patch, then finishPhase. Do not reread or search; no additional correction or budget is granted. Missing evidence must be reported as insufficient."
+                : "One bounded edit correction is available. The patch format was invalid and source is unchanged. Use the exact current evidence to correct the edit, preferably replaceText, then finishPhase. Do not reread or search. Hard budgets still apply.",
           });
         }
         let newEvidence = false;

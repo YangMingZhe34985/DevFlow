@@ -37,7 +37,17 @@ describe("exact replaceText", () => {
     await expect(replaceText(edit, f.context)).rejects.toMatchObject({
       code: "CONFLICT",
       message: expect.stringContaining("lineEndingMode=MATCH_FILE"),
-      details: { fileLineEndings: "CRLF", oldTextLineEndings: "LF", occurrences: 0 },
+      details: {
+        fileLineEndings: "CRLF",
+        oldTextLineEndings: "LF",
+        occurrences: 0,
+        textFailure: {
+          kind: "LINE_ENDING_MISMATCH",
+          needsRead: false,
+          path: "a.ts",
+          fileSha256: sha(initial),
+        },
+      },
     });
     expect(f.content()).toBe(initial);
     expect(f.writes()).toBe(0);

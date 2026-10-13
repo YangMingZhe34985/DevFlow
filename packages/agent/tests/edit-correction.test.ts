@@ -104,6 +104,71 @@ function contextFailure(): ToolExecutionResult {
     },
   };
 }
+
+for (const invalid of ["none", "changed", "incomplete", "stale", "used"] as const)
+  it(`gives unchanged unique newline conflicts one shared correction, subject to ${invalid}`, async () => {
+    const f = fixture(),
+      stateStore = new InMemoryAgentStateStore();
+    f.context.stateStore = stateStore;
+    const failed = contextFailure();
+    if (failed.ok) throw new Error("fixture");
+    failed.error = {
+      code: "CONFLICT",
+      message: "TEXT_MATCH_COUNT: LF/CRLF",
+      retryable: false,
+      details: {
+        textFailure: {
+          kind: "LINE_ENDING_MISMATCH",
+          needsRead: false,
+          path: "a.ts",
+          fileSha256: "a".repeat(64),
+        },
+      },
+    };
+    if (invalid === "changed") failed.mutation!.workspaceChanged = true;
+    if (invalid === "incomplete") failed.mutation!.observationComplete = false;
+    if (invalid === "stale") failed.mutation!.currentHashes["a.ts"] = "b".repeat(64);
+    let edits = 0;
+    f.context.executeTool = async (_, call) =>
+      call.name === "replaceText" && edits++ === 0
+        ? failed
+        : { ok: true, durationMs: 0, output: {} };
+    const edit = () =>
+      fakeModelResponse({
+        toolCalls: [
+          {
+            id: randomUUID(),
+            name: "replaceText",
+            input: { path: "a.ts", expectedSha256: "a".repeat(64) },
+          },
+        ],
+      });
+    const model = new FakeLanguageModel([
+      response("readFile"),
+      edit(),
+      async (request) => {
+        expect(JSON.stringify(request.messages)).toContain("lineEndingMode=MATCH_FILE");
+        return fakeModelResponse({
+          toolCalls: [...edit().toolCalls, ...response("finishPhase").toolCalls],
+        });
+      },
+    ]);
+    const result = await new DefaultAgentRuntime(model).run(
+      {
+        maxSteps: 4,
+        adaptiveStepBudget: { ...lease, initialLimit: 2, hardLimit: 4 },
+        maxRetries: 0,
+        timeoutMs: 3000,
+        codingSession: true,
+        executionRecovery: { pending: false, used: invalid === "used", explorationClosed: false },
+      },
+      f.context,
+    );
+    expect(model.requests).toHaveLength(invalid === "none" ? 3 : 2);
+    expect(result.status).toBe(invalid === "none" ? "SUCCEEDED" : "FAILED");
+    if (invalid === "none")
+      expect((await stateStore.load(f.context.runId))!.executionRecovery?.used).toBe(true);
+  });
 it("uses the existing correction after an unchanged context mismatch even when closing refresh is exhausted", async () => {
   const f = fixture(),
     stateStore = new InMemoryAgentStateStore();

@@ -87,6 +87,31 @@ export async function replaceText(
         lineEndingMode,
         expectedOccurrences: input.expectedOccurrences,
         occurrences,
+        ...(lineEndingMode === "EXACT" &&
+        input.expectedOccurrences === 1 &&
+        occurrences === 0 &&
+        [endings.fileLineEndings, endings.oldTextLineEndings, endings.newTextLineEndings].every(
+          (kind) => ["LF", "CRLF", "NONE"].includes(kind),
+        ) &&
+        [endings.fileLineEndings, endings.oldTextLineEndings].every((kind) =>
+          ["LF", "CRLF"].includes(kind),
+        ) &&
+        endings.fileLineEndings !== endings.oldTextLineEndings &&
+        current.content.replace(/\r\n/gu, "\n").split(input.oldText.replace(/\r\n/gu, "\n"))
+          .length === 2
+          ? {
+              textFailure: {
+                kind: "LINE_ENDING_MISMATCH",
+                needsRead: false,
+                path: input.path,
+                fileSha256: sha256,
+                fields: {
+                  lineEndingMode:
+                    "Use explicit MATCH_FILE with the same current SHA and unique oldText.",
+                },
+              },
+            }
+          : {}),
       },
     });
   const content = parts.join(newText);

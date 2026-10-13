@@ -353,6 +353,11 @@ export class TeamEngine {
         const op = s.operations.find((o) => o.id === id)!;
         op.status = notIssued ? "NOT_ISSUED" : "UNKNOWN";
         op.error = error instanceof Error ? (error.stack ?? error.message) : String(error);
+        op.failure = {
+          code: error instanceof DevflowError ? error.code : "HOST_ERROR",
+          message: error instanceof Error ? error.message : String(error),
+          ...(error instanceof DevflowError && error.details ? { details: error.details } : {}),
+        };
       });
       throw error;
     }

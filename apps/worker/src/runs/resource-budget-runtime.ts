@@ -416,6 +416,21 @@ export class ResourceBudgetRuntime {
           await this.record({
             budgetScheduler: { operationId: id, action: "UNCERTAIN", dispatchStatus: "UNKNOWN" },
           });
+          if (error instanceof Error && error.name === "TimeoutError")
+            throw new DevflowError({
+              code: "TIMEOUT",
+              message: "Model invocation timed out without confirmed provider usage.",
+              details: {
+                operationId: id,
+                stage: options.stage,
+                dispatchStatus: "UNKNOWN",
+                providerUsageConfirmed: false,
+                configuredTimeoutMs: timeoutMs,
+                ...(admission.executionDeadlineAt === undefined
+                  ? {}
+                  : { executionDeadlineAt: admission.executionDeadlineAt }),
+              },
+            });
           throw error;
         }
         const actual = {

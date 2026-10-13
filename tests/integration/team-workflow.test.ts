@@ -22,7 +22,7 @@ const files = {
 describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
   "production Worker team planning",
   () => {
-    it.each(["READ", "SEARCH", "SEARCH_TIMEOUT"])(
+    it.each(["READ", "SEARCH", "SEARCH_TIMEOUT", "MODEL_TIMEOUT"])(
       "routes independent %s evidence into the existing Planner and PLAN approval without write authority",
       async (action) => {
         const database = PrismaDatabaseAdapter.fromConnectionString(process.env.TEST_DATABASE_URL!);
@@ -78,6 +78,8 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                 ) as TeamDecisionView;
                 expect(view.resourceAvailability?.tokens).toBeGreaterThan(0);
                 expect(view.resourceAvailability?.costMicros).toBeLessThan(4000000);
+                if (action === "MODEL_TIMEOUT" && view.role === "INVESTIGATOR")
+                  throw new DOMException("model transport deadline", "TimeoutError");
                 if (action === "SEARCH_TIMEOUT" && view.role === "INVESTIGATOR")
                   database.repositoryIndexes.get = async () => {
                     throw new DOMException("read-only search deadline", "TimeoutError");
@@ -197,11 +199,23 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             environment,
             () => model,
           ).execute(run!, AbortSignal.timeout(30000));
-          if (action === "SEARCH_TIMEOUT") {
+          if (action.endsWith("TIMEOUT")) {
             expect(outcome).toMatchObject({ status: "FAILED", error: { code: "TIMEOUT" } });
             const saved = (await database.teams.load(run!.id))!;
             expect(saved.operations.some((op) => op.failure?.code === "TIMEOUT")).toBe(true);
             expect(requests.some((r) => r.output?.name === "plan_proposal")).toBe(false);
+            if (action === "MODEL_TIMEOUT") {
+              const unknown = saved.operations.filter(
+                (op) => op.kind === "MODEL" && op.status === "UNKNOWN",
+              );
+              expect(unknown.length).toBeGreaterThan(0);
+              const ledger = (await database.budgetLedgers.get(run!.id))!.value as {
+                reservations: Record<string, { status: string }>;
+              };
+              expect(unknown.every((op) => ledger.reservations[op.id]?.status === "ADMITTED")).toBe(
+                true,
+              );
+            }
             return;
           }
           expect(

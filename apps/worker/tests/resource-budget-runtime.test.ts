@@ -383,40 +383,50 @@ describe("Resource Budget Scheduler execution boundary", () => {
     );
   });
 
-  it("keeps unknown provider consumption held across a new Worker and cannot reuse that model-call capacity", async () => {
-    const { options, scheduler, runtime } = await fixture({ modelCalls: 1 });
-    const failing = new FakeLanguageModel([
-      async () => {
-        throw Error("transport interrupted");
-      },
-    ]);
-    await expect(
-      runtime
-        .model(failing, { stage: "REVIEW", outputTokens: 16384, timeoutMs: 1000, price })
-        .generate(request, { signal: signal() }),
-    ).rejects.toThrow("transport interrupted");
-    const before = await scheduler.snapshot();
-    expect(before.consumed.modelCalls).toBe(1);
-    expect(Object.values(before.reservations)[0]!.knownUsage?.timeMs).toBeTypeOf("number");
-    expect(Object.values(before.reservations)[0]!.status).toBe("ADMITTED");
-    const resumed = await ResourceBudgetScheduler.open({
-      ...options,
-      startedAt: Date.now(),
-      deadlineAt: Date.now() + 2_000_000,
-    });
-    const next = new FakeLanguageModel([]);
-    const resumedRuntime = new ResourceBudgetRuntime(resumed, async () => undefined);
-    await expect(
-      resumedRuntime
-        .model(next, { stage: "REVIEW", outputTokens: 16384, timeoutMs: 1000, price })
-        .generate(request, { signal: signal() }),
-    ).rejects.toMatchObject({ code: "EXECUTION_BUDGET_EXCEEDED" });
-    expect(next.requests).toEqual([]);
-    expect((await resumed.snapshot()).deadlineAt).toBe(before.deadlineAt);
-    expect(
-      Object.values((await resumed.snapshot()).reservations).filter((r) => r.status === "ADMITTED"),
-    ).toHaveLength(1);
-  });
+  it.each(["transport", "timeout"])(
+    "keeps unknown %s consumption held across a new Worker and cannot reuse that model-call capacity",
+    async (kind) => {
+      const { options, scheduler, runtime } = await fixture({ modelCalls: 1 });
+      const failing = new FakeLanguageModel([
+        async () => {
+          if (kind === "timeout") throw new DOMException("request deadline", "TimeoutError");
+          throw Error("transport interrupted");
+        },
+      ]);
+      await expect(
+        runtime
+          .model(failing, { stage: "REVIEW", outputTokens: 16384, timeoutMs: 1000, price })
+          .generate(request, { signal: signal() }),
+      ).rejects.toThrow(
+        kind === "timeout"
+          ? "Model invocation timed out without confirmed provider usage."
+          : "transport interrupted",
+      );
+      const before = await scheduler.snapshot();
+      expect(before.consumed.modelCalls).toBe(1);
+      expect(Object.values(before.reservations)[0]!.knownUsage?.timeMs).toBeTypeOf("number");
+      expect(Object.values(before.reservations)[0]!.status).toBe("ADMITTED");
+      const resumed = await ResourceBudgetScheduler.open({
+        ...options,
+        startedAt: Date.now(),
+        deadlineAt: Date.now() + 2_000_000,
+      });
+      const next = new FakeLanguageModel([]);
+      const resumedRuntime = new ResourceBudgetRuntime(resumed, async () => undefined);
+      await expect(
+        resumedRuntime
+          .model(next, { stage: "REVIEW", outputTokens: 16384, timeoutMs: 1000, price })
+          .generate(request, { signal: signal() }),
+      ).rejects.toMatchObject({ code: "EXECUTION_BUDGET_EXCEEDED" });
+      expect(next.requests).toEqual([]);
+      expect((await resumed.snapshot()).deadlineAt).toBe(before.deadlineAt);
+      expect(
+        Object.values((await resumed.snapshot()).reservations).filter(
+          (r) => r.status === "ADMITTED",
+        ),
+      ).toHaveLength(1);
+    },
+  );
 
   it.each([true, false])(
     "settles a trusted local rejection without token or cost exposure (priced=%s)",

@@ -130,7 +130,7 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                             type: "RESULT",
                             evidenceIds: view.evidence.map((e) => e.id),
                             hypotheses: ["subtraction conflicts with the public expected sum"],
-                            missing: [],
+                            missing: ["Negative operand consumer remains unverified"],
                           },
                         ];
                 return fakeModelResponse({
@@ -144,6 +144,9 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
               const prompt = JSON.stringify(request.messages);
               expect(prompt).toContain("return a-b");
               expect(prompt).toContain("total = add");
+              expect(prompt).toContain("Negative operand consumer remains unverified");
+              expect(prompt).toContain("teamInvestigation");
+              expect(prompt).toContain("RANGE_COVERED");
               return fakeModelResponse({
                 toolCalls: [],
                 output: {
@@ -202,6 +205,9 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           if (action.endsWith("TIMEOUT")) {
             expect(outcome).toMatchObject({ status: "FAILED", error: { code: "TIMEOUT" } });
             const saved = (await database.teams.load(run!.id))!;
+            expect(JSON.stringify(await database.events.list(run!.id, { limit: 1000 }))).toContain(
+              "INVESTIGATION_INTERRUPTED",
+            );
             expect(saved.operations.some((op) => op.failure?.code === "TIMEOUT")).toBe(true);
             expect(requests.some((r) => r.output?.name === "plan_proposal")).toBe(false);
             if (action === "MODEL_TIMEOUT") {
@@ -228,6 +234,10 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             }),
           ).toMatchObject({ status: "WAITING_APPROVAL", approvalKind: "PLAN" });
           const state = (await database.teams.load(run!.id))!;
+          const events = JSON.stringify(await database.events.list(run!.id, { limit: 1000 }));
+          expect(events).toContain("INVESTIGATION_OUTCOME");
+          expect(events).toContain("PREPARED_NOT_YET_ADMITTED");
+          expect(events).toContain("requestFingerprint");
           expect(state.status).toBe("READY_FOR_PLAN");
           expect(state.agents.filter((a) => a.role === "INVESTIGATOR")).toHaveLength(2);
           expect(

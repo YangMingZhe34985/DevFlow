@@ -243,6 +243,11 @@ it("projects overlapping evidence through a visible owner and preserves each leg
   );
   expect(result.shown.map((e) => e.id).sort()).toEqual(["full", "part"]);
   expect(input.evidence[1]!.content).toBe(lines.slice(9, 60).join("\n"));
+  expect(result.audit.evidenceBodyBytesBeforeReferences).toBeGreaterThan(
+    result.audit.evidenceBodyBytesAfterReferences,
+  );
+  expect(result.audit.retainedEvidence).toBe(2);
+  expect(result.audit.requestFingerprint).toMatch(/^[a-f0-9]{64}$/);
 });
 
 it("fails before dispatch if a mandatory reference only exists in a stale source view", async () => {

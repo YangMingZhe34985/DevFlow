@@ -18,8 +18,6 @@ import { resolveStageModel, type ModelStage } from "../config/stage-models.js";
 import {
   exclusionReason,
   hash,
-  isTestFile,
-  type EvidenceItem,
   type EvidencePack,
   type IndexSource,
 } from "../localization/contracts.js";
@@ -38,6 +36,8 @@ import { TeamEngine, teamDigest, teamDecisionView, type TeamDecisionView } from 
 import { estimatePlanRequest } from "../runs/plan-agent-context.js";
 import { teamBudgetStore } from "./budget-store.js";
 import { projectTeamRequest } from "./context.js";
+import { teamEvidencePack } from "./handoff.js";
+import { teamOperationAudit, teamStopError } from "./observability.js";
 
 export async function investigateWithTeam(input: {
   database: DatabaseAdapter;
@@ -488,6 +488,8 @@ export async function investigateWithTeam(input: {
           role,
           shown: projection.shown,
           omitted: projection.omitted,
+          projectionAudit: projection.audit,
+          requestState: "PREPARED_NOT_YET_ADMITTED",
         },
       });
       const response = await model.generate(projection.request, { signal });
@@ -669,12 +671,39 @@ export async function investigateWithTeam(input: {
   const saved = await store.load(run.id);
   const ledger = await runtime.scheduler.snapshot();
   const used = saved!.agents.reduce((n, a) => n + a.decisionCount, 0);
-  const state = await engine.run(
-    run.id,
-    { title: run.task.title, description: run.task.description },
-    used + Math.max(0, (ledger.limits.steps ?? run.maxSteps) - ledger.consumed.steps),
-  );
+  let state: TeamSnapshot;
+  try {
+    state = await engine.run(
+      run.id,
+      { title: run.task.title, description: run.task.description },
+      used + Math.max(0, (ledger.limits.steps ?? run.maxSteps) - ledger.consumed.steps),
+    );
+  } catch (error) {
+    // Operation receipts remain authoritative even if cancellation/lease loss prevents this event.
+    try {
+      const failed = await store.load(run.id);
+      if (failed)
+        await record({
+          team: {
+            action: "INVESTIGATION_INTERRUPTED",
+            ...teamOperationAudit(failed),
+            status: failed.status,
+          },
+        });
+    } catch {
+      /* Preserve the original execution error, never replace it with an audit-sink error. */
+    }
+    throw error;
+  }
   const history = JSON.stringify(state);
+  await record({
+    team: {
+      action: "INVESTIGATION_OUTCOME",
+      ...teamOperationAudit(state),
+      status: state.status,
+      stopReason: state.stopReason,
+    },
+  });
   await database.artifacts.create({
     runId: run.id,
     kind: "OTHER",
@@ -711,64 +740,8 @@ export async function investigateWithTeam(input: {
     .catch(async (error) => {
       if ((await runtime.scheduler.snapshot()).reservations[downstreamId]) throw error;
     });
-  if (state.status !== "READY_FOR_PLAN")
-    throw new DevflowError({
-      code:
-        state.stopReason === "STALLED"
-          ? "AGENT_STALLED"
-          : state.stopReason === "BUDGET_STOP"
-            ? "EXECUTION_BUDGET_EXCEEDED"
-            : "INSUFFICIENT_EVIDENCE",
-      message: `Collaboration ended: ${state.stopReason ?? state.status}`,
-      details: {
-        missing: state.missing,
-        requestIssued: false,
-        teamRevision: state.revision,
-        stopReason: state.stopReason,
-        failures: state.operations
-          .filter((op) => op.failure)
-          .map((op) => ({ operationId: op.id, ...op.failure })),
-      },
-    });
-  const selected = state.evidence.filter(
-    (e) => e.valid && state.selectedEvidenceIds.includes(e.id),
-  );
-  const sources = selected.filter(
-    (e) => e.kind === "SOURCE_OBSERVATION" && e.path && e.fileSha256 && e.startLine && e.endLine,
-  );
-  const evidence: EvidenceItem[] = sources.map((e) => ({
-    repositoryId: run.repository.id,
-    baseCommitSha: input.baseCommit,
-    viewRevision: input.evidence.viewRevision,
-    path: e.path!,
-    contentHash: e.fileSha256!,
-    startLine: e.startLine!,
-    endLine: e.endLine!,
-    symbol: null,
-    reason: "Team-selected public observation; cause remains a hypothesis",
-    retrievalSource: ["TEAM", e.sourceOperationId],
-    score: 1,
-    snippet: e.content,
-    language: e.path!.split(".").at(-1) ?? "unknown",
-    module: e.path!.split("/").slice(0, -1).join("/"),
-    fileType: isTestFile(e.path!) ? "TEST" : "SOURCE",
-    parseStatus: "LEXICAL",
-    signature: null,
-    directImports: [],
-    truncated: true,
-  }));
-  return {
-    ...input.evidence,
-    evidence: evidence.length ? evidence : input.evidence.evidence,
-    missingInformation: [
-      ...input.evidence.missingInformation,
-      ...state.missing,
-      ...state.tasks
-        .filter((t) => t.sourceIdentity === state.sourceIdentity)
-        .flatMap((t) => t.result?.hypotheses ?? [])
-        .map((h) => `Unverified team hypothesis to assess: ${h}`),
-    ],
-  };
+  if (state.status !== "READY_FOR_PLAN") throw teamStopError(state);
+  return teamEvidencePack(state, input.evidence, input.baseCommit);
 }
 
 function decisionOf(response: ModelResponse): unknown {

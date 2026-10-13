@@ -17,6 +17,7 @@ import type { StructuredOutputAttempt } from "./workflow-structured-output.js";
 import {
   boundPlanSnippet,
   estimatePlanRequest,
+  planRequestEvidenceAudit,
   planContextText,
   planEvidenceRows,
   planHash,
@@ -150,6 +151,7 @@ export interface PlanAttempt {
     actualTokens?: number;
     /** Undefined means transport outcome is unknown, never infer dispatch from attempt count. */
     requestIssued?: boolean;
+    evidenceVisibility?: ReturnType<typeof planRequestEvidenceAudit>;
   }[];
   outputRegeneration?: {
     trigger: "LENGTH" | "COMPACT_SCHEMA";
@@ -966,7 +968,12 @@ class PlanSession {
       );
     await this.hooks.onRequest?.({ purpose, formatRepair, request, preflight });
     this.check();
-    const row: PlanAttempt["requests"][number] = { purpose, formatRepair, preflight };
+    const row: PlanAttempt["requests"][number] = {
+      purpose,
+      formatRepair,
+      preflight,
+      evidenceVisibility: planRequestEvidenceAudit(request),
+    };
     this.attempt.requests.push(row);
     this.attempt.metrics.modelCalls++;
     const started = Date.now();

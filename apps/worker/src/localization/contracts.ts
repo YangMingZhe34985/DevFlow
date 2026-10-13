@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { TeamInvestigationHandoff } from "../team/handoff.js";
 
 import { z } from "zod";
 
@@ -90,6 +91,7 @@ export interface EvidenceItem {
   truncated: boolean;
 }
 export interface EvidencePack {
+  teamHandoff?: TeamInvestigationHandoff;
   prg?: {
     atlasIdentity: string;
     coverage: "COMPLETE" | "PARTIAL";

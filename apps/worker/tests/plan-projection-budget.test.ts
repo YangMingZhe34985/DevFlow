@@ -21,6 +21,10 @@ it("preserves Scheduler non-dispatch diagnostics instead of equating a decision 
   expect(result.status).toBe("BLOCKED");
   expect(result.attempt.metrics.modelCalls).toBe(1);
   expect(result.attempt.requests[0]?.requestIssued).toBe(false);
+  expect(result.attempt.requests[0]?.evidenceVisibility?.shown.length).toBeGreaterThan(0);
+  expect(result.attempt.requests[0]?.evidenceVisibility?.assessment).toBe(
+    "VISIBILITY_ONLY_NOT_BEHAVIORAL_SUFFICIENCY",
+  );
   expect(result.attempt.diagnostics.at(-1)).toMatchObject({
     code: "EXECUTION_BUDGET_EXCEEDED",
     details: { requestIssued: false, missingCostMicros: 10 },

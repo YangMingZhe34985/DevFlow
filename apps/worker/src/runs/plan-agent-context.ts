@@ -3,6 +3,7 @@ import { preparedInput, serializeModelRequest, type ModelRequest } from "@devflo
 import type { EvidenceItem, EvidencePack } from "../localization/contracts.js";
 import type { IssueLocalizationResult } from "../localization/issue-localization-agent.js";
 import { normalizeTargetPath } from "./execution-packet.js";
+import { projectTeamHandoff, teamHandoffGaps } from "../team/handoff.js";
 
 export const planHash = (value: string): string => createHash("sha256").update(value).digest("hex");
 
@@ -74,6 +75,38 @@ export function estimatePlanRequest(request: ModelRequest): PlanRequestEstimate 
     settingsBytes: size(shape.settings),
     fingerprint: projection?.fingerprint ?? planHash(serialized),
   };
+}
+
+/** Audit the actual serialized view, not the host's larger evidence cache. */
+export function planRequestEvidenceAudit(request: ModelRequest) {
+  for (const message of request.messages) {
+    if (message.role !== "USER" || typeof message.content !== "string") continue;
+    let value;
+    try {
+      value = JSON.parse(message.content);
+    } catch {
+      continue;
+    }
+    if (value?.hostState?.version !== "plan-host-state-v1" || !Array.isArray(value.evidence))
+      continue;
+    return {
+      version: "plan-request-evidence-audit-v1",
+      issueDigest: value.hostState.issue?.digest as string | undefined,
+      shown: value.evidence.map((e: PlanEvidenceRow) => ({
+        id: e.id,
+        path: e.path,
+        contentHash: e.contentHash,
+        startLine: e.startLine,
+        endLine: e.endLine,
+        snippetHash: e.snippetHash,
+        truncated: e.truncated,
+        fileType: e.fileType,
+      })),
+      teamReferences: value.teamInvestigation?.references ?? [],
+      assessment: "VISIBILITY_ONLY_NOT_BEHAVIORAL_SUFFICIENCY",
+    };
+  }
+  return undefined;
 }
 
 export interface PlanEvidenceRef {
@@ -338,6 +371,9 @@ export function planContextText(
   observations: readonly string[],
 ): string {
   return JSON.stringify({
+    ...(input.evidence?.teamHandoff
+      ? { teamInvestigation: projectTeamHandoff(input.evidence.teamHandoff, rows) }
+      : {}),
     ...(input.priorSolverSession ? { priorSolverSession: input.priorSolverSession } : {}),
     hostState: {
       ...host,
@@ -362,7 +398,11 @@ export function planContextText(
     coverage: {
       incomplete: input.evidence?.incomplete ?? true,
       truncated: (input.evidence?.truncated ?? false) || rows.some((row) => row.truncated),
-      missingInformation: input.evidence?.missingInformation ?? [],
+      missingInformation: input.evidence?.teamHandoff
+        ? (input.evidence.missingInformation ?? []).filter(
+            (gap) => !teamHandoffGaps(input.evidence!.teamHandoff!, []).includes(gap),
+          )
+        : (input.evidence?.missingInformation ?? []),
       manifestNotIncluded: true,
     },
     hypotheses: {

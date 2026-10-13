@@ -114,7 +114,7 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                             .filter((e) => e.kind === "SOURCE_OBSERVATION")
                             .map((e) => e.id),
                           hypotheses: ["subtract adds instead of subtracting"],
-                          missing: [],
+                          missing: ["Preserve the add consumer while correcting subtraction"],
                         },
                       ];
               return fakeModelResponse({
@@ -152,6 +152,12 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
               });
             }
             codingTurns++;
+            if (mode === "team") {
+              expect(JSON.stringify(request.messages)).toContain(
+                "Preserve the add consumer while correcting subtraction",
+              );
+              expect(JSON.stringify(request.messages)).toContain("Historical investigation");
+            }
             const call = (name: string, input: unknown) => ({
               id: `${codingTurns}-${name}`,
               name,

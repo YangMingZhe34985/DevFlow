@@ -11,6 +11,7 @@ import { attachPatchFailureEvidence } from "./patch-failure-evidence.js";
 import { databaseExecutionLease } from "@devflow/database";
 import { investigateWithTeam } from "../team/workflow-bridge.js";
 import { solverSessionView } from "../team/solver-session.js";
+import { codingTeamFollowup } from "../team/handoff.js";
 import { buildRepositoryAtlas, atlasSource } from "../localization/repository-atlas.js";
 import { BehaviorRetriever } from "../localization/behavior-retriever.js";
 import {
@@ -5661,8 +5662,21 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       input.run.executionMode === "single"
         ? solverSessionView(await this.database.teams?.load(input.run.id))
         : undefined;
+    const teamHistory =
+      input.run.executionMode === "team"
+        ? await this.database.teams?.load(input.run.id)
+        : undefined;
+    const stableTaskContext = [
+      input.stableTaskContext,
+      teamHistory
+        ? JSON.stringify({ teamInvestigation: codingTeamFollowup(teamHistory) })
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join("\n");
     const cumulativeResult = await runtime.run(
       {
+        ...(stableTaskContext ? { stableTaskContext } : {}),
         ...(input.run.executionMode === "single"
           ? {
               initialSession: (() => {
@@ -5843,7 +5857,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               repairMode: true,
               ...(repairRecovery ? { executionRecovery: repairRecovery } : {}),
               stableTaskContext:
-                input.stableTaskContext ??
+                stableTaskContext ||
                 `Host finding IDs: ${JSON.stringify(input.reviewFindingIds ?? [])}. Preserve requirements and resolve diagnostics before finishing.`,
               repairRecoveryContext: {
                 maxToolExecutions: 2,

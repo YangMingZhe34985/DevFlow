@@ -157,6 +157,26 @@ export async function projectTeamRequest(
             version: "team-context-audit-v1",
             serializedBytes: bytes,
             estimatedInputTokens: tokens,
+            requestFingerprint: estimate.fingerprint,
+            messagesBytes: estimate.messagesBytes,
+            toolsBytes: estimate.toolsBytes,
+            outputSchemaBytes: estimate.outputSchemaBytes,
+            availableEvidence: evidence.length,
+            retainedEvidence: kept.length,
+            requiredEvidence: required.length,
+            omittedEvidence: omitted.length,
+            evidenceBodyBytesBeforeReferences: kept.reduce(
+              (n, e) => n + Buffer.byteLength(e.content),
+              0,
+            ),
+            evidenceBodyBytesAfterReferences: projectedEvidence.reduce(
+              (n, e) =>
+                n +
+                ("content" in e && typeof e.content === "string"
+                  ? Buffer.byteLength(e.content)
+                  : 0),
+              0,
+            ),
             retainedHistoryTurns: history.length,
             archivedHistoryTurns: view.history.length - history.length,
             sourceReferences: [...rangeRefs].map(([id, owner]) => ({ id, ownerId: owner.id })),

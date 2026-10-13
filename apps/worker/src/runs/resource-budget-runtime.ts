@@ -165,14 +165,58 @@ export class ResourceBudgetRuntime {
   indexStore(store: RepositoryIndexStore): RepositoryIndexStore {
     const prior = this.wrappedIndexes.get(store);
     if (prior) return prior;
+    // Publications are immutable by (scope, key). Keep only confirmed reads; a
+    // publish may lose to another builder, so its proposed value is not evidence.
+    // This cache belongs to one Run runtime and is never restored across workers.
+    const cached = new Map<string, { value: unknown; bytes: number }>();
+    const pending = new Map<string, Promise<unknown>>();
+    const maxBytes = 16 * 1024 * 1024;
+    let bytes = 0;
+    const reused = async (value: unknown, key: string) => {
+      await this.record({
+        budgetScheduler: { action: "INDEX_CACHE_HIT", key, physicalIO: false },
+      });
+      return structuredClone(value);
+    };
     const wrapped: RepositoryIndexStore = {
-      get: (scope, key) =>
-        this.io(
+      get: async (scope, key) => {
+        await this.flush();
+        const identity = JSON.stringify([scope, key]);
+        const hit = cached.get(identity);
+        if (hit) {
+          cached.delete(identity);
+          cached.set(identity, hit);
+          return reused(hit.value, identity);
+        }
+        const inflight = pending.get(identity);
+        if (inflight) return reused(await inflight, identity);
+        const read = this.io(
           "prg:index-get",
           { toolExecutions: 1, ioReads: 1, ioBytes: 1024 * 1024, timeMs: 5000 },
           () => store.get(scope, key),
           (value) => ({ ioBytes: Buffer.byteLength(JSON.stringify(value ?? null)) }),
-        ),
+        ).then((value) => {
+          if (value !== undefined) {
+            const size = Buffer.byteLength(JSON.stringify(value));
+            if (size <= maxBytes) {
+              while (bytes + size > maxBytes && cached.size) {
+                const oldest = cached.keys().next().value!;
+                bytes -= cached.get(oldest)!.bytes;
+                cached.delete(oldest);
+              }
+              cached.set(identity, { value: structuredClone(value), bytes: size });
+              bytes += size;
+            }
+          }
+          return value;
+        });
+        pending.set(identity, read);
+        try {
+          return structuredClone(await read);
+        } finally {
+          pending.delete(identity); // misses and errors must remain retryable
+        }
+      },
       publish: (scope, key, value) =>
         this.io(
           "prg:index-publish",

@@ -458,6 +458,7 @@ export interface DatabaseAdapter extends DatabaseLifecycle {
 }
 
 export interface RepositoryIndexStore {
+  /** Keys are immutable within an access scope; publish never replaces an existing value. */
   get(scope: string, key: string): Promise<unknown | undefined>;
   publish(scope: string, key: string, value: unknown): Promise<void>;
 }

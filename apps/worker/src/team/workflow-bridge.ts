@@ -506,6 +506,12 @@ export async function investigateWithTeam(input: {
             ];
           });
         } catch (error) {
+          if (error instanceof Error && error.name === "TimeoutError" && !signal.aborted)
+            throw new DevflowError({
+              code: "TIMEOUT",
+              message: "Read-only team observation exceeded its host execution deadline.",
+              details: { operationId: op.id, action, observationComplete: false },
+            });
           if (
             error instanceof DevflowError &&
             ["VALIDATION_ERROR", "INSUFFICIENT_EVIDENCE"].includes(error.code)

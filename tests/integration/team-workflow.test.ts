@@ -22,7 +22,7 @@ const files = {
 describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
   "production Worker team planning",
   () => {
-    it.each(["READ", "SEARCH"])(
+    it.each(["READ", "SEARCH", "SEARCH_TIMEOUT"])(
       "routes independent %s evidence into the existing Planner and PLAN approval without write authority",
       async (action) => {
         const database = PrismaDatabaseAdapter.fromConnectionString(process.env.TEST_DATABASE_URL!);
@@ -76,6 +76,10 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                 const view = JSON.parse(
                   request.messages.find((m) => m.role === "USER")!.content as string,
                 ) as TeamDecisionView;
+                if (action === "SEARCH_TIMEOUT" && view.role === "INVESTIGATOR")
+                  database.repositoryIndexes.get = async () => {
+                    throw new DOMException("read-only search deadline", "TimeoutError");
+                  };
                 const actions =
                   view.role === "COORDINATOR"
                     ? view.board.length
@@ -106,7 +110,7 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                         ]
                     : !view.history.length
                       ? [
-                          action === "SEARCH"
+                          action.startsWith("SEARCH")
                             ? { type: "SEARCH", query: view.assignments[0]!.goal }
                             : {
                                 type: "READ",
@@ -191,6 +195,13 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             environment,
             () => model,
           ).execute(run!, AbortSignal.timeout(30000));
+          if (action === "SEARCH_TIMEOUT") {
+            expect(outcome).toMatchObject({ status: "FAILED", error: { code: "TIMEOUT" } });
+            const saved = (await database.teams.load(run!.id))!;
+            expect(saved.operations.some((op) => op.failure?.code === "TIMEOUT")).toBe(true);
+            expect(requests.some((r) => r.output?.name === "plan_proposal")).toBe(false);
+            return;
+          }
           expect(
             outcome,
             JSON.stringify({

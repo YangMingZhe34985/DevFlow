@@ -193,6 +193,53 @@ function sandbox() {
 }
 
 describe("Resource Budget Scheduler execution boundary", () => {
+  it("coalesces immutable scoped index reads without charging cached IO or sharing mutable results", async () => {
+    const { runtime, scheduler } = await fixture();
+    const get = vi.fn(async (scope: string) => ({ scope, facts: ["verified"] }));
+    const store = { get, publish: async () => {} };
+    const indexed = runtime.indexStore(store);
+    const [a, b] = await Promise.all([indexed.get("a", "key"), indexed.get("a", "key")]);
+    (a as { facts: string[] }).facts.push("forged");
+    expect(b).toEqual({ scope: "a", facts: ["verified"] });
+    expect(await indexed.get("a", "key")).toEqual(b);
+    expect(await indexed.get("b", "key")).toEqual({ scope: "b", facts: ["verified"] });
+    expect(get).toHaveBeenCalledTimes(2);
+    expect((await scheduler.snapshot()).consumed.ioReads).toBe(2);
+    expect((await scheduler.snapshot()).consumed.logicalToolCalls).toBe(0);
+    // New immutable identity and a restored Runtime require real reads again.
+    await indexed.get("a", "new-sha");
+    await new ResourceBudgetRuntime(scheduler, async () => {}).indexStore(store).get("a", "key");
+    expect(get).toHaveBeenCalledTimes(4);
+  });
+
+  it("does not cache misses, failures or an unconfirmed winning publication", async () => {
+    const { runtime } = await fixture();
+    let value: unknown;
+    const get = vi.fn(async () => value);
+    const indexed = runtime.indexStore({
+      get,
+      publish: async () => {
+        value = { winner: "other-builder" };
+      },
+    });
+    expect(await indexed.get("scope", "key")).toBeUndefined();
+    await indexed.publish("scope", "key", { winner: "proposed" });
+    expect(await indexed.get("scope", "key")).toEqual({ winner: "other-builder" });
+    get.mockRejectedValueOnce(new Error("read failed"));
+    await expect(indexed.get("scope", "unread")).rejects.toThrow("read failed");
+    expect(await indexed.get("scope", "unread")).toEqual(value);
+    expect(get).toHaveBeenCalledTimes(4);
+  });
+
+  it("evicts immutable index entries at the bounded cache capacity", async () => {
+    const { runtime } = await fixture();
+    const get = vi.fn(async () => "x".repeat(1024 * 1024));
+    const indexed = runtime.indexStore({ get, publish: async () => {} });
+    for (let i = 0; i < 17; i++) await indexed.get("scope", String(i));
+    await indexed.get("scope", "0");
+    expect(get).toHaveBeenCalledTimes(18);
+  });
+
   it("prices pre-evidence continuation quotes without consuming the reservation", async () => {
     const { runtime, scheduler } = await fixture({ costMicros: 100_000 });
     runtime.model(new FakeLanguageModel([]), {

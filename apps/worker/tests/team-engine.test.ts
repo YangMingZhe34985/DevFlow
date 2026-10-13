@@ -27,6 +27,43 @@ const observation = (path: string): TeamEvidence => ({
 });
 
 describe("dynamic collaboration core", () => {
+  it("preserves a host observation timeout as unknown tool work, not invalid model output or permission", async () => {
+    const store = new InMemoryTeamStore();
+    const engine = new TeamEngine({
+      store,
+      lease,
+      signal: AbortSignal.timeout(5000),
+      decide: async () => result([{ type: "SEARCH", query: "public failure implementation" }]),
+      observe: async () => {
+        throw new DevflowError({
+          code: "TIMEOUT",
+          message: "readonly search deadline",
+          details: { observationComplete: false },
+        });
+      },
+    });
+    await engine.initialize({
+      runId: "run",
+      repositoryId: "repo",
+      sourceIdentity: "base",
+      mode: "single",
+    });
+    await expect(engine.run("run", task, 8)).rejects.toMatchObject({ code: "TIMEOUT" });
+    const state = (await store.load("run"))!;
+    expect(state.operations.find((o) => o.kind === "TOOL")).toMatchObject({
+      status: "UNKNOWN",
+      failure: { code: "TIMEOUT" },
+    });
+    await expect(
+      engine.initialize({
+        runId: "run",
+        repositoryId: "repo",
+        sourceIdentity: "base",
+        mode: "single",
+      }),
+    ).rejects.toThrow("TEAM_OPERATION_OUTCOME_UNKNOWN");
+  });
+
   it("reopens a changed Coding view without reviving old evidence or renewing decisions", async () => {
     const store = new InMemoryTeamStore();
     let count = 0;

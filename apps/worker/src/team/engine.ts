@@ -528,6 +528,11 @@ export class TeamEngine {
             (error.details as { requestIssued?: boolean } | undefined)?.requestIssued === false;
           op.status = notIssued ? "NOT_ISSUED" : "UNKNOWN";
           op.error = String(error);
+          op.failure = {
+            code: error instanceof DevflowError ? error.code : "HOST_ERROR",
+            message: error instanceof Error ? error.message : String(error),
+            ...(error instanceof DevflowError && error.details ? { details: error.details } : {}),
+          };
           if (notIssued) {
             s.status = "STOPPED";
             s.stopReason = "BUDGET_STOP";

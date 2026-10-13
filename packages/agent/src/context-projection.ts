@@ -3,6 +3,7 @@ import { inputHash, preparedInput, serializeModelRequest } from "./model-budget.
 import { projectCodingSessionHistory } from "./coding-session.js";
 import { invalidateHistoricalReads } from "./working-set.js";
 import type { ModelMessage, ModelRequest } from "./model.js";
+import { sourceRangeReferences, type ContextSourceRange } from "./context-source.js";
 
 type JsonBlock = { start: number; end: number; value: unknown };
 const identity = (value: unknown) => inputHash(JSON.stringify(value));
@@ -54,6 +55,18 @@ export interface ContextProjectionArtifact {
   records: { id: string; tier: "P0" | "P1" | "P2"; viewIndex: number | null }[];
   evidence: { version: "repair-evidence-v1"; sections: Record<string, string> };
   evidenceSha256: string;
+  sourceReferences?: {
+    record: string;
+    pointer: string;
+    ownerRecord: string;
+    ownerPointer: string;
+    path: string;
+    fileSha256: string;
+    startLine: number;
+    endLine: number;
+    trailingLineBreak: string;
+  }[];
+  semanticCompression?: { status: string; requestIssued: boolean };
 }
 
 /** Immutable history/evidence stays outside request selection; this store never authorizes edits. */
@@ -135,8 +148,46 @@ export async function optimizeContextProjection(input: {
     };
   });
   const canonical = new Map<string, { index: number; pointer: string; record: string }>();
+  const sources: (ContextSourceRange & { index: number; pointer: string })[] = [];
+  const gatherSources = (value: unknown, index: number, pointer: string) => {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const v = value as Record<string, unknown>;
+      if (
+        typeof v.path === "string" &&
+        typeof v.fileSha256 === "string" &&
+        typeof v.content === "string" &&
+        typeof v.startLine === "number" &&
+        typeof v.endLine === "number" &&
+        v.stale !== true
+      )
+        sources.push({
+          id: `${index}:${pointer}/content`,
+          index,
+          pointer: `${pointer}/content`,
+          path: v.path,
+          fileSha256: v.fileSha256,
+          content: v.content,
+          startLine: v.startLine,
+          endLine: v.endLine,
+        });
+    }
+    for (const [key, child] of children(value))
+      gatherSources(child, index, `${pointer}/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`);
+  };
+  for (const row of rows) {
+    row.blocks.forEach((b, i) => gatherSources(b.value, row.index, `json:${i}`));
+    if (row.message.role === "TOOL" && !row.message.isError)
+      gatherSources(row.message.content, row.index, "content");
+  }
+  const rangeRefs = sourceRangeReferences(sources);
+  const sourceReferences: NonNullable<ContextProjectionArtifact["sourceReferences"]> = [];
+  const rangeOwners = new Set([...rangeRefs.values()].map((r) => Number(r.id.split(":")[0])));
   const collect = (value: unknown, index: number, pointer: string) => {
-    if (bytes(value) >= 512) {
+    const address = `${index}:${pointer}`;
+    const replacedBelow = [...rangeRefs.keys()].some(
+      (key) => key === address || key.startsWith(`${address}/`),
+    );
+    if (bytes(value) >= 512 && !replacedBelow) {
       store.atom(value);
       canonical.set(identity(value), { index, pointer, record: rows[index]!.id });
     }
@@ -151,6 +202,7 @@ export async function optimizeContextProjection(input: {
   }
   const references: ContextProjectionArtifact["references"] = [];
   const canonicalRecords = new Set<string>();
+  for (const index of rangeOwners) canonicalRecords.add(rows[index]!.id);
   const plain = new Map<string, { index: number; record: string; text: string }>();
   for (const row of rows) {
     if (
@@ -185,9 +237,37 @@ export async function optimizeContextProjection(input: {
       })
       .join("\n\n");
   const intern = (value: unknown, index: number, pointer: string): unknown => {
+    const rangeOwner = rangeRefs.get(`${index}:${pointer}`);
+    if (rangeOwner) {
+      const owner = sources.find((r) => r.id === rangeOwner.id)!;
+      const original = sources.find((r) => r.id === `${index}:${pointer}`)!;
+      const reference = {
+        record: rows[index]!.id,
+        pointer,
+        ownerRecord: rows[owner.index]!.id,
+        ownerPointer: owner.pointer,
+        path: original.path,
+        fileSha256: original.fileSha256,
+        startLine: original.startLine,
+        endLine: original.endLine,
+        trailingLineBreak: original.content.endsWith("\r\n")
+          ? "\r\n"
+          : original.content.endsWith("\n")
+            ? "\n"
+            : "",
+      };
+      sourceReferences.push(reference);
+      store.atom(value);
+      return { $sourceRangeRef: reference };
+    }
     const digest = identity(value),
       owner = canonical.get(digest);
-    if (bytes(value) >= 512 && owner && (owner.index !== index || owner.pointer !== pointer)) {
+    if (
+      !rangeOwners.has(index) &&
+      bytes(value) >= 512 &&
+      owner &&
+      (owner.index !== index || owner.pointer !== pointer)
+    ) {
       canonicalRecords.add(owner.record);
       references.push({ sha256: digest, record: owner.record, pointer: owner.pointer });
       return { $contextRef: { sha256: digest, record: owner.record, pointer: owner.pointer } };
@@ -227,6 +307,16 @@ export async function optimizeContextProjection(input: {
   });
   const retained = new Set(rows.map((row) => row.index));
   const omitted: ContextProjectionArtifact["omitted"] = [];
+  const hostRecords = new Set<string>();
+  for (const row of [...rows].reverse()) {
+    if (!["SYSTEM", "USER"].includes(row.message.role)) continue;
+    const key = identity(row.message);
+    if (hostRecords.has(key) && !canonicalRecords.has(row.id)) {
+      retained.delete(row.index);
+      omitted.push({ record: row.id, reason: "EXACT_DUPLICATE_HOST_RECORD" });
+    }
+    hostRecords.add(key);
+  }
   const evidence = { version: "repair-evidence-v1" as const, sections: store.sections };
   const evidenceSha256 = inputHash(JSON.stringify(evidence));
   const render = () => {
@@ -238,17 +328,44 @@ export async function optimizeContextProjection(input: {
         viewIndex: kept.findIndex((other) => other.index === row.index),
       }));
     const messages: ModelMessage[] = kept.map((row) => view[row.index]!);
-    if (references.length || omitted.length)
+    if (references.length || sourceReferences.length || omitted.length)
       messages.push({
         role: "SYSTEM",
         content:
-          "HOST_CONTEXT_REFERENCES: $contextRef replaces only an exactly identical complete JSON value retained in a listed visible record. Resolve its JSON pointer; no source bytes were shortened. Omitted history is recoverable as read-only data via readEvidenceArtifact, not write authority.\n" +
+          "HOST_CONTEXT_REFERENCES: $contextRef replaces an identical value; $sourceRangeRef identifies verbatim lines in a same-path/full-SHA visible owner record. Resolve the pointer/range; neither grants write authority. Omitted history is recoverable as read-only data via readEvidenceArtifact.\n" +
           JSON.stringify({ evidenceSha256, canonicalRecords: lookup, omitted }),
       });
     return { ...requestBase, messages };
   };
   const measure = async (request: ModelRequest) => {
-    const prepared = input.prepare ? await input.prepare(request) : request;
+    let prepared: ModelRequest;
+    try {
+      prepared = input.prepare ? await input.prepare(request) : request;
+    } catch (error) {
+      // A measured oversized candidate is selectable, not a failed dispatch. Other provider errors propagate.
+      const details =
+        error instanceof DevflowError
+          ? (error.details as Record<string, unknown> | undefined)
+          : undefined;
+      if (
+        !(error instanceof DevflowError) ||
+        error.code !== "VALIDATION_ERROR" ||
+        details?.requestIssued !== false ||
+        typeof details.requiredBytes !== "number" ||
+        typeof details.maxBytes !== "number" ||
+        details.requiredBytes <= details.maxBytes
+      )
+        throw error;
+      const serialized = serializeModelRequest(request);
+      return {
+        request,
+        bytes: details.requiredBytes,
+        tokens: Math.ceil(details.requiredBytes / 3),
+        fingerprint: inputHash(serialized),
+        wireBytes: details.requiredBytes,
+        prepared: false,
+      };
+    }
     const projection = preparedInput(prepared);
     const serializedBytes =
       projection?.serializedBytes ?? Buffer.byteLength(serializeModelRequest(prepared));
@@ -258,6 +375,7 @@ export async function optimizeContextProjection(input: {
       tokens: projection?.estimatedInputTokens ?? Math.ceil(serializedBytes / 3),
       fingerprint: projection?.fingerprint ?? inputHash(serializeModelRequest(prepared)),
       wireBytes: projection?.wireBytes ?? serializedBytes,
+      prepared: true,
     };
   };
   const before = await measure(requestBase);
@@ -280,6 +398,7 @@ export async function optimizeContextProjection(input: {
     });
   let current = await measure(render());
   const fits = () =>
+    current.prepared &&
     current.bytes <= input.maxBytes &&
     current.tokens <= (input.maxInputTokens ?? Number.MAX_SAFE_INTEGER);
   // Old successful stale source pairs can leave the view only as complete interactions.
@@ -401,6 +520,7 @@ export async function optimizeContextProjection(input: {
     })),
     evidence,
     evidenceSha256,
+    sourceReferences,
   };
   if (!fits()) {
     await input.onCapacityFailure?.(artifact);

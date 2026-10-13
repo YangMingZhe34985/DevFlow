@@ -1,4 +1,5 @@
 import { DevflowError, type TeamSnapshot } from "@devflow/shared";
+import { teamWorkingMemory } from "./working-memory.js";
 
 /** A view of the same solver's durable history, not a second solver or a new resource budget. */
 export function solverSessionView(snapshot: TeamSnapshot | null | undefined) {
@@ -17,6 +18,7 @@ export function solverSessionView(snapshot: TeamSnapshot | null | undefined) {
     historyReference: { artifact: "team-history-v1.json", revision: snapshot.revision },
     decisions: agent.history.slice(-4).map((h) => h.output),
     omittedDecisions: Math.max(0, agent.history.length - 4),
+    workingMemory: teamWorkingMemory(agent.history, snapshot.sourceIdentity),
     evidenceReferences: snapshot.selectedEvidenceIds,
     missing: snapshot.missing,
     notice:

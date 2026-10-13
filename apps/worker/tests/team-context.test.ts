@@ -137,3 +137,72 @@ it("blocks when mandatory evidence cannot fit and does not treat configuration e
     ),
   ).rejects.toThrow("bad model setting");
 });
+
+it("projects overlapping evidence through a visible owner and preserves each legal ID and source SHA", async () => {
+  const input = view();
+  input.counterevidence = [];
+  const lines = Array.from({ length: 70 }, (_, i) => `value_${i} = "source observation ${i}"`);
+  const base = input.evidence[0]!;
+  input.evidence = [
+    {
+      ...base,
+      id: "full",
+      path: "logic.py",
+      startLine: 1,
+      endLine: 70,
+      content: lines.join("\n"),
+      contentSha256: teamDigest(lines.join("\n")),
+    },
+    {
+      ...base,
+      id: "part",
+      path: "logic.py",
+      startLine: 10,
+      endLine: 60,
+      content: lines.slice(9, 60).join("\n"),
+      contentSha256: teamDigest(lines.slice(9, 60).join("\n")),
+    },
+  ];
+  const result = await projectTeamRequest(
+    input,
+    {
+      generate: async () => {
+        throw Error("not issued");
+      },
+    },
+    AbortSignal.timeout(1000),
+    { bytes: 14000, tokens: 12000, outputTokens: 1000 },
+  );
+  const payload = JSON.parse(
+    result.request.messages.find((m) => m.role === "USER")!.content as string,
+  );
+  expect(payload.evidence.find((e: { id: string }) => e.id === "part").contentRef).toMatchObject({
+    evidenceId: "full",
+    fileSha256: base.fileSha256,
+    trailingLineBreak: "",
+  });
+  expect(payload.evidence.find((e: { id: string }) => e.id === "full").content).toBe(
+    lines.join("\n"),
+  );
+  expect(result.shown.map((e) => e.id).sort()).toEqual(["full", "part"]);
+  expect(input.evidence[1]!.content).toBe(lines.slice(9, 60).join("\n"));
+});
+
+it("fails before dispatch if a mandatory reference only exists in a stale source view", async () => {
+  const input = view();
+  input.evidence.find((e) => e.id === "counterexample")!.sourceIdentity = "old";
+  await expect(
+    projectTeamRequest(
+      input,
+      {
+        generate: async () => {
+          throw Error("not issued");
+        },
+      },
+      AbortSignal.timeout(1000),
+      { bytes: 96000, tokens: 32000, outputTokens: 8192 },
+    ),
+  ).rejects.toMatchObject({
+    details: { requestIssued: false, missingRequiredEvidenceIds: ["counterexample"] },
+  });
+});

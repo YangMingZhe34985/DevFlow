@@ -35,6 +35,10 @@ const MAX_ENVIRONMENT_ENTRIES = 64;
 const MAX_ENVIRONMENT_VALUE_BYTES = 32_768;
 const MAX_ENVIRONMENT_BYTES = 131_072;
 const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/u;
+// GNU timeout bounds the container child; this separately bounds a stalled Docker
+// transport or ownership query. A timed-out transport leaves an unsafe segment.
+const OWNERSHIP_CHECK_TIMEOUT_MS = 5_000;
+const COMMAND_TRANSPORT_DRAIN_MS = 2_000;
 
 export interface DockerSandboxManagerOptions {
   image: string;
@@ -381,7 +385,13 @@ class DockerSandboxSession implements SandboxSession {
 
   async exec(command: CommandSpec, signal?: AbortSignal): Promise<CommandResult> {
     this.assertActive();
-    await this.assertOwnership?.();
+    const operationId = randomUUID();
+    await this.boundedOperation(
+      operationId,
+      "OWNERSHIP_BEFORE",
+      OWNERSHIP_CHECK_TIMEOUT_MS,
+      () => this.assertOwnership?.() ?? Promise.resolve(),
+    );
     this.assertActive();
     if (signal?.aborted) throw this.cancelled();
     const parsed = CommandSpecSchema.safeParse(command);
@@ -419,17 +429,24 @@ class DockerSandboxSession implements SandboxSession {
 
     let result: DockerCommandResult;
     try {
-      result = await this.runner.run(args, {
-        // A child operation's deadline does not own the container. Drain the
-        // bounded command instead of detaching its Docker CLI and destroying
-        // the session. Only the execution segment can interrupt this wait.
-        ...(this.ownerSignal === undefined ? {} : { signal: this.ownerSignal }),
-        ...(parsed.data.stdin === undefined ? {} : { stdin: parsed.data.stdin }),
-        maxOutputBytes: parsed.data.maxOutputBytes ?? DEFAULT_COMMAND_OUTPUT_BYTES,
-      });
+      result = await this.boundedOperation(
+        operationId,
+        "COMMAND",
+        timeoutMs + COMMAND_TRANSPORT_DRAIN_MS,
+        (transportSignal) =>
+          this.runner.run(args, {
+            // A child operation's deadline does not own the container. Drain the
+            // bounded command instead of detaching its Docker CLI and destroying
+            // the session. Only the execution segment can interrupt this wait.
+            signal: transportSignal,
+            ...(parsed.data.stdin === undefined ? {} : { stdin: parsed.data.stdin }),
+            maxOutputBytes: parsed.data.maxOutputBytes ?? DEFAULT_COMMAND_OUTPUT_BYTES,
+          }),
+      );
     } catch (error) {
       this.unsafe = true;
       if (this.ownerSignal?.aborted) throw this.cancelled();
+      if (error instanceof DevflowError && error.code === "SANDBOX_RESOURCE_LIMIT") throw error;
       throw new DevflowError({
         code: "SANDBOX_PROCESS_FAILED",
         message: "Docker could not execute the sandbox command.",
@@ -449,7 +466,12 @@ class DockerSandboxSession implements SandboxSession {
       });
     }
     this.assertActive();
-    await this.assertOwnership?.();
+    await this.boundedOperation(
+      operationId,
+      "OWNERSHIP_AFTER",
+      OWNERSHIP_CHECK_TIMEOUT_MS,
+      () => this.assertOwnership?.() ?? Promise.resolve(),
+    );
     this.assertActive();
     if (signal?.aborted) throw this.cancelled();
     return {
@@ -460,6 +482,71 @@ class DockerSandboxSession implements SandboxSession {
       timedOut,
       outputTruncated: result.outputTruncated,
     };
+  }
+
+  private async boundedOperation<T>(
+    operationId: string,
+    phase: "OWNERSHIP_BEFORE" | "COMMAND" | "OWNERSHIP_AFTER",
+    timeoutMs: number,
+    execute: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const startedAt = Date.now();
+    const timeout = new AbortController();
+    const signal = this.ownerSignal
+      ? AbortSignal.any([this.ownerSignal, timeout.signal])
+      : timeout.signal;
+    let rejectAbort: () => void = () => undefined;
+    const aborted = new Promise<never>((_resolve, reject) => {
+      rejectAbort = () =>
+        reject(
+          this.ownerSignal?.aborted
+            ? this.cancelled()
+            : new DevflowError({
+                code: phase === "COMMAND" ? "SANDBOX_RESOURCE_LIMIT" : "SANDBOX_LOST_OWNERSHIP",
+                message:
+                  phase === "COMMAND"
+                    ? "Sandbox transport exceeded its bounded command deadline; execution outcome is unknown."
+                    : "Sandbox ownership could not be verified within its deadline.",
+                details: { ...this.identity, operationId, phase, timeoutMs, outcome: "UNKNOWN" },
+              }),
+        );
+      signal.addEventListener("abort", rejectAbort, { once: true });
+      if (signal.aborted) rejectAbort();
+    });
+    const timer = setTimeout(() => timeout.abort(), timeoutMs);
+    this.observeLifecycle?.({
+      ...this.identity,
+      operationId,
+      phase,
+      state: "OPERATION_STARTED",
+      timeoutMs,
+    });
+    try {
+      signal.throwIfAborted();
+      const value = await Promise.race([execute(signal), aborted]);
+      this.observeLifecycle?.({
+        ...this.identity,
+        operationId,
+        phase,
+        state: "OPERATION_COMPLETED",
+        durationMs: Date.now() - startedAt,
+      });
+      return value;
+    } catch (error) {
+      if (signal.aborted) this.unsafe = true;
+      this.observeLifecycle?.({
+        ...this.identity,
+        operationId,
+        phase,
+        state: "OPERATION_FAILED",
+        durationMs: Date.now() - startedAt,
+        errorCode: error instanceof DevflowError ? error.code : "UNKNOWN",
+      });
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", rejectAbort);
+    }
   }
 
   async listFiles(input: ListFilesRequest, signal?: AbortSignal): Promise<ListFilesResult> {

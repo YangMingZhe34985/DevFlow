@@ -195,7 +195,9 @@ export const AgentStateSchema = z.object({
       submissionOnly: z.boolean().optional(),
       correctionTool: z.string().optional(),
       correctionInput: z.string().optional(),
-      correctionReason: z.enum(["FORMAT_INVALID", "OUTPUT_LENGTH", "PROTOCOL_INVALID"]).optional(),
+      correctionReason: z
+        .enum(["FORMAT_INVALID", "CONTEXT_MISMATCH", "OUTPUT_LENGTH", "PROTOCOL_INVALID"])
+        .optional(),
     })
     .optional(),
   lastError: DevflowErrorShapeSchema.optional(),
@@ -217,7 +219,7 @@ export interface AgentState {
     authorizationHandoffUsed?: boolean;
     evidenceRefreshUsed?: boolean;
     submissionOnly?: boolean;
-    correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
+    correctionReason?: "FORMAT_INVALID" | "CONTEXT_MISMATCH" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
     correctionTool?: string;
     correctionInput?: string;
   };

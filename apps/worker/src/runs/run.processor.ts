@@ -15,7 +15,18 @@ import type { RunExecutionPort } from "./run-execution.js";
 export interface RunProcessorOptions {
   observeTiming?: (
     runId: string,
-    timing: { queueWaitMs: number; executionWallMs: number; exitReason: string },
+    timing: {
+      queueWaitMs: number;
+      executionWallMs: number;
+      exitReason: string;
+      lease?: {
+        renewals: number;
+        failedChecks: number;
+        maxCheckMs: number;
+        deadlineReached: boolean;
+        dispatchRevision: number;
+      };
+    },
   ) => Promise<void>;
   workerId: string;
   leaseMs: number;
@@ -53,17 +64,62 @@ export class RunProcessor {
         ? cancellation.signal
         : AbortSignal.any([workerSignal, cancellation.signal]);
     let checking = false;
+    let active = true;
+    const lease = {
+      renewals: 0,
+      failedChecks: 0,
+      maxCheckMs: 0,
+      deadlineReached: false,
+      dispatchRevision: run.dispatchRevision,
+    };
+    let leaseTimer: ReturnType<typeof setTimeout>;
+    const armLeaseDeadline = (deadline: number) => {
+      clearTimeout(leaseTimer);
+      leaseTimer = setTimeout(
+        () => {
+          lease.deadlineReached = true;
+          cancellation.abort(
+            new DevflowError({
+              code: "SANDBOX_LOST_OWNERSHIP",
+              message: "Run lease expired without a confirmed renewal.",
+              details: { dispatchRevision: run.dispatchRevision, leaseDeadlineAt: deadline },
+            }),
+          );
+        },
+        Math.max(0, deadline - Date.now()),
+      );
+    };
+    armLeaseDeadline(
+      run.leaseExpiresAt ? Date.parse(run.leaseExpiresAt) : Date.now() + this.options.leaseMs,
+    );
     const timer = setInterval(() => {
       if (checking || cancellation.signal.aborted) return;
       checking = true;
-      void this.maintainLease(run.id, owner, cancellation).finally(() => {
-        checking = false;
-      });
+      const started = Date.now();
+      void this.maintainLease(run.id, owner, cancellation)
+        .then((renewed) => {
+          lease.maxCheckMs = Math.max(lease.maxCheckMs, Date.now() - started);
+          if (renewed) {
+            lease.renewals++;
+            // The server renewal began no earlier than this check. Using its start
+            // is conservative if DB latency consumes part of the renewed lease.
+            if (active && !cancellation.signal.aborted)
+              armLeaseDeadline(started + this.options.leaseMs);
+          } else lease.failedChecks++;
+        })
+        .finally(() => {
+          checking = false;
+        });
     }, this.options.cancellationPollMs);
 
     try {
       if (await this.runs.isCancellationRequested(run.id)) cancellation.abort();
       const result = await this.executor.execute(run, signal);
+      if (
+        cancellation.signal.reason instanceof DevflowError &&
+        cancellation.signal.reason.code === "SANDBOX_LOST_OWNERSHIP"
+      )
+        throw cancellation.signal.reason;
       exitReason = result.status;
       if (result.status === "WAITING_APPROVAL") {
         if (result.approvalKind === "GITHUB") {
@@ -108,6 +164,7 @@ export class RunProcessor {
         message: "Worker execution failed.",
         retryable: true,
       });
+      exitReason = normalized.code;
       const attempts = job.opts.attempts ?? 1;
       const hasRetry = normalized.retryable && job.attemptsMade + 1 < attempts;
       if (hasRetry) {
@@ -120,12 +177,15 @@ export class RunProcessor {
       const persisted = await this.runs.complete(run.id, owner, result);
       return { outcome: "COMPLETED", status: persisted.status };
     } finally {
+      active = false;
+      clearTimeout(leaseTimer!);
       clearInterval(timer);
       try {
         await this.options.observeTiming?.(run.id, {
           queueWaitMs: Math.max(0, executionStarted - (job.timestamp ?? executionStarted)),
           executionWallMs: Date.now() - executionStarted,
           exitReason,
+          lease,
         });
       } catch (error) {
         // Observability must not retry a Run already atomically completed or paused.
@@ -141,11 +201,11 @@ export class RunProcessor {
     runId: string,
     owner: string,
     cancellation: AbortController,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       if (await this.runs.isCancellationRequested(runId)) {
         cancellation.abort();
-        return;
+        return false;
       }
       if (!(await this.runs.renewLease(runId, owner, this.options.leaseMs))) {
         cancellation.abort(
@@ -154,7 +214,9 @@ export class RunProcessor {
             message: "Run lease ownership was lost.",
           }),
         );
+        return false;
       }
+      return true;
     } catch {
       cancellation.abort(
         new DevflowError({
@@ -162,6 +224,7 @@ export class RunProcessor {
           message: "Run lease could not be verified.",
         }),
       );
+      return false;
     }
   }
 }

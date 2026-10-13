@@ -1768,25 +1768,58 @@ export class DefaultAgentRuntime implements AgentRuntime {
           });
         }
 
+        const contextCorrection = normalCalls.some(({ call, result }) => {
+          if (call.name !== "applyPatch") return false;
+          const failure = objectValue(
+            result.ok
+              ? objectValue(result.output)?.patchFailure
+              : objectValue(result.error.details)?.patchFailure,
+          );
+          const mutation = result.mutation;
+          return (
+            failure?.kind === "CONTEXT_MISMATCH" &&
+            failure.needsRead === false &&
+            failure.contextEvidenceComplete === true &&
+            Array.isArray(failure.currentSource) &&
+            failure.currentSource.length > 0 &&
+            mutation?.observationComplete === true &&
+            !mutation.workspaceChanged &&
+            !mutation.mutationApplied &&
+            mutation.beforeRevision === mutation.afterRevision &&
+            failure.currentSource.every((raw) => {
+              const source = objectValue(raw);
+              return (
+                source &&
+                typeof source.path === "string" &&
+                typeof source.content === "string" &&
+                source.rangeComplete === true &&
+                typeof source.fileSha256 === "string" &&
+                source.fileSha256 === mutation.currentHashes[source.path]
+              );
+            })
+          );
+        });
         if (
           !execution.editCorrectionUsed &&
           !execution.editCorrectionPending &&
-          normalCalls.some(({ call, result }) => {
-            if (call.name !== "applyPatch") return false;
-            const failure = objectValue(
-              result.ok
-                ? objectValue(result.output)?.patchFailure
-                : objectValue(result.error.details)?.patchFailure,
-            );
-            return failure?.kind === "FORMAT_INVALID" && failure.needsRead === false;
-          })
+          (contextCorrection ||
+            normalCalls.some(({ call, result }) => {
+              if (call.name !== "applyPatch") return false;
+              const failure = objectValue(
+                result.ok
+                  ? objectValue(result.output)?.patchFailure
+                  : objectValue(result.error.details)?.patchFailure,
+              );
+              return failure?.kind === "FORMAT_INVALID" && failure.needsRead === false;
+            }))
         ) {
           execution.editCorrectionPending = true;
-          execution.correctionReason = "FORMAT_INVALID";
+          execution.correctionReason = contextCorrection ? "CONTEXT_MISMATCH" : "FORMAT_INVALID";
           messages.push({
             role: "USER",
-            content:
-              "One bounded edit correction is available. The patch format was invalid and source is unchanged. Use the exact current evidence to correct the edit, preferably replaceText, then finishPhase. Do not reread or search. Hard budgets still apply.",
+            content: contextCorrection
+              ? "One shared bounded edit correction is available. Patch context did not match the verified unchanged source. The tool error includes complete current hunk neighborhoods and full file SHA from existing host verification. Use these exact lines for replaceText or a corrected patch, then finishPhase. Do not reread or search; no additional correction or budget is granted. Missing evidence must be reported as insufficient."
+              : "One bounded edit correction is available. The patch format was invalid and source is unchanged. Use the exact current evidence to correct the edit, preferably replaceText, then finishPhase. Do not reread or search. Hard budgets still apply.",
           });
         }
         let newEvidence = false;
@@ -2074,7 +2107,7 @@ interface ToolExecutionMetadata {
 
 interface RuntimeExecutionState {
   checkpointAdmission?: () => Promise<void>;
-  correctionReason?: "FORMAT_INVALID" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
+  correctionReason?: "FORMAT_INVALID" | "CONTEXT_MISMATCH" | "OUTPUT_LENGTH" | "PROTOCOL_INVALID";
   correctionTool?: string;
   correctionInput?: string;
   editCorrectionPending: boolean;

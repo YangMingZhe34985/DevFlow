@@ -607,13 +607,18 @@ class PrismaRunStore implements RunRepository {
   }
 
   async renewLease(runId: string, owner: string, leaseMs: number): Promise<boolean> {
-    return await databaseCall(async () => {
-      const changed = await this.client.run.updateMany({
-        where: { id: runId, status: "RUNNING", executionOwner: owner },
-        data: { leaseExpiresAt: new Date(Date.now() + leaseMs) },
-      });
-      return changed.count === 1;
-    });
+    return await databaseCall(async () =>
+      this.client.$transaction(async (transaction) => {
+        // Evaluate expiry at the database, after any row-lock wait. An expired
+        // worker must claim a new execution identity; it cannot revive itself.
+        if (!(await lockLiveRunOwner(transaction, runId, owner))) return false;
+        const changed = await transaction.$executeRaw`
+        UPDATE "Run" SET "leaseExpiresAt" = clock_timestamp() + (${leaseMs} * interval '1 millisecond')
+        WHERE "id" = ${runId} AND "status" = 'RUNNING' AND "executionOwner" = ${owner}
+          AND "leaseExpiresAt" > clock_timestamp()`;
+        return changed === 1;
+      }),
+    );
   }
 
   async isCancellationRequested(runId: string): Promise<boolean> {
@@ -637,6 +642,7 @@ class PrismaRunStore implements RunRepository {
               message: "Run result ID does not match the claimed run.",
             });
           }
+          await assertLiveRunOwner(transaction, runId, owner);
           const current = await transaction.run.findFirst({
             where: { id: runId, status: "RUNNING", executionOwner: owner },
           });
@@ -706,6 +712,7 @@ class PrismaRunStore implements RunRepository {
     return await databaseCall(
       async () =>
         await this.client.$transaction(async (transaction) => {
+          await assertLiveRunOwner(transaction, runId, owner);
           const changed = await transaction.run.updateMany({
             where: {
               id: runId,
@@ -760,6 +767,7 @@ class PrismaRunStore implements RunRepository {
     return await databaseCall(
       async () =>
         await this.client.$transaction(async (transaction) => {
+          await assertLiveRunOwner(transaction, runId, owner);
           const changed = await transaction.run.updateMany({
             where: {
               id: runId,
@@ -2379,6 +2387,31 @@ function errorShape(error: unknown): DevflowErrorShape {
 
 function notFound(entity: string, id: string): DevflowError {
   return new DevflowError({ code: "NOT_FOUND", message: entity + " '" + id + "' was not found." });
+}
+
+async function assertLiveRunOwner(
+  transaction: TransactionClient,
+  runId: string,
+  owner: string,
+): Promise<void> {
+  if (!(await lockLiveRunOwner(transaction, runId, owner)))
+    throw conflict("Run execution lease is expired or no longer owned.");
+}
+
+async function lockLiveRunOwner(
+  transaction: TransactionClient,
+  runId: string,
+  owner: string,
+): Promise<boolean> {
+  // SELECT/UPDATE predicates can be evaluated before waiting for a row lock.
+  // Acquire the owner row first, then check the database clock in a new statement.
+  const locked = await transaction.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Run" WHERE "id" = ${runId} AND "status" = 'RUNNING'
+      AND "executionOwner" = ${owner} FOR UPDATE`;
+  if (locked.length !== 1) return false;
+  const live = await transaction.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Run" WHERE "id" = ${runId} AND "leaseExpiresAt" > clock_timestamp()`;
+  return live.length === 1;
 }
 
 function conflict(message: string): DevflowError {

@@ -1,4 +1,6 @@
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { DevflowError } from "@devflow/shared";
+import type { SandboxSession } from "@devflow/sandbox";
 import { EfficiencyTrace, unionMs } from "../src/runs/efficiency-trace.js";
 
 it("unions overlapping spans rather than adding concurrent latency", () => {
@@ -44,4 +46,39 @@ it("records failed model calls without fabricated token usage or content", async
   ).rejects.toThrow();
   expect(trace.rows[0]?.inputTokens).toBeNull();
   expect(JSON.stringify(trace.report())).not.toContain("secret-source");
+});
+
+it("attributes failed source IO duration without inventing received bytes or leaking paths", async () => {
+  vi.useFakeTimers();
+  try {
+    const trace = new EfficiencyTrace();
+    const error = new DevflowError({
+      code: "SANDBOX_RESOURCE_LIMIT",
+      message: "private path and source",
+    });
+    const session = {
+      readFile: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        throw error;
+      },
+    } as unknown as SandboxSession;
+    const operation = trace.sandbox(session).readFile({ path: "secret/source.ts" });
+    const rejected = expect(operation).rejects.toBe(error);
+    await vi.advanceTimersByTimeAsync(500);
+    await rejected;
+    expect(trace.rows).toEqual([
+      expect.objectContaining({
+        stage: "SOURCE_READ",
+        wallMs: 500,
+        ok: false,
+        errorCode: "SANDBOX_RESOURCE_LIMIT",
+        sourceBytes: null,
+      }),
+    ]);
+    expect(trace.report().stages[0]?.sourceBytes).toBe(0);
+    expect(JSON.stringify(trace.report())).not.toContain("secret/source.ts");
+    expect(JSON.stringify(trace.report())).not.toContain("private path");
+  } finally {
+    vi.useRealTimers();
+  }
 });

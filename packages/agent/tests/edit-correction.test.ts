@@ -5,8 +5,10 @@ import {
   DefaultAgentRuntime,
   FakeLanguageModel,
   fakeModelResponse,
+  InMemoryAgentStateStore,
   type RunContext,
 } from "../src/index.js";
+import type { ToolExecutionResult } from "@devflow/tools";
 
 const response = (name: string) =>
   fakeModelResponse({
@@ -60,6 +62,150 @@ const lease = {
       ? { action: "EXTEND" as const, additionalSteps: 2 }
       : { action: "STOP" as const, reason: "NO_PROGRESS" as const },
 };
+function contextFailure(): ToolExecutionResult {
+  return {
+    ok: false,
+    durationMs: 0,
+    mutation: {
+      status: "REJECTED",
+      executionSucceeded: false,
+      mutationAttempted: true,
+      mutationApplied: false,
+      workspaceChanged: false,
+      observationComplete: true,
+      changedFiles: [],
+      affectedPaths: ["a.ts"],
+      currentHashes: { "a.ts": "a".repeat(64) },
+      beforeRevision: 2,
+      afterRevision: 2,
+      reason: "Context mismatch",
+    },
+    error: {
+      code: "TOOL_FAILED",
+      message: "Patch context mismatch",
+      retryable: false,
+      details: {
+        patchFailure: {
+          kind: "CONTEXT_MISMATCH",
+          needsRead: false,
+          contextEvidenceComplete: true,
+          currentSource: [
+            {
+              path: "a.ts",
+              fileSha256: "a".repeat(64),
+              startLine: 58,
+              endLine: 79,
+              content: "if (flat) {\n  filterExisting(*flat);\n}\n",
+              rangeComplete: true,
+            },
+          ],
+        },
+      },
+    },
+  };
+}
+it("uses the existing correction after an unchanged context mismatch even when closing refresh is exhausted", async () => {
+  const f = fixture(),
+    stateStore = new InMemoryAgentStateStore();
+  f.context.stateStore = stateStore;
+  const original = f.context.executeTool;
+  f.context.executeTool = async (...args) =>
+    args[1].name === "applyPatch" ? contextFailure() : original(...args);
+  const model = new FakeLanguageModel([
+    response("applyPatch"),
+    async (r) => {
+      expect(r.tools.map((t) => t.name)).not.toContain("readFile");
+      expect(JSON.stringify(r.messages)).toContain("filterExisting(*flat)");
+      expect(JSON.stringify(r.messages)).toContain("current hunk neighborhoods");
+      return fakeModelResponse({
+        toolCalls: [...response("replaceText").toolCalls, ...response("finishPhase").toolCalls],
+      });
+    },
+  ]);
+  const result = await new DefaultAgentRuntime(model).run(
+    {
+      maxSteps: 3,
+      timeoutMs: 1000,
+      maxRetries: 0,
+      adaptiveStepBudget: lease,
+      executionRecovery: {
+        pending: false,
+        used: false,
+        explorationClosed: true,
+        evidenceRefreshUsed: true,
+      },
+    },
+    f.context,
+  );
+  expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+  expect(model.requests).toHaveLength(2);
+  expect((await stateStore.load(f.context.runId))!.executionRecovery).toMatchObject({
+    used: true,
+    evidenceRefreshUsed: true,
+    correctionReason: "CONTEXT_MISMATCH",
+  });
+});
+for (const invalid of ["stale", "incomplete", "changed", "used"] as const)
+  it(`does not grant context correction for ${invalid} evidence or credit`, async () => {
+    const f = fixture(),
+      failed = contextFailure();
+    if (invalid === "stale") failed.mutation!.currentHashes["a.ts"] = "b".repeat(64);
+    if (invalid === "incomplete") failed.mutation!.observationComplete = false;
+    if (invalid === "changed") failed.mutation!.workspaceChanged = true;
+    f.context.executeTool = async () => failed;
+    const model = new FakeLanguageModel([response("applyPatch"), response("replaceText")]);
+    const result = await new DefaultAgentRuntime(model).run(
+      {
+        maxSteps: 3,
+        timeoutMs: 1000,
+        maxRetries: 0,
+        adaptiveStepBudget: lease,
+        executionRecovery: {
+          pending: false,
+          used: invalid === "used",
+          explorationClosed: true,
+          evidenceRefreshUsed: true,
+        },
+      },
+      f.context,
+    );
+    expect(result.status).not.toBe("SUCCEEDED");
+    expect(model.requests).toHaveLength(1);
+  });
+it("never grants a second credit for repeated context mismatch and does not buy an unaffordable correction", async () => {
+  for (const constrained of [false, true]) {
+    const f = fixture();
+    f.context.executeTool = async () => contextFailure();
+    const model = new FakeLanguageModel([
+      response("applyPatch"),
+      response("applyPatch"),
+      response("applyPatch"),
+    ]);
+    const result = await new DefaultAgentRuntime(model).run(
+      {
+        maxSteps: 3,
+        timeoutMs: 1000,
+        maxRetries: 0,
+        adaptiveStepBudget: lease,
+        ...(constrained
+          ? {
+              modelSettings: { maxOutputTokens: 8192 },
+              executionBudget: {
+                stage: "EXECUTE" as const,
+                maxModelCalls: 3,
+                maxToolCalls: 5,
+                maxTotalTokens: 1000,
+              },
+            }
+          : {}),
+      },
+      f.context,
+    );
+    expect(model.requests).toHaveLength(constrained ? 1 : 2);
+    expect(result.status).not.toBe("SUCCEEDED");
+    if (constrained) expect(result.error?.details).toMatchObject({ requestIssued: false });
+  }
+});
 it("reserves downstream time without turning the request estimate into a hidden model deadline", async () => {
   const f = fixture();
   const model = new FakeLanguageModel([

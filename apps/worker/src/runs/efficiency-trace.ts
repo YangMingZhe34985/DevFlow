@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { DevflowError } from "@devflow/shared";
 import type { LanguageModelPort, ModelRequest } from "@devflow/agent";
 import { z } from "zod";
 import type { EvidencePack } from "../localization/contracts.js";
@@ -30,13 +31,26 @@ export class EfficiencyTrace {
       dispose: () => session.dispose(),
       readFile: async (request, signal) => {
         const startedAt = Date.now();
-        const result = await session.readFile(request, signal);
-        this.span("SOURCE_READ", startedAt, {
-          pathFingerprint: fingerprint(request.path),
-          sourceBytes: Buffer.byteLength(result.content),
-          truncated: result.truncated,
-        });
-        return result;
+        try {
+          const result = await session.readFile(request, signal);
+          this.span("SOURCE_READ", startedAt, {
+            pathFingerprint: fingerprint(request.path),
+            sourceBytes: Buffer.byteLength(result.content),
+            truncated: result.truncated,
+            ok: true,
+          });
+          return result;
+        } catch (error) {
+          // A timeout may consume nearly all the interval without returning bytes.
+          // Record its duration, never infer transferred content from the IO quote.
+          this.span("SOURCE_READ", startedAt, {
+            pathFingerprint: fingerprint(request.path),
+            sourceBytes: null,
+            ok: false,
+            errorCode: error instanceof DevflowError ? error.code : "UNKNOWN",
+          });
+          throw error;
+        }
       },
     };
   }

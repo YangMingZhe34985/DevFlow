@@ -1,4 +1,5 @@
 import { ContinuationTools } from "./continuation-tools.js";
+import { attachPatchFailureEvidence } from "./patch-failure-evidence.js";
 import { databaseExecutionLease } from "@devflow/database";
 import { investigateWithTeam } from "../team/workflow-bridge.js";
 import { solverSessionView } from "../team/solver-session.js";
@@ -5805,6 +5806,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
               output: asJson(query),
             };
           }
+          const currentTargets = new Map<string, { content: string; expectedHash: string }>();
           const execute = async (): Promise<ToolExecutionResult> => {
             const args = recordValue(request.input);
             const denial =
@@ -5816,7 +5818,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 durationMs: 0,
                 error: new DevflowError({ code: "APPROVAL_REQUIRED", message: denial }).toJSON(),
               };
-            const currentTargets = new Map<string, { content: string; expectedHash: string }>();
             const patchGuard: Record<string, string | null> = {};
             const patchPaths =
               workingSet && request.name === "applyPatch" && typeof args.patch === "string"
@@ -6100,7 +6101,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             }
             return result;
           };
-          const result = mutationObserver
+          const observedResult = mutationObserver
             ? await observePostPatchTool({
                 controller: mutationObserver,
                 request,
@@ -6109,6 +6110,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                 execute,
               })
             : await execute();
+          const result = attachPatchFailureEvidence(request, observedResult, currentTargets);
           input.onToolObservation?.(request.name, result);
           exploration?.observe(request.name, result);
           if (relationGraph && exploration && result.ok && request.name === "readFile") {
@@ -6815,16 +6817,42 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
   ): Promise<RunResult> {
     if (prepared === undefined) return result;
     const evaluationStarted = Date.now();
-    await evaluateBenchmarkInSandbox(
-      this.database,
-      prepared,
-      sandbox,
-      result,
-      { testPassed, repairAttempts, reviewRetries },
-      signal,
-    );
-    this.traces.getStore()?.span("HIDDEN_EVALUATOR", evaluationStarted);
-    return result;
+    try {
+      await evaluateBenchmarkInSandbox(
+        this.database,
+        prepared,
+        sandbox,
+        result,
+        { testPassed, repairAttempts, reviewRetries },
+        signal,
+      );
+      return result;
+    } catch (error) {
+      // Failed Coding is already a primary outcome. Diagnostic/integrity cleanup
+      // must remain fail-closed without replacing that cause with a later fault.
+      if (result.status !== "FAILED" || !result.error) throw error;
+      const evaluationError = toDevflowError(error, {
+        code: "TOOL_FAILED",
+        message: "Independent benchmark evaluation did not complete.",
+      });
+      return {
+        ...result,
+        error: {
+          ...result.error,
+          details: asJson({
+            ...recordValue(result.error.details),
+            primaryFailureDetails: result.error.details ?? null,
+            benchmarkEvaluation: {
+              status: "INCOMPLETE",
+              independentlyVerified: false,
+              error: evaluationError.toJSON(),
+            },
+          }),
+        },
+      };
+    } finally {
+      this.traces.getStore()?.span("HIDDEN_EVALUATOR", evaluationStarted);
+    }
   }
 
   private createModel(

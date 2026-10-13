@@ -355,9 +355,9 @@ export async function investigateWithTeam(input: {
               outputTokens: binding.settings.maxOutputTokens ?? 8192,
               steps: 1,
               modelCalls: 1,
-            // The elastic deadline is fitted atomically by model admission below.
-            // Reusing an earlier remaining-time sample here would already be stale
-            // after projection/DB IO, spuriously denying every shortened request.
+              // The elastic deadline is fitted atomically by model admission below.
+              // Reusing an earlier remaining-time sample here would already be stale
+              // after projection/DB IO, spuriously denying every shortened request.
             },
           },
           () => allPrices[`${binding.provenance.provider}:${binding.provenance.model}`],

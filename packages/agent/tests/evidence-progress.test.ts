@@ -1,5 +1,25 @@
 import { expect, it } from "vitest";
 import { EvidenceProgress } from "../src/evidence-progress.js";
+it("counts a public diagnostic identity once, not duration changes or cached observations", () => {
+  const progress = new EvidenceProgress();
+  const observation = {
+    authority: "OBSERVATION_ONLY",
+    status: "COMPLETED",
+    id: "diagnostic-a",
+    sourceIdentity: "source-a",
+    profileSha256: "profile-a",
+    result: { exitCode: 1, durationMs: 100 },
+  };
+  expect(progress.observe(observation, 0)).toBe(true);
+  expect(progress.observe({ ...observation, result: { exitCode: 1, durationMs: 200 } }, 0)).toBe(
+    false,
+  );
+  expect(progress.observe({ ...observation, id: "new", cached: true }, 0)).toBe(false);
+  expect(new EvidenceProgress(progress.snapshot()).observe(observation, 0)).toBe(false);
+  expect(
+    progress.observe({ ...observation, id: "diagnostic-b", sourceIdentity: "source-b" }, 1),
+  ).toBe(true);
+});
 it("remembers union coverage; narrower rereads and query metadata are not progress", () => {
   const p = new EvidenceProgress();
   const read = (startLine: number, endLine: number) => ({

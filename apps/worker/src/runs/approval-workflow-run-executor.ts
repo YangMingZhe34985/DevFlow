@@ -1,4 +1,12 @@
 import { ContinuationTools } from "./continuation-tools.js";
+import {
+  AgentDiagnostics,
+  DiagnosticRequestSchema,
+  diagnosticContinuationPlan,
+  diagnosticOperationPlan,
+  executeDiagnosticBudget,
+  type DiagnosticRecord,
+} from "./agent-diagnostics.js";
 import { attachPatchFailureEvidence } from "./patch-failure-evidence.js";
 import { databaseExecutionLease } from "@devflow/database";
 import { investigateWithTeam } from "../team/workflow-bridge.js";
@@ -9,7 +17,11 @@ import {
   validateInvestigationResume,
   type LocalizationInvestigationState,
 } from "../localization/investigation-state.js";
-import { ResourceBudgetScheduler, estimateOperationPlan, type ResourceBudgetLedger } from "./resource-budget-scheduler.js";
+import {
+  ResourceBudgetScheduler,
+  estimateOperationPlan,
+  type ResourceBudgetLedger,
+} from "./resource-budget-scheduler.js";
 import {
   ResourceBudgetRuntime,
   resourceBudgetContext,
@@ -155,6 +167,7 @@ import {
   DockerSandboxManager,
   NodeDockerCommandRunner,
   ReadonlyProbeRunner,
+  PublicDiagnosticRunner,
   resolveLocalFilesystemPath,
   type CommandResult,
   type SandboxSession,
@@ -1513,16 +1526,22 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             }),
           }).toJSON();
         };
-      const continuationReserve = (operation: CodingBudgetOperation = "CODING", feedback?: {
-        source: unknown; diagnostics: unknown;
-      }) => {
-        const source = feedback?.source ?? JSON.stringify(
-          [...continuation.current.values()].map((f) => ({
-            path: f.path,
-            sha256: f.contentHash,
-            content: f.content.slice(0, 3000),
-          })),
-        ).slice(0, 16000);
+      const continuationReserve = (
+        operation: CodingBudgetOperation = "CODING",
+        feedback?: {
+          source: unknown;
+          diagnostics: unknown;
+        },
+      ) => {
+        const source =
+          feedback?.source ??
+          JSON.stringify(
+            [...continuation.current.values()].map((f) => ({
+              path: f.path,
+              sha256: f.contentHash,
+              content: f.content.slice(0, 3000),
+            })),
+          ).slice(0, 16000);
         const reserve = codingContinuationReserve({
           title: run.task.title,
           description: run.task.description,
@@ -1573,36 +1592,52 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           ...(replanBranch ? { replanning: replanBranch.required } : {}),
         });
         const prices = this.environment.DEVFLOW_MODEL_PRICES_JSON
-          ? JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<string, ModelResourcePrice>
+          ? (JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<
+              string,
+              ModelResourcePrice
+            >)
           : {};
-        const pricedPlan = priceModelOperationPlan(codingContinuationOperationPlan({
-          finalModels: reserve.operationPlan,
-          validationAndFinalize: {
-            logicalToolCalls: frontier.sharedFinal.tools,
-            timeMs: 300_000 + reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
+        const pricedPlan = priceModelOperationPlan(
+          codingContinuationOperationPlan({
+            finalModels: reserve.operationPlan,
+            validationAndFinalize: {
+              logicalToolCalls: frontier.sharedFinal.tools,
+              timeMs:
+                300_000 +
+                reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
+            },
+            ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
+            submitCurrent: operation === "SUBMIT_CURRENT",
+          }),
+          (id) => {
+            const stage = id.startsWith("review:")
+              ? "REVIEW"
+              : id.startsWith("planner:")
+                ? "PLANNER"
+                : "EXECUTE";
+            // Injected transports use the same explicit identity as bindStageModel.
+            // They must not resolve unrelated live credentials merely to quote a path.
+            if (stage === "REVIEW" ? this.reviewerFactory : this.modelFactory)
+              return prices["injected:injected"];
+            const actualStage =
+              run.executionMode === "single" && stage !== "REVIEW" ? "EXECUTE" : stage;
+            const override = this.environment.stageModels?.[actualStage];
+            const provider =
+              override?.provider ?? run.modelProvider ?? this.environment.LLM_PROVIDER;
+            const model = override?.model ?? run.modelName ?? this.environment.LLM_MODEL;
+            // A missing future binding remains UNPRICED; actual dispatch still validates
+            // its full configuration. Quotation never requires or reads its credential.
+            return provider && model ? prices[`${provider}:${model}`] : undefined;
           },
-          ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
-          submitCurrent: operation === "SUBMIT_CURRENT",
-        }), (id) => {
-          const stage = id.startsWith("review:") ? "REVIEW" : id.startsWith("planner:") ? "PLANNER" : "EXECUTE";
-          // Injected transports use the same explicit identity as bindStageModel.
-          // They must not resolve unrelated live credentials merely to quote a path.
-          if (stage === "REVIEW" ? this.reviewerFactory : this.modelFactory)
-            return prices["injected:injected"];
-          const actualStage = run.executionMode === "single" && stage !== "REVIEW" ? "EXECUTE" : stage;
-          const override = this.environment.stageModels?.[actualStage];
-          const provider = override?.provider ?? run.modelProvider ?? this.environment.LLM_PROVIDER;
-          const model = override?.model ?? run.modelName ?? this.environment.LLM_MODEL;
-          // A missing future binding remains UNPRICED; actual dispatch still validates
-          // its full configuration. Quotation never requires or reads its credential.
-          return provider && model ? prices[`${provider}:${model}`] : undefined;
-        });
+        );
         const pricedEstimate = estimateOperationPlan(pricedPlan);
         return {
           ...frontier.required,
           costMicros: pricedEstimate.resources.costMicros,
           modelCalls: pricedEstimate.resources.modelCalls,
-          costStatus: pricedEstimate.unpricedOperationIds.length ? "UNPRICED" as const : "PRICED" as const,
+          costStatus: pricedEstimate.unpricedOperationIds.length
+            ? ("UNPRICED" as const)
+            : ("PRICED" as const),
           audit: {
             ...frontier,
             pricedOperationPlan: pricedPlan,
@@ -1723,6 +1758,263 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         { version: "repair-evidence-v1"; sections: Record<string, string> }
       >();
       let localizationCalls = 0;
+      const diagnosticProfile = testCommandCache.profile;
+      const quoteDiagnosticContinuation = async (future: string) => {
+        if (!codingSession.state)
+          throw new DevflowError({
+            code: "CONFLICT",
+            message: "Diagnostic requires the persisted Coding view.",
+          });
+        const reserve = continuationReserve("CODING");
+        const binding = this.modelBindings.get(implementationModel);
+        const settings = binding?.settings ?? {
+          maxOutputTokens: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+        };
+        const prices = this.environment.DEVFLOW_MODEL_PRICES_JSON
+          ? (JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<
+              string,
+              ModelResourcePrice
+            >)
+          : {};
+        const price =
+          prices[
+            `${binding?.provenance.provider ?? "injected"}:${binding?.provenance.model ?? "injected"}`
+          ];
+        return diagnosticContinuationPlan({
+          id: future,
+          request: {
+            messages: codingSession.state.messages,
+            tools: toolsForCoding(tools),
+            settings,
+          },
+          contextTokens: this.environment.stageModels?.EXECUTE?.contextTokens ?? 32000,
+          outputTokens: settings.maxOutputTokens ?? 8192,
+          continuation: reserve.audit.pricedOperationPlan,
+          logicalToolCapacity: continuationToolCapacity("CODING", true),
+          ...(price ? { price } : {}),
+          ...(implementationModel.prepareRequest
+            ? {
+                prepare: (request) =>
+                  implementationModel.prepareRequest!(request, { signal: executionSignal }),
+              }
+            : {}),
+        });
+      };
+      const diagnostics =
+        run.teamConfiguration?.diagnosticsEnabled && diagnosticProfile
+          ? new AgentDiagnostics({
+              runId: run.id,
+              enabled: true,
+              profile: diagnosticProfile,
+              load: async () => {
+                const latest = new Map<string, DiagnosticRecord>();
+                for (const artifact of await this.database.artifacts.list(run.id)) {
+                  if (artifact.name !== "agent-diagnostic-v1.json" || !artifact.content) continue;
+                  const record = JSON.parse(artifact.content) as DiagnosticRecord;
+                  latest.set(record.id, record);
+                }
+                return [...latest.values()];
+              },
+              save: async (record) => {
+                await this.database.artifacts.create({
+                  runId: run.id,
+                  kind: "OTHER",
+                  name: "agent-diagnostic-v1.json",
+                  mimeType: "application/json",
+                  content: JSON.stringify(record),
+                  metadata: { visibility: "HOST_ONLY" },
+                });
+                // Known pre-dispatch cancellation does not strand an admitted but unused
+                // lifetime. INFLIGHT/UNKNOWN never enters this release path.
+                if (record.status === "NOT_ISSUED") {
+                  const host = resourceBudgetContext.getStore();
+                  if (host) {
+                    const saved = (await host.scheduler.snapshot()).reservations;
+                    const lifetime = `diagnostic:${record.id}:lifetime`;
+                    const future = `diagnostic:${record.id}:continuation`;
+                    if (saved[lifetime]?.status === "ADMITTED")
+                      await host.scheduler.settle(lifetime, {});
+                    else if (saved[lifetime]?.status === "RESERVED")
+                      await host.scheduler.release(lifetime, "Diagnostic was not issued");
+                    if (saved[future]?.status === "RESERVED")
+                      await host.scheduler.release(future, "Diagnostic was not issued");
+                  }
+                }
+              },
+              identity: async () => {
+                const host = resourceBudgetContext.getStore();
+                if (!host)
+                  throw new DevflowError({
+                    code: "CONFLICT",
+                    message: "Diagnostic requires the Run Scheduler.",
+                  });
+                await host.flush();
+                const future = `diagnostic:identity-continuation:${codingSession.state?.stepCount ?? "unknown"}`;
+                const projected = await quoteDiagnosticContinuation(future);
+                const held = await host.scheduler.replaceHold(future, projected.plan);
+                if (!held.reserved)
+                  throw new DevflowError({
+                    code: "EXECUTION_BUDGET_EXCEEDED",
+                    message: "Diagnostic source preparation cannot preserve required continuation.",
+                    details: asJson({ requestIssued: false, quote: held.quote }),
+                  });
+                // Wrapped Git/source operations are individually admitted against this
+                // hold, so optional identity preparation cannot consume final validation.
+                try {
+                  const status = await git.status(probeCaptureSandbox, executionSignal);
+                  const diff = await git.diff(
+                    probeCaptureSandbox,
+                    { maxBytes: 1_000_000 },
+                    executionSignal,
+                  );
+                  if (diff.truncated)
+                    throw new DevflowError({
+                      code: "INSUFFICIENT_EVIDENCE",
+                      message: "Diagnostic requires complete candidate identity.",
+                    });
+                  const untracked = status.files.filter(
+                    (f) => f.indexStatus === "?" || f.workTreeStatus === "?",
+                  );
+                  if (untracked.length > 8)
+                    throw new DevflowError({
+                      code: "INSUFFICIENT_EVIDENCE",
+                      message: "Diagnostic source identity exceeds bounded untracked-file capture.",
+                    });
+                  const hashes = [];
+                  for (const file of untracked) {
+                    const source = await probeCaptureSandbox.readFile(
+                      { path: file.path, maxBytes: 512 * 1024 },
+                      executionSignal,
+                    );
+                    if (!source.fileSha256) throw new Error("Diagnostic source SHA unavailable");
+                    hashes.push([file.path, source.fileSha256]);
+                  }
+                  // A command or restored container may change dependency/runtime state
+                  // without changing tracked source. Do not reuse that observation.
+                  return contentHash(
+                    JSON.stringify({
+                      head: status.headSha,
+                      diff: diff.patch,
+                      hashes,
+                      containerId: activeSandbox.id,
+                      revision: localizationView.revision(),
+                    }),
+                  );
+                } finally {
+                  await host.scheduler.release(
+                    future,
+                    "Identity preparation ended; transfer continuation to diagnostic lifetime",
+                  );
+                }
+              },
+              admit: async (record) => {
+                const host = resourceBudgetContext.getStore();
+                if (!host)
+                  throw new DevflowError({
+                    code: "CONFLICT",
+                    message: "Diagnostic requires the Run Scheduler.",
+                  });
+                await host.flush();
+                const future = `diagnostic:${record.id}:continuation`;
+                const lifetime = `diagnostic:${record.id}:lifetime`;
+                const projected = await quoteDiagnosticContinuation(future);
+                await this.database.events.append({
+                  runId: run.id,
+                  type: "WORKFLOW_CHECKPOINT",
+                  occurredAt: new Date().toISOString(),
+                  payload: asJson({
+                    diagnosticBudget: { id: record.id, requestIssued: false, ...projected.audit },
+                  }),
+                });
+                const held = await host.scheduler.replaceHold(future, projected.plan);
+                if (!held.reserved)
+                  throw new DevflowError({
+                    code: "EXECUTION_BUDGET_EXCEEDED",
+                    message:
+                      "Diagnostic cannot preserve the next Coding decision and mandatory continuation.",
+                    details: asJson({ requestIssued: false, quote: held.quote }),
+                  });
+                const reserved = await host.scheduler.reserve(
+                  lifetime,
+                  diagnosticOperationPlan(lifetime),
+                );
+                if (!reserved.reserved)
+                  throw new DevflowError({
+                    code: "EXECUTION_BUDGET_EXCEEDED",
+                    message:
+                      "Diagnostic lifetime cannot be admitted with its cleanup and continuation.",
+                    details: asJson({ requestIssued: false, quote: reserved.quote }),
+                  });
+                const admitted = await host.scheduler.admit(lifetime);
+                if (!admitted.admitted)
+                  throw new DevflowError({
+                    code: "EXECUTION_BUDGET_EXCEEDED",
+                    message: "Diagnostic lifetime admission expired before dispatch.",
+                    details: asJson({ requestIssued: false, admission: admitted }),
+                  });
+              },
+              execute: async (check, toolSignal, record) => {
+                const host = resourceBudgetContext.getStore()!;
+                try {
+                  return await executeDiagnosticBudget({
+                    scheduler: host.scheduler,
+                    operationId: `diagnostic:${record.id}:lifetime`,
+                    record: async (event) => {
+                      if (event.status !== "INFLIGHT")
+                        this.traces
+                          .getStore()
+                          ?.span("DIAGNOSTIC_DOCKER", Date.now() - Number(event.elapsedMs ?? 0), {
+                            ...event,
+                            accountingAuthority: "RUN_BUDGET_LEDGER",
+                            accountingUnit: "DOCKER_EXECUTION",
+                          });
+                      await this.database.events.append({
+                        runId: run.id,
+                        type: "WORKFLOW_CHECKPOINT",
+                        occurredAt: new Date().toISOString(),
+                        payload: asJson({ diagnosticExecution: event }),
+                      });
+                    },
+                    run: (execute) =>
+                      new PublicDiagnosticRunner(new NodeDockerCommandRunner()).run({
+                        containerId: activeSandbox.id,
+                        runId: run.id,
+                        command: check.command,
+                        ...(record.resources ? { resources: record.resources } : {}),
+                        signal: toolSignal,
+                        assertOwnership: async () => {
+                          toolSignal.throwIfAborted();
+                          if (!run.executionOwner)
+                            throw new DevflowError({
+                              code: "PERMISSION_DENIED",
+                              message: "Leased diagnostic execution required.",
+                            });
+                          const current = await this.database.runs.findById(run.id);
+                          if (
+                            !current ||
+                            current.status !== "RUNNING" ||
+                            current.executionOwner !== run.executionOwner ||
+                            current.dispatchRevision !== run.dispatchRevision ||
+                            !current.leaseExpiresAt ||
+                            Date.parse(current.leaseExpiresAt) <= Date.now()
+                          )
+                            throw new DevflowError({
+                              code: "SANDBOX_LOST_OWNERSHIP",
+                              message: "Diagnostic source owner expired.",
+                            });
+                        },
+                        execute,
+                      }),
+                  });
+                } finally {
+                  await host.scheduler.release(
+                    `diagnostic:${record.id}:continuation`,
+                    "Diagnostic ended; next Coding decision re-quotes its actual observation",
+                  );
+                }
+              },
+            })
+          : undefined;
       const { executor, tools } = createTools(
         git,
         benchmark?.configuration.tools,
@@ -1806,6 +2098,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           return readRepairEvidence(input, evidence);
         },
         run.executionMode === "team" ? 180_000 : undefined,
+        diagnostics,
       );
       const implementationModel = this.createModel(run, benchmark?.configuration.modelParameters);
       const codingArtifacts = await this.database.artifacts.list(run.id);
@@ -7071,12 +7364,26 @@ export function createTools(
     signal: AbortSignal,
   ) => Promise<unknown>,
   localizationTimeoutMs?: number,
+  diagnostics?: AgentDiagnostics,
 ): {
   executor: DefaultToolExecutor;
   tools: readonly ModelToolDescriptor[];
 } {
   const registry = new ToolRegistry();
   registerCoreTools(registry, git);
+  if (diagnostics)
+    registry.register({
+      name: "runDiagnostic",
+      description: `Optionally run one host-approved public check in an isolated snapshot (30 seconds, 512 MiB scratch). At most two attempts per Run; no model-provided commands. Output is an observation, never Final Validation or Review. Available checks: ${JSON.stringify(diagnostics.checks())}`,
+      inputSchema: DiagnosticRequestSchema,
+      outputSchema: z.unknown(),
+      permission: "EXECUTE",
+      timeoutMs: 55_000,
+      readOnly: true,
+      parallelSafe: false,
+      mutatesWorkspace: false,
+      execute: (value, context) => diagnostics.run(value, context.signal),
+    });
   if (recoverEvidence)
     registry.register({
       name: "readEvidenceArtifact",

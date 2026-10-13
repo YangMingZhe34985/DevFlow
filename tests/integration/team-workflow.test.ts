@@ -248,11 +248,15 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           };
           expect(ledger.consumed.modelCalls).toBe(requests.length);
           expect(ledger.reservations["team:shared-downstream"]?.status).toBe("RELEASED");
-          const investigatorDecision = state.operations.find((op) => op.kind === "MODEL" && op.agentId !== state.coordinatorId)!;
+          const investigatorDecision = state.operations.find(
+            (op) => op.kind === "MODEL" && op.agentId !== state.coordinatorId,
+          )!;
           expect(ledger.reservations[investigatorDecision.id]?.quote.resources.timeMs).toBeLessThan(
             180000,
           );
-          expect(ledger.reservations[investigatorDecision.id]?.executionDeadlineAt).toBeTypeOf("number");
+          expect(ledger.reservations[investigatorDecision.id]?.executionDeadlineAt).toBeTypeOf(
+            "number",
+          );
           const durable = (await database.budgetLedgers.get(run!.id))!.value as {
             reservations: Record<string, { quote: { dispatchGroup?: string } }>;
             violations: unknown[];
@@ -274,6 +278,7 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           await database.disconnect();
         }
       },
+      60_000,
     );
   },
 );

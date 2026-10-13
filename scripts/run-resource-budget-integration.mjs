@@ -59,10 +59,13 @@ try {
     [
       path.resolve("node_modules/vitest/vitest.mjs"),
       "run",
+      "--maxWorkers=2",
       "tests/integration/resource-budget-postgres.test.ts",
       "tests/integration/team-postgres.test.ts",
       "tests/integration/team-workflow.test.ts",
       "tests/integration/team-coding.test.ts",
+      "tests/integration/run-ownership-postgres.test.ts",
+      "tests/integration/public-diagnostic-docker.test.ts",
     ],
     env,
   );

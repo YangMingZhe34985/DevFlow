@@ -57,4 +57,11 @@ The host derives the Localization lease from current serialized task/evidence, c
 
 The Coding session consumes the original workflow limits across all iterations. It retains final validation and independent Review capacity, and checks the alternative scope-replan branch before optional exploration. Reservations are capacity projections, not token consumption; provider usage is charged once. A new approval transfers the remaining budget to the resumed session without resetting steps, tools, tokens, deadline or correction credits. See [the unified Coding workflow and acceptance record](unified-coding-loop-20261008.md).
 
+Continuation prices retain each role's actual input/output split and model rate. They do not
+multiply all future tokens by the most expensive output rate. Team investigations share one
+reservation for the currently projectable Coordinator closing decision; actual evidence growth
+is checked again. Planner output recovery retains its tokens and request count within the same
+absolute Planner phase deadline. See [the stability update](stability-autonomy-architecture-20261013.md)
+for quote provenance, unknown-price refusal and optional diagnostic accounting.
+
 Localization 的纯说明字段不设细碎字符门槛；整份序列化输出最大字节为配置输出 token 的八倍（大小保护，非精确 token 换算），实际计费与 token 额度仍采用提供方使用记录。配置输出上限保持原值。格式修复处理 JSON/结构错误，完整长说明无需额外无损转换；LENGTH 回复即使可解析也不能作为完整决策。

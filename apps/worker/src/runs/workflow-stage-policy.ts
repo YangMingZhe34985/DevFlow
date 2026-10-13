@@ -15,6 +15,7 @@ const COMMON_PROMPT = [
 
 const IMPLEMENTATION_TOOLS = new Set([
   "locateIssue",
+  "runDiagnostic",
   "listFiles",
   "readFile",
   "batchReadFiles",
@@ -94,7 +95,7 @@ export function toolsForCoding(
 }
 
 export function codingSystemPrompt(purpose: AgentPhasePurpose): string {
-  return `${COMMON_PROMPT} You are the single Coding Agent for this task. Observe, edit, submit a candidate for public validation, analyze the host's failure feedback, and revise in the same session. Your original task and approved behavioral requirements remain active after every edit and test. Check remaining requirements, but do not edit a file merely because it is approved. Use finishPhase to yield the current candidate to the workflow; put it after edits in the same response when ready. Workflow always performs Final Validation and Independent Review; a failed check returns to this session while resources remain. A successful submission requires no extra confirmation call. Never invent test results, repeat an unchanged failed candidate, or ignore unfinishedWork. When blocked by scope, cite the current public failure and candidate implementation using SCOPE_CONFLICT; only a new PLAN approval authorizes expanded writes. Current feedback reason: ${purpose}.`;
+  return `${COMMON_PROMPT} You are the single Coding Agent for this task. Observe, edit, submit a candidate for public validation, analyze the host's failure feedback, and revise in the same session. Your original task and approved behavioral requirements remain active after every edit and test. Check remaining requirements, but do not edit a file merely because it is approved. Choose your next action from evidence: continue a precise edit, use locateIssue for a focused read-only investigation when available, or request an optional runDiagnostic using only its host-listed checkId. Diagnostics run in a disposable copy, provide observations only, and never replace the complete final profile or Review. A failed diagnostic can motivate a read, a local edit or a justified scope request; it grants no new write permission or budget. These actions are optional, not a required sequence. Use finishPhase to yield the current candidate to the workflow; put it after edits in the same response when ready. Workflow always performs Final Validation and Independent Review; a failed check returns to this session while resources remain. A successful submission requires no extra confirmation call. Never invent test results, repeat an unchanged failed candidate, or ignore unfinishedWork. When blocked by scope, cite the current public failure and candidate implementation using SCOPE_CONFLICT; only a new PLAN approval authorizes expanded writes. Current feedback reason: ${purpose}.`;
 }
 
 /**

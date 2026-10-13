@@ -143,8 +143,8 @@ export class PostPatchController {
     if (this.ready) return name === "finishPhase";
     return (
       (this.diagnosticReadOnly &&
-        ["queryRelations", "searchCode", "readEvidence"].includes(name)) ||
-      ["finishPhase", "readFile", "batchReadFiles", "gitDiff"].includes(name) ||
+        ["queryRelations", "searchCode", "readEvidence", "locateIssue"].includes(name)) ||
+      ["finishPhase", "readFile", "batchReadFiles", "gitDiff", "runDiagnostic"].includes(name) ||
       (this.failures.size > 0 && ["writeFile", "replaceText", "applyPatch"].includes(name)) ||
       (!this.ready && ["writeFile", "replaceText", "applyPatch"].includes(name))
     );

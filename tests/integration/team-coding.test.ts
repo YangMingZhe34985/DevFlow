@@ -59,6 +59,13 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           const created = await database.runs.create({
             taskId: task.id,
             executionMode: mode,
+            teamConfiguration: {
+              concurrency: 2,
+              maxInvestigators: 4,
+              maxTasks: 12,
+              maxMessages: 64,
+              diagnosticsEnabled: mode === "team",
+            },
             maxSteps: 32,
             maxTestRetries: 2,
             maxReviewRetries: 1,
@@ -160,7 +167,20 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                 ],
               });
             // Team returned the same approved source: another identical read is not progress.
-            const n = codingTurns;
+            if (mode === "team" && codingTurns === 2) {
+              expect(request.tools.some((t) => t.name === "runDiagnostic")).toBe(true);
+              return fakeModelResponse({
+                toolCalls: [
+                  call("runDiagnostic", {
+                    checkId: "0:test",
+                    reason: "Public arithmetic failure can distinguish implementation hypotheses",
+                  }),
+                ],
+              });
+            }
+            if (mode === "team" && codingTurns === 3)
+              expect(JSON.stringify(request.messages)).toContain("OBSERVATION_ONLY");
+            const n = codingTurns - (mode === "team" && codingTurns > 2 ? 1 : 0);
             if (mode === "single" && n === 1)
               expect(JSON.stringify(request.messages)).toContain("existing solver session");
             if (n === 1 || n === 3)
@@ -221,6 +241,17 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             env,
             () => model,
             () => reviewer,
+            undefined,
+            () => ({
+              version: 1,
+              checks: [
+                {
+                  kind: "test",
+                  source: "package.json#scripts.test",
+                  command: { program: "npm", args: ["test"], cwd: ".", environment: {} },
+                },
+              ],
+            }),
           );
           const planned = await worker.execute(run, signal);
           expect(planned.status, JSON.stringify(planned)).toBe("WAITING_APPROVAL");
@@ -248,6 +279,14 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             }),
           ).toBe("SUCCEEDED");
           expect(reviewCalls).toBe(1);
+          if (mode === "team") {
+            const diagnostic = (await database.artifacts.list(run.id)).filter(
+              (a) => a.name === "agent-diagnostic-v1.json",
+            );
+            expect(diagnostic.some((a) => JSON.parse(a.content!).status === "COMPLETED")).toBe(
+              true,
+            );
+          }
           const snapshots = (await database.artifacts.list(run.id))
             .filter((a) => a.name === "coding-session-v1.json")
             .map((a) => JSON.parse(a.content!).state);

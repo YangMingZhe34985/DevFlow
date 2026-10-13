@@ -18,6 +18,18 @@ export class EvidenceProgress {
   observe(value: unknown, revision: number, pathHint?: string): boolean {
     const row = object(value);
     let changed = false;
+    if (
+      row.authority === "OBSERVATION_ONLY" &&
+      row.status === "COMPLETED" &&
+      typeof row.sourceIdentity === "string" &&
+      typeof row.id === "string" &&
+      !row.cached
+    )
+      changed = this.fact({
+        diagnostic: row.id,
+        sourceIdentity: row.sourceIdentity,
+        profileSha256: row.profileSha256,
+      });
     const text = row.content ?? row.snippet ?? row.code;
     if (typeof row.path === "string" && typeof text === "string" && text.length) {
       const identity = `${row.path}:${row.fileSha256 ?? row.contentHash ?? row.sha256 ?? revision}`;

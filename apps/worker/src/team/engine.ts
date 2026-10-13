@@ -43,6 +43,8 @@ export interface TeamDecisionView {
   history: TeamAgent["history"];
   limits: TeamConfiguration;
   feedback?: TeamSnapshot["feedback"];
+  /** Host quote after shared downstream reservations; informative, never authorization. */
+  resourceAvailability?: Record<string, number>;
 }
 export interface TeamEnginePorts {
   store: TeamStore;
@@ -203,6 +205,7 @@ export class TeamEngine {
         0,
         Math.min(state.config.concurrency, maxDecisions - attempts),
       );
+      const feedbackBefore = coordinatorFeedback(state);
       // Every selected task shares the same immutable view; no Coding writer is running here.
       const dispatch = async () => {
         const outcomes = await Promise.allSettled(
@@ -211,7 +214,8 @@ export class TeamEngine {
               const current = await this.load(runId);
               if (
                 current.status !== "RUNNING" ||
-                current.agents.find((row) => row.id === a.id)?.status !== "READY"
+                current.agents.find((row) => row.id === a.id)?.status !== "READY" ||
+                coordinatorFeedback(current) !== feedbackBefore
               )
                 break;
               // Synchronous allocation before await prevents parallel siblings using the same remaining slot.
@@ -639,6 +643,16 @@ export class TeamEngine {
           s.status = "READY_FOR_PLAN";
           s.selectedEvidenceIds = action.evidenceIds;
           s.missing = action.missing;
+          // Handoff ends this investigation wave. Keep uncompleted goals visible,
+          // but never resurrect their old assignments after Coding changes the view.
+          for (const t of s.tasks.filter((t) =>
+            ["READY", "RUNNING", "WAITING"].includes(t.status),
+          )) {
+            t.status = "CANCELLED";
+            t.reason = "PLANNING_HANDOFF";
+            s.agents.find((a) => a.id === t.agentId)!.status = "CANCELLED";
+            s.missing.push(`Investigation not completed before planning handoff: ${t.goal}`);
+          }
           break;
         case "STOP":
           s.status = "STOPPED";
@@ -701,4 +715,14 @@ export class TeamEngine {
     }
     fail("TEAM_CONCURRENT_UPDATE_CONFLICT");
   }
+}
+
+/** Yield only on new results/blockers or addressed messages, not query wording or cache churn. */
+function coordinatorFeedback(state: TeamSnapshot): string {
+  return teamDigest({
+    tasks: state.tasks
+      .filter((t) => ["COMPLETED", "BLOCKED", "CANCELLED"].includes(t.status))
+      .map((t) => ({ id: t.id, status: t.status, result: t.result, reason: t.reason })),
+    messages: state.messages.filter((m) => m.to === state.coordinatorId).map((m) => m.id),
+  });
 }

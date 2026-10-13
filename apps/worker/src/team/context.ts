@@ -36,6 +36,7 @@ export async function projectTeamRequest(
             "Only DELEGATE creates investigators. Do not recursively delegate. SEND uses IDs from the task board; evidence IDs must already exist. No editing, shell execution, approval or test-pass declarations.",
             "Source presence is not proof of cause. Follow public assertions, implementations and consumers; distinguish current observation, counterevidence and hypothesis.",
             "Your private history is separate. Act on unread challenges: investigate, revise or explain rejection with source evidence. RESULT finishes an investigation; Coordinator then PROPOSE_PLAN with selected evidence or STOP with concrete missing information.",
+            "Host resourceAvailability is the current shared remaining capacity AFTER required downstream reservations, not a per-agent allowance. Other in-flight work can consume it. Conclude a supported investigation with RESULT and explicit gaps instead of trying to exhaustively prove every path. On partial results, Coordinator may redirect/cancel redundant tasks, request specific counterevidence, or submit supported planning evidence; unfinished tasks are not a mandatory barrier to PROPOSE_PLAN.",
             "Do not repeat actions or reword a hypothesis to claim progress. Two turns without new evidence stop exploration. Preserve unsolved requirements; only host validation/review can approve a fix.",
           ].join("\n"),
         },

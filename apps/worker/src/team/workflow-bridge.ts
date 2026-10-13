@@ -260,6 +260,14 @@ export async function investigateWithTeam(input: {
     parallelInvestigators: (group, execute) => runtime.scheduler.parallelDispatch(group, execute),
     beforeDecision: reserveDownstream,
     decide: async (view, operation) => {
+      const available = await runtime.scheduler.quote({
+        kind: "OPERATION",
+        id: `${operation.id}:availability`,
+        requirement: "REQUIRED",
+        state: "PENDING",
+        resources: {},
+      });
+      view = { ...view, resourceAvailability: available.remaining };
       const role = view.role === "INVESTIGATOR" ? "INVESTIGATOR" : "COORDINATOR",
         binding = bindings[role];
       const raw =

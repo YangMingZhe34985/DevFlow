@@ -27,6 +27,96 @@ const observation = (path: string): TeamEvidence => ({
 });
 
 describe("dynamic collaboration core", () => {
+  it("yields to Coordinator on a completed sibling result before a long investigation exhausts the Run", async () => {
+    const store = new InMemoryTeamStore();
+    let completed!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      completed = resolve;
+    });
+    let coordinatorCalls = 0,
+      slowCalls = 0;
+    const engine = new TeamEngine({
+      store,
+      lease,
+      signal: AbortSignal.timeout(5000),
+      onChange: async (s) => {
+        if (s.tasks.some((t) => t.key === "fast" && t.status === "COMPLETED")) completed();
+      },
+      decide: async (view) => {
+        if (view.role === "COORDINATOR") {
+          coordinatorCalls++;
+          if (!view.board.length)
+            return result(
+              ["fast", "slow"].map((key) => ({
+                type: "DELEGATE",
+                key,
+                goal: key,
+                evidenceIds: [],
+                dependsOn: [],
+              })),
+            );
+          const slow = view.board.find((t) => t.goal === "slow")!;
+          expect(slow.status).toBe("READY");
+          expect(view.board.find((t) => t.goal === "fast")?.status).toBe("COMPLETED");
+          return result([
+            {
+              type: "PROPOSE_PLAN",
+              evidenceIds: view.evidence.map((e) => e.id),
+              missing: ["Planner must assess remaining uncertainty"],
+            },
+          ]);
+        }
+        if (view.assignments[0]!.goal === "slow") {
+          slowCalls++;
+          await ready;
+          return result([{ type: "READ", path: "background.ts", startLine: 1, endLine: 1 }]);
+        }
+        return result(
+          view.history.length
+            ? [
+                {
+                  type: "RESULT",
+                  evidenceIds: view.evidence.map((e) => e.id),
+                  hypotheses: ["Public failure conflicts with implementation"],
+                  missing: [],
+                },
+              ]
+            : [{ type: "READ", path: "implementation.ts", startLine: 1, endLine: 1 }],
+        );
+      },
+      observe: async (action) => (action.type === "READ" ? [observation(action.path)] : []),
+    });
+    await engine.initialize({
+      runId: "run",
+      repositoryId: "repo",
+      sourceIdentity: "base",
+      mode: "team",
+    });
+    const state = await engine.run("run", task, 16);
+    expect(state.status).toBe("READY_FOR_PLAN");
+    expect(coordinatorCalls).toBe(2);
+    expect(slowCalls).toBe(1);
+    expect(state.operations.every((o) => o.status === "COMPLETED")).toBe(true);
+    expect(state.tasks.find((t) => t.goal === "slow")).toMatchObject({
+      status: "CANCELLED",
+      reason: "PLANNING_HANDOFF",
+    });
+    expect(state.missing.some((m) => m.includes("slow"))).toBe(true);
+    // Resume processes persisted terminal state without renewed decisions.
+    await engine.run("run", task, 16);
+    expect(coordinatorCalls).toBe(2);
+    await engine.reopen("run", "candidate", [], {
+      id: "test-feedback",
+      origin: "VALIDATION",
+      description: "new public failure",
+    });
+    const restored = (await store.load("run"))!;
+    expect(
+      restored.agents.find((a) => a.id === state.tasks.find((t) => t.goal === "slow")!.agentId)
+        ?.status,
+    ).toBe("CANCELLED");
+  });
+
   it("preserves a host observation timeout as unknown tool work, not invalid model output or permission", async () => {
     const store = new InMemoryTeamStore();
     const engine = new TeamEngine({
@@ -268,7 +358,21 @@ describe("dynamic collaboration core", () => {
       signal: AbortSignal.timeout(5000),
       decide: async (view) => {
         views.push(structuredClone(view));
-        if (view.role === "COORDINATOR")
+        if (view.role === "COORDINATOR") {
+          const pending = view.board.find((t) => t.goal === "B" && t.status !== "COMPLETED");
+          if (pending && view.history.length)
+            return result([
+              {
+                type: "SEND",
+                toAgentId: pending.agentId,
+                taskId: pending.id,
+                messageType: "REQUEST_EVIDENCE",
+                body: "Resolve the source-backed challenge before planning.",
+                evidenceIds: view.evidence
+                  .filter((e) => e.path === "counterexample.ts")
+                  .map((e) => e.id),
+              },
+            ]);
           return result(
             view.board.length
               ? [{ type: "PROPOSE_PLAN", evidenceIds: view.evidence.map((e) => e.id), missing: [] }]
@@ -280,6 +384,7 @@ describe("dynamic collaboration core", () => {
                   dependsOn: [],
                 })),
           );
+        }
         if (view.assignments[0]?.goal === "A") {
           if (!view.history.length)
             return result([{ type: "READ", path: "counterexample.ts", startLine: 1, endLine: 1 }]);

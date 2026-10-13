@@ -76,6 +76,8 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
                 const view = JSON.parse(
                   request.messages.find((m) => m.role === "USER")!.content as string,
                 ) as TeamDecisionView;
+                expect(view.resourceAvailability?.tokens).toBeGreaterThan(0);
+                expect(view.resourceAvailability?.costMicros).toBeLessThan(4000000);
                 if (action === "SEARCH_TIMEOUT" && view.role === "INVESTIGATOR")
                   database.repositoryIndexes.get = async () => {
                     throw new DOMException("read-only search deadline", "TimeoutError");

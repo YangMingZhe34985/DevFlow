@@ -513,6 +513,46 @@ export function operation(
   return { kind: "OPERATION", id, requirement: "REQUIRED", state: "PENDING", resources };
 }
 
+/** Price each projected request using its own binding; preserve the execution-path algebra. */
+export function priceModelOperationPlan(
+  plan: ResourceBudgetOperationPlan,
+  priceFor: (operationId: string) => ModelResourcePrice | undefined,
+): ResourceBudgetOperationPlan {
+  if (plan.kind === "EXCLUSIVE")
+    return {
+      ...plan,
+      ...(plan.shared ? { shared: priceModelOperationPlan(plan.shared, priceFor) } : {}),
+      branches: plan.branches.map((branch) => priceModelOperationPlan(branch, priceFor)),
+    };
+  if (plan.kind !== "OPERATION")
+    return {
+      ...plan,
+      operations: plan.operations.map((op) => priceModelOperationPlan(op, priceFor)),
+    };
+  if (!(
+    plan.resources.modelCalls ||
+    plan.resources.tokens ||
+    plan.resources.inputTokens ||
+    plan.resources.outputTokens
+  ))
+    return plan;
+  const price = priceFor(plan.id);
+  // An aggregate with no input/output split cannot be priced as an all-input request.
+  const splitKnown =
+    plan.resources.inputTokens !== undefined && plan.resources.outputTokens !== undefined;
+  return {
+    ...plan,
+    costStatus: price && splitKnown ? "PRICED" : "UNPRICED",
+    resources: {
+      ...plan.resources,
+      costMicros:
+        price && splitKnown
+          ? modelCost(price, plan.resources.inputTokens!, plan.resources.outputTokens!)
+          : 0,
+    },
+  };
+}
+
 function modelCost(price: ModelResourcePrice | undefined, input: number, output: number): number {
   return price
     ? Math.ceil(

@@ -165,6 +165,17 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             DEVFLOW_MAX_TOTAL_TOKENS: "320000",
             DEVFLOW_MAX_TOOL_CALLS: "75",
             DEVFLOW_TIMEOUT_MS: "1500000",
+            DEVFLOW_MAX_COST_MICROS: "4000000",
+            DEVFLOW_MODEL_PRICES_JSON: JSON.stringify({
+              "openai-compatible:glm-5.3": {
+                inputMicrosPerMillionTokens: 8000000,
+                outputMicrosPerMillionTokens: 28000000,
+              },
+              "injected:injected": {
+                inputMicrosPerMillionTokens: 8000000,
+                outputMicrosPerMillionTokens: 28000000,
+              },
+            }),
             DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: "60000",
             DEVFLOW_PLAN_AGENT_TIMEOUT_MS: "180000",
             LLM_PROVIDER: "openai-compatible",

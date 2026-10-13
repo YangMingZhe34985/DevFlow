@@ -241,7 +241,8 @@ export class ResourceBudgetScheduler {
       const candidate = structuredClone(ledger);
       delete candidate.reservations[operationId];
       const quote = quoteAgainst(candidate, plan, this.now());
-      if (!quote.fits) return { value: { reserved: false, quote }, changed: false };
+      ledger.lastDecision = { operationId, at: this.now(), quote, requestIssued: false };
+      if (!quote.fits) return { value: { reserved: false, quote }, changed: true };
       const reservation: ResourceBudgetReservation = {
         id: operationId,
         planDigest: digest(plan),

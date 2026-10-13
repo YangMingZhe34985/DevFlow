@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryTeamStore } from "@devflow/database";
-import type { TeamDecision, TeamEvidence } from "@devflow/shared";
+import { DevflowError, type TeamDecision, type TeamEvidence } from "@devflow/shared";
 import { TeamEngine, teamDigest, type TeamDecisionView } from "../src/team/engine.js";
 
 const task = { title: "Cached value is stale", description: "Reload must expose updated values." };
@@ -352,7 +352,14 @@ describe("dynamic collaboration core", () => {
       lease,
       signal: AbortSignal.timeout(5000),
       beforeDecision: async () => {
-        throw new Error("budget shortfall");
+        throw new DevflowError({
+          code: "EXECUTION_BUDGET_EXCEEDED",
+          message: "budget shortfall",
+          details: {
+            requestIssued: false,
+            quote: { shortfalls: { costMicros: 123 }, remaining: { costMicros: 10 } },
+          },
+        });
       },
       decide: async () => {
         calls++;
@@ -369,6 +376,13 @@ describe("dynamic collaboration core", () => {
     const state = await engine.run("run", task, 12);
     expect(calls).toBe(0);
     expect(state.operations[0]?.status).toBe("NOT_ISSUED");
+    expect(state.operations[0]?.failure).toMatchObject({
+      code: "EXECUTION_BUDGET_EXCEEDED",
+      details: { requestIssued: false, quote: { shortfalls: { costMicros: 123 } } },
+    });
+    await engine.run("run", task, 12);
+    expect(calls).toBe(0);
+    expect((await store.load("run"))?.operations[0]?.failure).toEqual(state.operations[0]?.failure);
     const uncertain = structuredClone(state);
     uncertain.revision++;
     uncertain.operations[0]!.status = "UNKNOWN";

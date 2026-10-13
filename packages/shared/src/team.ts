@@ -152,6 +152,8 @@ export interface TeamOperation {
   input: unknown;
   output?: unknown;
   error?: string;
+  /** Host failure diagnostics survive recovery; never treated as model evidence. */
+  failure?: { code: string; message: string; details?: unknown };
   /** Completed model decisions are replayed locally until their effects and history commit. */
   applied?: boolean;
   observedBefore?: string[];

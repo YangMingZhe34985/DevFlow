@@ -311,7 +311,17 @@ export class TeamEngine {
       await this.ports.beforeDecision?.(view, operation);
     } catch (error) {
       await this.change(runId, (s) => {
-        s.operations.find((o) => o.id === id)!.status = "NOT_ISSUED";
+        const op = s.operations.find((o) => o.id === id)!;
+        op.status = "NOT_ISSUED";
+        op.error = error instanceof Error ? error.message : String(error);
+        op.failure =
+          error instanceof DevflowError
+            ? {
+                code: error.code,
+                message: error.message,
+                ...(error.details ? { details: error.details } : {}),
+              }
+            : { code: "HOST_ERROR", message: op.error };
       });
       await this.stop(runId, "BUDGET_STOP", [
         error instanceof Error ? error.message : String(error),

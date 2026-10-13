@@ -28,13 +28,10 @@ import { RepositoryRelationGraph, relationGraphDigest } from "../localization/re
 import {
   ResourceBudgetRuntime,
   resourceBudgetContext,
+  priceModelOperationPlan,
   type ModelResourcePrice,
 } from "../runs/resource-budget-runtime.js";
-import {
-  estimateOperationPlan,
-  type ResourceBudgetLedger,
-  type ResourceBudgetOperationPlan,
-} from "../runs/resource-budget-scheduler.js";
+import { type ResourceBudgetLedger } from "../runs/resource-budget-scheduler.js";
 import { localizationLease } from "../runs/localization-lease.js";
 import { recordModelResponse, recordStageStep, recordToolWork } from "../runs/workflow-metrics.js";
 import { TeamEngine, teamDigest, type TeamDecisionView } from "./engine.js";
@@ -210,15 +207,11 @@ export async function investigateWithTeam(input: {
   const allPrices = environment.DEVFLOW_MODEL_PRICES_JSON
     ? (JSON.parse(environment.DEVFLOW_MODEL_PRICES_JSON) as Record<string, ModelResourcePrice>)
     : {};
-  const prices = ["COORDINATOR", "INVESTIGATOR", "PLANNER", "EXECUTE", "REVIEW"].map((stage) => {
-    const b = resolveStageModel(stage as ModelStage, environment, run);
-    return allPrices[`${b.provenance.provider}:${b.provenance.model}`];
-  });
-  const rate = prices.every(Boolean)
-    ? Math.max(
-        ...prices.flatMap((p) => [p!.inputMicrosPerMillionTokens, p!.outputMicrosPerMillionTokens]),
-      )
-    : undefined;
+  const downstreamBindings = {
+    planner: resolveStageModel("PLANNER", environment, run),
+    coding: resolveStageModel("EXECUTE", environment, run),
+    review: resolveStageModel("REVIEW", environment, run),
+  };
   const downstreamId = "team:shared-downstream";
   const reserveDownstream = async (_view: TeamDecisionView) => {
     const allEvidence = (await store.load(run.id))!.evidence.filter((e) => e.valid);
@@ -246,24 +239,16 @@ export async function investigateWithTeam(input: {
         finalize: environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
       },
     });
-    const resources = estimateOperationPlan(budget.downstreamOperationPlan).resources;
-    const plan: ResourceBudgetOperationPlan = {
-      kind: "OPERATION",
-      id: downstreamId,
-      requirement: "REQUIRED",
-      state: "PENDING",
-      resources: {
-        ...resources,
-        ...(rate === undefined
-          ? {}
-          : { costMicros: Math.ceil((resources.tokens * rate) / 1_000_000) }),
-      },
-      costStatus: rate === undefined ? "UNPRICED" : "PRICED",
-    };
+    const plan = priceModelOperationPlan(budget.downstreamOperationPlan, (id) => {
+      const binding = downstreamBindings[id.split(":")[0] as keyof typeof downstreamBindings];
+      return binding
+        ? allPrices[`${binding.provenance.provider}:${binding.provenance.model}`]
+        : undefined;
+    });
     const reserved = await runtime.scheduler.replaceHold(downstreamId, plan);
     if (!reserved.reserved)
       throw new DevflowError({
-        code: "MAX_STEPS_EXCEEDED",
+        code: "EXECUTION_BUDGET_EXCEEDED",
         message: "Run cannot fund investigation and required downstream work.",
         details: { requestIssued: false, quote: reserved.quote },
       });
@@ -606,9 +591,22 @@ export async function investigateWithTeam(input: {
     });
   if (state.status !== "READY_FOR_PLAN")
     throw new DevflowError({
-      code: state.stopReason === "STALLED" ? "AGENT_STALLED" : "INSUFFICIENT_EVIDENCE",
+      code:
+        state.stopReason === "STALLED"
+          ? "AGENT_STALLED"
+          : state.stopReason === "BUDGET_STOP"
+            ? "EXECUTION_BUDGET_EXCEEDED"
+            : "INSUFFICIENT_EVIDENCE",
       message: `Collaboration ended: ${state.stopReason ?? state.status}`,
-      details: { missing: state.missing, requestIssued: false, teamRevision: state.revision },
+      details: {
+        missing: state.missing,
+        requestIssued: false,
+        teamRevision: state.revision,
+        stopReason: state.stopReason,
+        failures: state.operations
+          .filter((op) => op.failure)
+          .map((op) => ({ operationId: op.id, ...op.failure })),
+      },
     });
   const selected = state.evidence.filter(
     (e) => e.valid && state.selectedEvidenceIds.includes(e.id),

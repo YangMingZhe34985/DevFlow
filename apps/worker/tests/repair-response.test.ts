@@ -1,9 +1,61 @@
 import { describe, expect, it } from "vitest";
 import { readFileContent, type SandboxSession } from "@devflow/sandbox";
 import { vi } from "vitest";
-import { checkRepairResponse, repairFinishInputError } from "../src/runs/repair-response.js";
+import {
+  checkRepairResponse,
+  repairFinishInputError,
+  resolveRepairEvidenceRefs,
+} from "../src/runs/repair-response.js";
+import { sourceEvidenceRecord } from "../src/runs/repair-tasks.js";
 import { PhaseCompletionSchema } from "@devflow/shared";
 describe("repair response provenance", () => {
+  it("offers current host references for a rejected quote without normalizing or accepting it", async () => {
+    const code = "    if (flat) {\n        filterExisting(*flat);\n    }\n";
+    const read = readFileContent(Buffer.from(code), { path: "src/search.cpp" });
+    const source = {
+      path: "src/search.cpp",
+      code,
+      contentHash: read.fileSha256!,
+      startLine: 1,
+      endLine: 4,
+      complete: true,
+      workspaceRevision: 2,
+    };
+    const stale = { ...source, contentHash: "b".repeat(64), workspaceRevision: 1 };
+    const versions = new Map([[source.path, source.contentHash]]);
+    const input = {
+      outcome: "SCOPE_CONFLICT" as const,
+      evidence: [
+        {
+          path: source.path,
+          fileSha256: source.contentHash,
+          quote: "        if (flat) {\n            filterExisting(*flat);\n        }",
+        },
+      ],
+      replanRequest: {
+        candidatePaths: [source.path],
+        reason: "Public failure requires consumer investigation",
+      },
+    };
+    const error = repairFinishInputError(input, [stale, source], versions);
+    expect(error).toContain("exact quote was not observed");
+    expect(error).toContain(sourceEvidenceRecord(source).id);
+    expect(error).not.toContain(sourceEvidenceRecord(stale).id);
+    const corrected = { ...input, evidence: [], evidenceRefs: [sourceEvidenceRecord(source).id] };
+    expect(repairFinishInputError(corrected, [source], versions)).toBeUndefined();
+    const response = resolveRepairEvidenceRefs(corrected, [source]);
+    const checked = await checkRepairResponse(
+      response,
+      [source],
+      { readFile: async () => read } as unknown as SandboxSession,
+      new AbortController().signal,
+    );
+    expect(checked?.evidenceStatus).toBe("CURRENT_SOURCE_LINKED");
+    expect(checked?.replanRequest).toEqual(input.replanRequest);
+    expect(
+      repairFinishInputError(corrected, [source], new Map([[source.path, "c".repeat(64)]])),
+    ).toContain("SOURCE_STALE");
+  });
   it("reports unknown finding IDs and stale citations before accepting finishPhase", () => {
     const versions = new Map([["a.ts", "a".repeat(64)]]);
     expect(

@@ -15,11 +15,24 @@ export function repairFinishInputError(
   if (!parsed.success) return undefined; // Transport validation reports field details first.
   if ((parsed.data.evidence?.length ?? 0) + (parsed.data.evidenceRefs?.length ?? 0) > 4)
     return "finishPhase.evidence/evidenceRefs: at most four combined source references; keep the required current records.";
+  const currentReferenceHint = (path?: string) => {
+    const records = observed
+      .filter(
+        (source) =>
+          (path === undefined || source.path === path) &&
+          versions.get(source.path) === source.contentHash,
+      )
+      .map((source) => sourceEvidenceRecord(source));
+    const unique = [...new Map(records.map((record) => [record.id, record])).values()];
+    if (!unique.length)
+      return " No current host reference is available; report INSUFFICIENT_EVIDENCE if a permitted refresh is unavailable.";
+    return ` Current host source references: ${JSON.stringify(unique.slice(0, 4))}. For a top-level citation you may explicitly replace it with its evidenceRefs ID; per-finding citations still require exact observed quotes. Do not reread unchanged source just to reconstruct a citation. References establish provenance only; keep the original scope request and unresolved behavior. Omitted references: ${Math.max(0, unique.length - 4)}.`;
+  };
   const known = new Map(observed.map((source) => [sourceEvidenceRecord(source).id, source]));
   for (const id of parsed.data.evidenceRefs ?? []) {
     const source = known.get(id);
     if (!source)
-      return `finishPhase.evidenceRefs: unknown host source record ${id}; use a supplied reference or current exact quote.`;
+      return `finishPhase.evidenceRefs: unknown host source record ${id}; use a supplied reference or current exact quote.${currentReferenceHint()}`;
     if (versions.get(source.path) !== source.contentHash)
       return `finishPhase.evidenceRefs: SOURCE_STALE ${id}; refresh ${source.path}.`;
   }
@@ -54,7 +67,7 @@ export function repairFinishInputError(
           s.code.includes(citation.quote),
       )
     )
-      return `finishPhase.evidence[${i}].quote: exact quote was not observed in current source ${citation.path}.`;
+      return `finishPhase.evidence[${i}].quote: exact quote was not observed in current source ${citation.path}.${currentReferenceHint(citation.path)}`;
   }
   return undefined;
 }

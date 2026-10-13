@@ -380,7 +380,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
           !hostVerification
         )
           return "CONTINUATION_TOOL_RESERVE: finishPhase with current evidence and remaining gaps; preserve downstream operations.";
-        if (authorizationHandoffUsed && call.name !== "finishPhase")
+        if (authorizationHandoffUsed && call.name !== "finishPhase" && !hostVerification)
           return "HOST_AUTHORIZATION_HANDOFF: only finishPhase with the remaining gap or scope conflict is available.";
         const protocolCorrection =
           correctingEdit && execution.correctionReason === "PROTOCOL_INVALID";
@@ -1755,7 +1755,7 @@ export class DefaultAgentRuntime implements AgentRuntime {
         const normalCalls = executedCalls.filter(({ control }) => !control);
         if (
           authorizationHandoffUsed &&
-          executedCalls.some(({ call }) => call.name !== "finishPhase")
+          response.toolCalls.some((call) => call.name !== "finishPhase")
         )
           throw new DevflowError({
             code: "AGENT_STALLED",

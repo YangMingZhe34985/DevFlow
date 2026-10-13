@@ -148,6 +148,7 @@ for (const invalid of ["none", "changed", "incomplete", "stale", "used"] as cons
       edit(),
       async (request) => {
         expect(JSON.stringify(request.messages)).toContain("lineEndingMode=MATCH_FILE");
+        expect((await stateStore.load(f.context.runId))?.executionConvergence?.noProgressStreak).toBe(2);
         return fakeModelResponse({
           toolCalls: [...edit().toolCalls, ...response("finishPhase").toolCalls],
         });
@@ -160,6 +161,7 @@ for (const invalid of ["none", "changed", "incomplete", "stale", "used"] as cons
         maxRetries: 0,
         timeoutMs: 3000,
         codingSession: true,
+        convergenceReserve: { downstreamSteps: 0, downstreamTokens: 0 },
         executionRecovery: { pending: false, used: invalid === "used", explorationClosed: false },
       },
       f.context,

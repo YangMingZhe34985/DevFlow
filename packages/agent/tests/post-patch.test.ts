@@ -44,10 +44,17 @@ async function run(
     initialContent?: string;
     stateStore?: AgentStateStore;
     runId?: string;
+    authorizationHandoff?: boolean;
   } = {},
 ) {
   const c = new PostPatchController(["a.ts"], 4, options.auto);
   let current = options.initialContent ?? "old";
+  if (options.authorizationHandoff) {
+    c.firstMutationEndedAt = Date.now();
+    c.changed.add("a.ts");
+    c.state = "PATCH_APPLIED";
+    c.needsVerification = true;
+  }
   const tools = ["writeFile", "readFile", "gitDiff", "finishPhase", "searchCode"].map((name) => ({
     name,
     description: name,
@@ -84,6 +91,16 @@ async function run(
       },
       additionalContext: "STALE_WORKING_SET EXPLORATION_HISTORY",
       postPatch: c,
+      ...(options.authorizationHandoff
+        ? {
+            executionRecovery: {
+              pending: false,
+              used: false,
+              explorationClosed: true,
+              authorizationHandoffUsed: true,
+            },
+          }
+        : {}),
       ...(options.reserve
         ? {
             modelSettings: { maxOutputTokens: 512 },
@@ -168,6 +185,41 @@ it("same-batch write + finish checks the deterministic diff first without anothe
     outcome: "PATCH_READY",
     metrics: { postPatchModelCalls: 0 },
   });
+});
+it("host-inserted diff revalidation survives finish-only handoff and is still charged", async () => {
+  const { result, model } = await run({
+    authorizationHandoff: true,
+    initialContent: "changed",
+    calls: [[finish]],
+    maxTools: 2,
+  });
+  expect(model.requests).toHaveLength(1);
+  expect(model.requests[0]!.tools.map((t) => t.name)).toEqual(["finishPhase"]);
+  expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+  expect(result.executeCompletion?.outcome).toBe("PATCH_READY");
+  expect(result.metrics.toolCalls).toBe(2);
+});
+it("finish-only handoff does not grant model diff/read authority or waive probe capacity", async () => {
+  for (const calls of [
+    [{ id: "model-probe", name: "gitDiff", input: { maxBytes: 32768 } }, finish],
+    [read, finish],
+  ]) {
+    const { result } = await run({
+      authorizationHandoff: true,
+      initialContent: "changed",
+      calls: [calls],
+    });
+    expect(result.status).toBe("FAILED");
+    expect(result.error?.message).toContain("AUTHORIZATION_HANDOFF_UNRESOLVED");
+  }
+  const { result } = await run({
+    authorizationHandoff: true,
+    initialContent: "changed",
+    calls: [[finish]],
+    maxTools: 1,
+  });
+  expect(result.status).toBe("FAILED");
+  expect(result.executeCompletion?.outcome).not.toBe("PATCH_READY");
 });
 it("closing model exploration preserves the authoritative post-write diff probe and handoff", async () => {
   const { result } = await run({ reserve: true, calls: [[write], [finish]] });

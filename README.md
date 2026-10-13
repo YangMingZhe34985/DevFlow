@@ -20,6 +20,11 @@ it uses a frozen public verification profile in an isolated copy and cannot repl
 or independent Review. See [the acceptance record](docs/stability-autonomy-validation-20261013.md)
 for free replay evidence and remaining real-model gates.
 
+The [context-management follow-up](docs/context-management-repair-20261013.md) adds recoverable
+team working memory, same-version source-range references and bounded Coding summaries through
+the existing Scheduler. Frozen-request replay checks evidence preservation and serialized input;
+it is not a new real-model success-rate result.
+
 The **2.3.1 baseline** shares one persistent Coding Session for editing and failure repair. The earlier Resource Budget Scheduler batch strictly passed **1/4** cases (E07). E10 dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; that batch did not meet its E10-specific version gate. See [the scheduler architecture](docs/resource-budget-scheduler.md), [its results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
 
 The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. That experiment used package version 2.3.0.

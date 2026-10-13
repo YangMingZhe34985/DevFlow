@@ -27,6 +27,40 @@ export interface CodingCapacity {
 
 export type CodingBudgetBranch = "CONTINUE" | "REPLAN";
 
+/** Preserve model input/output identities until the worker prices the selected path.
+ * Aggregate capacity alone cannot be priced at an unrelated stage's output rate. */
+export function codingContinuationOperationPlan(input: {
+  finalModels: ResourceBudgetOperationPlan;
+  validationAndFinalize: { timeMs: number; logicalToolCalls: number };
+  replan?: ResourceBudgetOperationPlan;
+  submitCurrent: boolean;
+}): ResourceBudgetOperationPlan {
+  const shared: ResourceBudgetOperationPlan = {
+    kind: "SEQUENCE",
+    id: "coding:shared-finalization",
+    operations: [
+      input.finalModels,
+      {
+        kind: "OPERATION",
+        id: "validation:mandatory-profile-and-finalize",
+        requirement: "REQUIRED",
+        state: "PENDING",
+        resources: input.validationAndFinalize,
+      },
+    ],
+  };
+  return {
+    kind: "EXCLUSIVE",
+    id: "coding:priced-continuation",
+    exclusivityKey: "coding-result:continue-or-scope-replan",
+    shared,
+    branches: [
+      { kind: "SEQUENCE", id: "coding:continue-current-scope", operations: [] },
+      ...(!input.submitCurrent && input.replan ? [input.replan] : []),
+    ],
+  };
+}
+
 /**
  * Final Validation and Independent Review belong to both branches. Reserve them
  * once, then the larger reachable alternative in each resource dimension.
@@ -198,6 +232,13 @@ export function codingReplanReserve(input: {
             plannerInputGrowthTokens +
             plannerOutputTokens +
             plannerRecoveryTokens,
+          inputTokens:
+            plannerInputTokens +
+            plannerInputGrowthTokens +
+            plannerRecoveryTokens -
+            Math.max(plannerOutputTokens, plannerFormatRepairOutputTokens),
+          outputTokens:
+            plannerOutputTokens + Math.max(plannerOutputTokens, plannerFormatRepairOutputTokens),
           steps: 2,
           modelCalls: 2,
           timeMs: integer(input.plannerTimeoutMs, "plannerTimeoutMs", 1),

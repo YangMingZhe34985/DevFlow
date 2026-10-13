@@ -135,15 +135,27 @@ export class ResourceBudgetRuntime {
 
   /** Price capacity using the same configured bound as actual model admission.
    * This is a quote, never consumption or a substitute for request admission. */
-  async checkContinuation(resources: Partial<ResourceVector>, label: string): Promise<void> {
+  async checkContinuation(
+    projection: Partial<ResourceVector> & { costStatus?: "PRICED" | "UNPRICED" },
+    label: string,
+  ): Promise<void> {
+    const { costStatus, ...resources } = projection;
     const tokens = resources.tokens ?? 0;
     const priced =
-      tokens === 0 || (resources.costMicros ?? 0) > 0 || this.continuationRate !== undefined;
+      costStatus === "UNPRICED"
+        ? false
+        : costStatus === "PRICED" ||
+          tokens === 0 ||
+          (resources.costMicros ?? 0) > 0 ||
+          this.continuationRate !== undefined;
     await this.check(
       {
         ...operation(label, {
           ...resources,
-          ...(tokens > 0 && (resources.costMicros ?? 0) === 0 && this.continuationRate !== undefined
+          ...(costStatus === undefined &&
+          tokens > 0 &&
+          (resources.costMicros ?? 0) === 0 &&
+          this.continuationRate !== undefined
             ? { costMicros: Math.ceil((tokens * this.continuationRate) / 1_000_000) }
             : {}),
         }),
@@ -301,13 +313,17 @@ export class ResourceBudgetRuntime {
           costMicros: modelCost(options.price, inputTokens, outputTokens),
         };
         if (request.resourceContinuation) {
-          const continuation = { ...request.resourceContinuation };
+          const { costStatus, audit, ...continuation } = request.resourceContinuation;
           const futureTokens = continuation.tokens ?? 0;
           const futurePriced =
-            futureTokens === 0 ||
-            (continuation.costMicros ?? 0) > 0 ||
-            options.continuationMicrosPerMillionTokens !== undefined;
+            costStatus === "UNPRICED"
+              ? false
+              : costStatus === "PRICED" ||
+                futureTokens === 0 ||
+                (continuation.costMicros ?? 0) > 0 ||
+                options.continuationMicrosPerMillionTokens !== undefined;
           if (
+            costStatus === undefined &&
             futureTokens > 0 &&
             (continuation.costMicros ?? 0) === 0 &&
             options.continuationMicrosPerMillionTokens !== undefined
@@ -315,6 +331,16 @@ export class ResourceBudgetRuntime {
             continuation.costMicros = Math.ceil(
               (futureTokens * options.continuationMicrosPerMillionTokens) / 1_000_000,
             );
+          if (audit !== undefined)
+            await this.record({
+              budgetScheduler: {
+                action: "CONTINUATION_PROJECTION",
+                operationId: id,
+                requestIssued: false,
+                inputFingerprint: estimatePlanRequest(request).fingerprint,
+                audit,
+              },
+            });
           await this.check(
             {
               kind: "SEQUENCE",
@@ -325,7 +351,9 @@ export class ResourceBudgetRuntime {
                   ...operation(`${id}:continuation`, continuation),
                   costStatus: futurePriced ? "PRICED" : "UNPRICED",
                   reason:
-                    "Reachable downstream capacity; unknown future input/output mix uses the maximum configured stage token rate.",
+                    costStatus === undefined
+                      ? "Legacy unsplit continuation uses the maximum configured stage token rate."
+                      : "Host operation projection priced by stage and input/output, preserving the reachable branch algebra.",
                 },
               ],
             },

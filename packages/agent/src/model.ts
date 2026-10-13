@@ -71,6 +71,10 @@ export interface ModelRequest {
     toolExecutions?: number;
     timeMs?: number;
     costMicros?: number;
+    /** Explicit host pricing result. Unknown prices must not fall back to a free request. */
+    costStatus?: "PRICED" | "UNPRICED";
+    /** Persisted quote provenance only; never sent to the Provider. */
+    audit?: unknown;
   };
 }
 

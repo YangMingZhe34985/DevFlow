@@ -8,15 +8,17 @@ import {
   validateInvestigationResume,
   type LocalizationInvestigationState,
 } from "../localization/investigation-state.js";
-import { ResourceBudgetScheduler, type ResourceBudgetLedger } from "./resource-budget-scheduler.js";
+import { ResourceBudgetScheduler, estimateOperationPlan, type ResourceBudgetLedger } from "./resource-budget-scheduler.js";
 import {
   ResourceBudgetRuntime,
   resourceBudgetContext,
+  priceModelOperationPlan,
   type ModelResourcePrice,
 } from "./resource-budget-runtime.js";
 import { CodingSession, codingMetricDelta } from "./coding-session.js";
 import {
   codingContinuationReserve,
+  codingContinuationOperationPlan,
   codingBranchFrontier,
   codingPlannerTokenLease,
   codingReplanReserve,
@@ -1510,8 +1512,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             }),
           }).toJSON();
         };
-      const continuationReserve = (operation: CodingBudgetOperation = "CODING") => {
-        const source = JSON.stringify(
+      const continuationReserve = (operation: CodingBudgetOperation = "CODING", feedback?: {
+        source: unknown; diagnostics: unknown;
+      }) => {
+        const source = feedback?.source ?? JSON.stringify(
           [...continuation.current.values()].map((f) => ({
             path: f.path,
             sha256: f.contentHash,
@@ -1522,7 +1526,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           title: run.task.title,
           description: run.task.description,
           plan: plan.proposal ?? plan,
-          diagnostics: [],
+          diagnostics: feedback?.diagnostics ?? [],
           source,
           codingOutput: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
           reviewOutput: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 2048,
@@ -1567,10 +1571,40 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           continuing: { tokens: 0, steps: 0, tools: 0, timeMs: 0 },
           ...(replanBranch ? { replanning: replanBranch.required } : {}),
         });
+        const prices = this.environment.DEVFLOW_MODEL_PRICES_JSON
+          ? JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<string, ModelResourcePrice>
+          : {};
+        const pricedPlan = priceModelOperationPlan(codingContinuationOperationPlan({
+          finalModels: reserve.operationPlan,
+          validationAndFinalize: {
+            logicalToolCalls: frontier.sharedFinal.tools,
+            timeMs: 300_000 + reviewTimeReserve(this.environment, continuationRecoveryAvailable ? 0 : 2),
+          },
+          ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
+          submitCurrent: operation === "SUBMIT_CURRENT",
+        }), (id) => {
+          const stage = id.startsWith("review:") ? "REVIEW" : id.startsWith("planner:") ? "PLANNER" : "EXECUTE";
+          // Injected transports use the same explicit identity as bindStageModel.
+          // They must not resolve unrelated live credentials merely to quote a path.
+          if (stage === "REVIEW" ? this.reviewerFactory : this.modelFactory)
+            return prices["injected:injected"];
+          const actualStage = run.executionMode === "single" && stage !== "REVIEW" ? "EXECUTE" : stage;
+          const override = this.environment.stageModels?.[actualStage];
+          const provider = override?.provider ?? run.modelProvider ?? this.environment.LLM_PROVIDER;
+          const model = override?.model ?? run.modelName ?? this.environment.LLM_MODEL;
+          // A missing future binding remains UNPRICED; actual dispatch still validates
+          // its full configuration. Quotation never requires or reads its credential.
+          return provider && model ? prices[`${provider}:${model}`] : undefined;
+        });
+        const pricedEstimate = estimateOperationPlan(pricedPlan);
         return {
           ...frontier.required,
+          costMicros: pricedEstimate.resources.costMicros,
+          modelCalls: pricedEstimate.resources.modelCalls,
+          costStatus: pricedEstimate.unpricedOperationIds.length ? "UNPRICED" as const : "PRICED" as const,
           audit: {
             ...frontier,
+            pricedOperationPlan: pricedPlan,
             timeOperationPlan: codingTimePathPlan({
               sharedFinal: finalValidationReviewTimePlan(
                 this.environment,
@@ -2675,7 +2709,10 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
                   continuationToolCapacity(operation, true),
                 beforeToolAdmission: admitCodingEdit(true),
                 continuationReserve: (operation) => {
-                  const reserve = continuationReserve(operation);
+                  const reserve = continuationReserve(operation, {
+                    source: JSON.stringify(currentSources),
+                    diagnostics: stableTaskContext ?? additionalContext,
+                  });
                   return { ...reserve, tokens: Math.max(reserve.tokens, finalReviewTokens) };
                 },
                 // Same session: retain only the reachable continuation and final checks.

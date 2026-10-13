@@ -130,6 +130,9 @@ export interface AgentRunRequest {
     tokens: number;
     steps: number;
     timeMs: number;
+    costMicros?: number;
+    costStatus?: "PRICED" | "UNPRICED";
+    modelCalls?: number;
     /** Host-only projection provenance; never included in model messages or tool Schema. */
     audit?: unknown;
   };
@@ -1292,6 +1295,10 @@ export class DefaultAgentRuntime implements AgentRuntime {
                         steps: next.steps,
                         logicalToolCalls: request.continuationTools?.(budgetOperation()) ?? 0,
                         timeMs: next.timeMs,
+                        ...(next.costMicros === undefined ? {} : { costMicros: next.costMicros }),
+                        ...(next.costStatus === undefined ? {} : { costStatus: next.costStatus }),
+                        ...(next.modelCalls === undefined ? {} : { modelCalls: next.modelCalls }),
+                        ...(next.audit === undefined ? {} : { audit: next.audit }),
                       };
                     })(),
                   }

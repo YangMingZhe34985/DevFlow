@@ -12,6 +12,54 @@ import {
 describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
   "durable team transactions",
   () => {
+    it("persists the message correction credit and refuses to renew it across connections", async () =>
+      fixture(async (a, b, state, lease) => {
+        const granted = structuredClone(state);
+        granted.revision++;
+        granted.agents[0]!.messageRecovery = {
+          originOperationId: "decision-1:send",
+          sourceIdentity: "base",
+          issue: {
+            field: "replyTo",
+            expected: "messageId",
+            actual: "task-id",
+            reason: "TASK_ID_IN_MESSAGE_FIELD",
+            availableReplies: [],
+            guidance: "Omit replyTo for a new message.",
+          },
+        };
+        expect(await a.teams.compareAndSwap(state.runId, state.revision, granted, lease)).toBe(
+          true,
+        );
+        const reserved = (await b.teams.load(state.runId))!;
+        reserved.revision++;
+        reserved.agents[0]!.messageRecovery!.correctionOperationId = "decision-2";
+        expect(await b.teams.compareAndSwap(state.runId, granted.revision, reserved, lease)).toBe(
+          true,
+        );
+        for (const mutate of [
+          (s: TeamSnapshot) => {
+            delete s.agents[0]!.messageRecovery;
+          },
+          (s: TeamSnapshot) => {
+            delete s.agents[0]!.messageRecovery!.correctionOperationId;
+          },
+          (s: TeamSnapshot) => {
+            s.agents[0]!.messageRecovery!.originOperationId = "fresh-credit";
+          },
+        ]) {
+          const bad = structuredClone(reserved);
+          bad.revision++;
+          mutate(bad);
+          await expect(
+            a.teams.compareAndSwap(state.runId, reserved.revision, bad, lease),
+          ).rejects.toThrow("TEAM_MESSAGE_RECOVERY_CANNOT_REWIND");
+        }
+        expect((await a.teams.load(state.runId))!.agents[0]!.messageRecovery).toEqual(
+          reserved.agents[0]!.messageRecovery,
+        );
+        expect((await a.teams.load(state.runId))!.revision).toBe(reserved.revision);
+      }));
     it("fences inherited Coding artifacts and events after lease loss", async () =>
       fixture(async (a, b, state, lease) => {
         await databaseExecutionLease.run({ ...lease, runId: state.runId }, async () => {

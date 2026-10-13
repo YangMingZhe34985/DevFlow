@@ -34,7 +34,8 @@ import {
 import { type ResourceBudgetLedger } from "../runs/resource-budget-scheduler.js";
 import { localizationLease } from "../runs/localization-lease.js";
 import { recordModelResponse, recordStageStep, recordToolWork } from "../runs/workflow-metrics.js";
-import { TeamEngine, teamDigest, type TeamDecisionView } from "./engine.js";
+import { TeamEngine, teamDigest, teamDecisionView, type TeamDecisionView } from "./engine.js";
+import { estimatePlanRequest } from "../runs/plan-agent-context.js";
 import { teamBudgetStore } from "./budget-store.js";
 import { projectTeamRequest } from "./context.js";
 
@@ -213,8 +214,16 @@ export async function investigateWithTeam(input: {
     review: resolveStageModel("REVIEW", environment, run),
   };
   const downstreamId = "team:shared-downstream";
-  const reserveDownstream = async (_view: TeamDecisionView) => {
-    const allEvidence = (await store.load(run.id))!.evidence.filter((e) => e.valid);
+  const roleModel = (role: "COORDINATOR" | "INVESTIGATOR" | "SOLVER") =>
+    input.roleModelFactory?.(role === "SOLVER" ? "EXECUTE" : role) ??
+    input.modelFactory?.(run, input.parameters) ??
+    createConfiguredLanguageModel({
+      ...bindings[role === "INVESTIGATOR" ? "INVESTIGATOR" : "COORDINATOR"].config,
+      ...(input.parameters ? { parameters: input.parameters } : {}),
+    });
+  const reserveDownstream = async (view: TeamDecisionView) => {
+    const snapshot = (await store.load(run.id))!;
+    const allEvidence = snapshot.evidence.filter((e) => e.valid);
     const budget = localizationLease({
       dynamic: true,
       remainingTokens: 0,
@@ -239,19 +248,123 @@ export async function investigateWithTeam(input: {
         finalize: environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
       },
     });
-    const plan = priceModelOperationPlan(budget.downstreamOperationPlan, (id) => {
+    const downstream = priceModelOperationPlan(budget.downstreamOperationPlan, (id) => {
       const binding = downstreamBindings[id.split(":")[0] as keyof typeof downstreamBindings];
       return binding
         ? allPrices[`${binding.provenance.provider}:${binding.provenance.model}`]
         : undefined;
     });
+    // Investigation and its closing Coordinator decision are sequential. Protect that
+    // decision once for the Run; siblings share it instead of consuming its capacity.
+    // Coordinator dispatch transfers this capacity back to its actual request admission.
+    let plan = downstream;
+    if (view.role === "INVESTIGATOR") {
+      const coordinator = snapshot.agents.find((a) => a.role === "COORDINATOR")!;
+      const closingView = teamDecisionView(snapshot, coordinator.id, view.task);
+      const binding = bindings.COORDINATOR;
+      const raw = roleModel("COORDINATOR");
+      const configured: LanguageModelPort = {
+        prepareRequest: async (request, options) => {
+          request = { ...request, settings: { ...binding.settings, ...request.settings } };
+          return raw.prepareRequest ? raw.prepareRequest(request, options) : request;
+        },
+        generate: raw.generate.bind(raw),
+      };
+      const projection = await projectTeamRequest(closingView, configured, signal, {
+        bytes: binding.contextTokens * 3,
+        tokens: binding.contextTokens,
+        outputTokens: binding.settings.maxOutputTokens ?? 8192,
+      });
+      const closing = priceModelOperationPlan(
+        {
+          kind: "OPERATION",
+          id: "coordinator:closing-current-projection",
+          requirement: "REQUIRED",
+          state: "PENDING",
+          resources: {
+            inputTokens: estimatePlanRequest(projection.request).estimatedInputTokens,
+            outputTokens: binding.settings.maxOutputTokens ?? 8192,
+            modelCalls: 1,
+            steps: 1,
+            timeMs: environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
+          },
+          reason:
+            "Current Coordinator task/message/evidence projection; rechecked after new observations. Shared across investigators.",
+        },
+        () => allPrices[`${binding.provenance.provider}:${binding.provenance.model}`],
+      );
+      plan = {
+        kind: "SEQUENCE",
+        id: "team:closing-and-downstream",
+        operations: [closing, downstream],
+      };
+    }
     const reserved = await runtime.scheduler.replaceHold(downstreamId, plan);
+    await record({
+      budgetScheduler: {
+        action: "TEAM_DOWNSTREAM_QUOTE",
+        operationId: downstreamId,
+        role: view.role,
+        quote: reserved.quote,
+        requestIssued: false,
+      },
+    });
     if (!reserved.reserved)
       throw new DevflowError({
         code: "EXECUTION_BUDGET_EXCEEDED",
         message: "Run cannot fund investigation and required downstream work.",
         details: { requestIssued: false, quote: reserved.quote },
       });
+    if (view.role === "INVESTIGATOR") {
+      const available = await runtime.scheduler.quote({
+        kind: "OPERATION",
+        id: "team:available",
+        requirement: "REQUIRED",
+        state: "PENDING",
+        resources: {},
+      });
+      const binding = bindings.INVESTIGATOR;
+      const raw = roleModel("INVESTIGATOR");
+      const projection = await projectTeamRequest(
+        { ...view, resourceAvailability: available.remaining },
+        {
+          prepareRequest: async (request, options) => {
+            request = { ...request, settings: { ...binding.settings, ...request.settings } };
+            return raw.prepareRequest ? raw.prepareRequest(request, options) : request;
+          },
+          generate: raw.generate.bind(raw),
+        },
+        signal,
+        {
+          bytes: binding.contextTokens * 3,
+          tokens: binding.contextTokens,
+          outputTokens: binding.settings.maxOutputTokens ?? 8192,
+        },
+      );
+      // Detect a known-not-issued budget stop before marking the decision INFLIGHT,
+      // so the existing Coordinator can use its protected closing capacity.
+      await runtime.check(
+        priceModelOperationPlan(
+          {
+            kind: "OPERATION",
+            id: "investigator:current-projection",
+            requirement: "REQUIRED",
+            state: "PENDING",
+            resources: {
+              inputTokens: estimatePlanRequest(projection.request).estimatedInputTokens,
+              outputTokens: binding.settings.maxOutputTokens ?? 8192,
+              steps: 1,
+              modelCalls: 1,
+            // The elastic deadline is fitted atomically by model admission below.
+            // Reusing an earlier remaining-time sample here would already be stale
+            // after projection/DB IO, spuriously denying every shortened request.
+            },
+          },
+          () => allPrices[`${binding.provenance.provider}:${binding.provenance.model}`],
+        ),
+        "team:investigator-and-protected-closing",
+      );
+    }
   };
   const engine = new TeamEngine({
     store,
@@ -270,13 +383,7 @@ export async function investigateWithTeam(input: {
       view = { ...view, resourceAvailability: available.remaining };
       const role = view.role === "INVESTIGATOR" ? "INVESTIGATOR" : "COORDINATOR",
         binding = bindings[role];
-      const raw =
-        input.roleModelFactory?.(view.role === "SOLVER" ? "EXECUTE" : role) ??
-        input.modelFactory?.(run, input.parameters) ??
-        createConfiguredLanguageModel({
-          ...binding.config,
-          ...(input.parameters ? { parameters: input.parameters } : {}),
-        });
+      const raw = roleModel(view.role);
       let received: ModelResponse | undefined;
       const observed: LanguageModelPort = {
         ...(raw.prepareRequest ? { prepareRequest: raw.prepareRequest.bind(raw) } : {}),

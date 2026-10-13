@@ -13,6 +13,7 @@ import {
   type TeamLease,
   type TeamOperation,
   type TeamConfiguration,
+  type TeamMessageArgumentIssue,
 } from "@devflow/shared";
 
 export const teamDigest = (value: unknown) =>
@@ -45,6 +46,8 @@ export interface TeamDecisionView {
   feedback?: TeamSnapshot["feedback"];
   /** Host quote after shared downstream reservations; informative, never authorization. */
   resourceAvailability?: Record<string, number>;
+  /** Host rejection of a prior SEND; a correction still needs ordinary Run admission. */
+  messageValidationFeedback?: TeamAgent["messageRecovery"];
 }
 export interface TeamEnginePorts {
   store: TeamStore;
@@ -59,6 +62,66 @@ export interface TeamEnginePorts {
   /** Host verifies the immutable read-only dispatch group; this is not an Agent option. */
   parallelInvestigators?(group: string, execute: () => Promise<void>): Promise<void>;
   onChange?(snapshot: TeamSnapshot): Promise<void>;
+}
+
+/** A single view builder is used by actual dispatch and downstream closing quotes. */
+export function teamDecisionView(
+  state: TeamSnapshot,
+  agentId: string,
+  task: TeamDecisionView["task"],
+): TeamDecisionView {
+  const agent = state.agents.find((a) => a.id === agentId)!;
+  const assignments = state.tasks.filter(
+    (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+  );
+  const inbox = state.messages.filter(
+    (m) =>
+      m.to === agentId &&
+      m.sequence > agent.inboxCursor &&
+      m.sourceIdentity === state.sourceIdentity,
+  );
+  const counterevidence = state.messages.filter(
+    (m) => m.to === agentId && m.type === "CHALLENGE" && m.sourceIdentity === state.sourceIdentity,
+  );
+  const allowed = new Set([
+    ...agent.observedEvidenceIds,
+    ...(agent.acquiredEvidenceIds ?? []),
+    ...assignments.flatMap((t) => t.evidenceIds),
+    ...inbox.flatMap((m) => m.evidenceIds),
+    ...counterevidence.flatMap((m) => m.evidenceIds),
+  ]);
+  return {
+    runId: state.runId,
+    sourceIdentity: state.sourceIdentity,
+    agentId,
+    role: agent.role,
+    task,
+    assignments,
+    board: state.tasks.map((t) => ({
+      id: t.id,
+      agentId: t.agentId,
+      goal: t.goal,
+      status: t.status,
+      ...(t.sourceIdentity ? { sourceIdentity: t.sourceIdentity } : {}),
+      current: t.sourceIdentity === state.sourceIdentity,
+      ...(t.result ? { result: t.result } : {}),
+    })),
+    inbox,
+    counterevidence,
+    evidence: state.evidence.filter(
+      (e) => e.valid && (agent.role !== "INVESTIGATOR" || allowed.has(e.id)),
+    ),
+    history: agent.history,
+    limits: state.config,
+    ...(state.feedback ? { feedback: state.feedback } : {}),
+    ...(agent.messageRecovery &&
+    !agent.messageRecovery.resolved &&
+    (!agent.messageRecovery.correctionOperationId ||
+      agent.messageRecovery.correctionOperationId ===
+        `team:${agentId}:decision:${agent.decisionCount + 1}`)
+      ? { messageValidationFeedback: agent.messageRecovery }
+      : {}),
+  };
 }
 
 /** A bounded collaboration service inside the owning Run, not a second workflow engine. */
@@ -256,46 +319,8 @@ export class TeamEngine {
     const state = await this.load(runId);
     const agent = state.agents.find((a) => a.id === agentId)!;
     if (["CANCELLED", "BLOCKED"].includes(agent.status)) return;
-    const assignments = state.tasks.filter(
-      (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
-    );
-    const inbox = state.messages.filter((m) => m.to === agentId && m.sequence > agent.inboxCursor);
-    const counterevidence = state.messages.filter(
-      (m) =>
-        m.to === agentId && m.type === "CHALLENGE" && m.sourceIdentity === state.sourceIdentity,
-    );
-    const allowed = new Set([
-      ...agent.observedEvidenceIds,
-      ...(agent.acquiredEvidenceIds ?? []),
-      ...assignments.flatMap((t) => t.evidenceIds),
-      ...inbox.flatMap((m) => m.evidenceIds),
-      ...counterevidence.flatMap((m) => m.evidenceIds),
-    ]);
-    const view: TeamDecisionView = {
-      runId,
-      sourceIdentity: state.sourceIdentity,
-      agentId,
-      role: agent.role,
-      task,
-      assignments,
-      board: state.tasks.map((t) => ({
-        id: t.id,
-        agentId: t.agentId,
-        goal: t.goal,
-        status: t.status,
-        ...(t.sourceIdentity ? { sourceIdentity: t.sourceIdentity } : {}),
-        current: t.sourceIdentity === state.sourceIdentity,
-        ...(t.result ? { result: t.result } : {}),
-      })),
-      inbox,
-      counterevidence,
-      evidence: state.evidence.filter(
-        (e) => e.valid && (agent.role !== "INVESTIGATOR" || allowed.has(e.id)),
-      ),
-      history: agent.history,
-      limits: state.config,
-      ...(state.feedback ? { feedback: state.feedback } : {}),
-    };
+    const view = teamDecisionView(state, agentId, task);
+    const assignments = view.assignments;
     const id = `team:${agentId}:decision:${agent.decisionCount + 1}`;
     const operation: TeamOperation = {
       id,
@@ -309,11 +334,19 @@ export class TeamEngine {
     };
     await this.change(runId, (s) => {
       if (!s.operations.some((o) => o.id === id)) s.operations.push(operation);
+      const recovery = s.agents.find((a) => a.id === agentId)!.messageRecovery;
+      if (recovery && !recovery.resolved && !recovery.correctionOperationId)
+        recovery.correctionOperationId = id;
     });
     // A rejected quote has a durable known-not-issued result; no phantom inflight request.
     try {
       await this.ports.beforeDecision?.(view, operation);
     } catch (error) {
+      const investigationDenied =
+        agent.role === "INVESTIGATOR" &&
+        error instanceof DevflowError &&
+        error.code === "EXECUTION_BUDGET_EXCEEDED" &&
+        (error.details as { requestIssued?: boolean } | undefined)?.requestIssued === false;
       await this.change(runId, (s) => {
         const op = s.operations.find((o) => o.id === id)!;
         op.status = "NOT_ISSUED";
@@ -326,7 +359,19 @@ export class TeamEngine {
                 ...(error.details ? { details: error.details } : {}),
               }
             : { code: "HOST_ERROR", message: op.error };
+        if (investigationDenied) {
+          s.agents.find((a) => a.id === agentId)!.status = "BLOCKED";
+          for (const t of s.tasks.filter(
+            (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+          )) {
+            t.status = "BLOCKED";
+            t.reason = `BUDGET_STOP: ${op.error}`;
+          }
+        }
       });
+      // A known non-dispatch closes this assignment; the shared closing reservation
+      // lets Coordinator decide whether the already collected evidence is sufficient.
+      if (investigationDenied) return;
       await this.stop(runId, "BUDGET_STOP", [
         error instanceof Error ? error.message : String(error),
       ]);
@@ -349,6 +394,11 @@ export class TeamEngine {
       const notIssued =
         error instanceof DevflowError &&
         (error.details as { requestIssued?: boolean } | undefined)?.requestIssued === false;
+      const investigationDenied =
+        agent.role === "INVESTIGATOR" &&
+        notIssued &&
+        error instanceof DevflowError &&
+        error.code === "EXECUTION_BUDGET_EXCEEDED";
       await this.change(runId, (s) => {
         const op = s.operations.find((o) => o.id === id)!;
         op.status = notIssued ? "NOT_ISSUED" : "UNKNOWN";
@@ -358,7 +408,19 @@ export class TeamEngine {
           message: error instanceof Error ? error.message : String(error),
           ...(error instanceof DevflowError && error.details ? { details: error.details } : {}),
         };
+        if (investigationDenied) {
+          s.agents.find((a) => a.id === agentId)!.status = "BLOCKED";
+          for (const t of s.tasks.filter(
+            (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+          )) {
+            t.status = "BLOCKED";
+            t.reason = `BUDGET_STOP: ${op.failure.message}`;
+          }
+        }
       });
+      // A sibling can reserve between quote and actual admission. Preserve the
+      // failed decision attempt, but never turn a known non-dispatch into unknown work.
+      if (investigationDenied) return;
       throw error;
     }
     await this.change(runId, (s) => {
@@ -395,6 +457,8 @@ export class TeamEngine {
     const originalAcquired = new Set([...(operation.acquiredBefore ?? []), ...originalEvidence]);
     let state = await this.load(runId);
     let duplicateOnly = true;
+    let rejectedMessage = false;
+    let correctedMessage = false;
     for (let index = 0; index < decision.actions.length; index++) {
       state = await this.load(runId);
       if (state.status !== "RUNNING") break;
@@ -404,11 +468,68 @@ export class TeamEngine {
       const receipt = state.operations.find((o) => o.id === actionId);
       if (receipt?.status === "COMPLETED") {
         duplicateOnly = false;
+        if (action.type === "SEND") correctedMessage = true;
         continue;
+      }
+      if (receipt?.status === "NOT_ISSUED" && receipt.failure?.code === "VALIDATION_ERROR") {
+        rejectedMessage = true;
+        break;
       }
       if (state.agents.find((a) => a.id === agentId)!.seenActions.includes(actionKey)) continue;
       duplicateOnly = false;
-      await this.apply(runId, agentId, action, actionId, decision.summary);
+      try {
+        await this.apply(runId, agentId, action, actionId, decision.summary);
+      } catch (error) {
+        if (
+          !(error instanceof DevflowError) ||
+          error.code !== "VALIDATION_ERROR" ||
+          error.message !== "TEAM_REPLY_ID_INVALID"
+        )
+          throw error;
+        const issue = error.details as TeamMessageArgumentIssue;
+        await this.change(runId, (s) => {
+          if (s.operations.some((o) => o.id === actionId)) return;
+          const current = s.agents.find((a) => a.id === agentId)!;
+          const recoveryGranted = !current.messageRecovery;
+          if (recoveryGranted)
+            current.messageRecovery = {
+              originOperationId: actionId,
+              sourceIdentity: s.sourceIdentity,
+              issue,
+            };
+          s.operations.push({
+            id: actionId,
+            agentId,
+            kind: "CONTROL",
+            status: "NOT_ISSUED",
+            input: action,
+            failure: {
+              code: error.code,
+              message: error.message,
+              details: { ...issue, recoveryGranted },
+            },
+          });
+          if (!recoveryGranted) {
+            current.status = "BLOCKED";
+            for (const t of s.tasks.filter(
+              (t) => t.agentId === agentId && ["READY", "RUNNING"].includes(t.status),
+            )) {
+              t.status = "BLOCKED";
+              t.reason = "MESSAGE_CORRECTION_EXHAUSTED";
+            }
+            if (agentId === s.coordinatorId) {
+              s.status = "STOPPED";
+              s.stopReason = "MESSAGE_CORRECTION_EXHAUSTED";
+              s.missing.push(
+                `${error.message}: ${issue.field} must reference a current inbox message, or be omitted for a new message.`,
+              );
+            }
+          }
+        });
+        rejectedMessage = true;
+        break; // Do not let later actions hide the rejected SEND.
+      }
+      if (action.type === "SEND") correctedMessage = true;
       await this.change(runId, (s) => {
         s.agents.find((a) => a.id === agentId)!.seenActions.push(actionKey);
       });
@@ -451,12 +572,19 @@ export class TeamEngine {
       );
       current.observedEvidenceIds = observed;
       current.noProgress = progress || acquisitionProgress ? 0 : current.noProgress + 1;
+      const correcting = current.messageRecovery?.correctionOperationId === id;
+      const corrected = correcting && correctedMessage && !rejectedMessage;
+      if (correcting) current.messageRecovery!.resolved = corrected;
+      const correctionPending =
+        current.messageRecovery && !current.messageRecovery.correctionOperationId;
       current.inboxCursor = Math.max(current.inboxCursor, ...inbox.map((m) => m.sequence));
       // History records preserve a bounded view without recursively embedding its own history.
       current.history.push({ input: { ...view, history: undefined }, output: decision });
       if (current.status === "RUNNING") current.status = "READY";
       if (
         (duplicateOnly || current.noProgress >= 2) &&
+        !correctionPending &&
+        !corrected &&
         !["COMPLETED", "CANCELLED"].includes(current.status) &&
         s.status === "RUNNING"
       ) {
@@ -596,11 +724,59 @@ export class TeamEngine {
             (!manager && relatedTask.agentId !== agentId && relatedTask.agentId !== target.id)
           )
             fail("TEAM_MESSAGE_TARGET_INVALID");
+          if (!manager) {
+            const visible = new Set([
+              ...agent.observedEvidenceIds,
+              ...(agent.acquiredEvidenceIds ?? []),
+              ...s.tasks
+                .filter((t) => t.agentId === agentId && t.sourceIdentity === s.sourceIdentity)
+                .flatMap((t) => t.evidenceIds),
+              ...s.messages
+                .filter((m) => m.to === agentId && m.sourceIdentity === s.sourceIdentity)
+                .flatMap((m) => m.evidenceIds),
+            ]);
+            if (action.evidenceIds.some((id) => !visible.has(id)))
+              fail("TEAM_MESSAGE_EVIDENCE_NOT_VISIBLE");
+          }
           if (
-            action.replyTo &&
-            !s.messages.some((m) => m.id === action.replyTo && m.to === agentId)
+            target.status === "CANCELLED" ||
+            target.status === "BLOCKED" ||
+            relatedTask.sourceIdentity !== s.sourceIdentity ||
+            ["CANCELLED", "BLOCKED"].includes(relatedTask.status)
           )
-            fail("TEAM_REPLY_ID_INVALID");
+            fail("TEAM_MESSAGE_TARGET_UNAVAILABLE");
+          if (action.replyTo !== undefined) {
+            const reply = s.messages.find((m) => m.id === action.replyTo);
+            if (!reply) {
+              const issue: TeamMessageArgumentIssue = {
+                field: "replyTo",
+                expected: "messageId",
+                actual: action.replyTo,
+                reason: s.tasks.some((t) => t.id === action.replyTo)
+                  ? "TASK_ID_IN_MESSAGE_FIELD"
+                  : "MESSAGE_ID_NOT_FOUND",
+                availableReplies: s.messages
+                  .filter(
+                    (m) =>
+                      m.to === agentId &&
+                      m.from === target.id &&
+                      m.taskId === action.taskId &&
+                      m.sourceIdentity === s.sourceIdentity,
+                  )
+                  .map((m) => ({ messageId: m.id, fromAgentId: m.from, taskId: m.taskId })),
+                guidance:
+                  "For a new SEND omit replyTo. To reply, explicitly use an available messageId, its sender as toAgentId and its taskId. The host does not rewrite your parameters.",
+              };
+              throw new DevflowError({
+                code: "VALIDATION_ERROR",
+                message: "TEAM_REPLY_ID_INVALID",
+                details: issue,
+              });
+            }
+            if (reply.to !== agentId || reply.from !== target.id || reply.taskId !== action.taskId)
+              fail("TEAM_REPLY_AUTHORIZATION_DENIED");
+            if (reply.sourceIdentity !== s.sourceIdentity) fail("TEAM_REPLY_SOURCE_STALE");
+          }
           s.messages.push({
             id: randomUUID(),
             sequence: s.messages.length + 1,

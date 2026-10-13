@@ -226,5 +226,17 @@ function validateTransition(old: TeamSnapshot | undefined, next: TeamSnapshot): 
       current.history.length < agent.history.length
     )
       conflict("TEAM_SESSION_CANNOT_REWIND");
+    if (
+      agent.messageRecovery &&
+      (!current.messageRecovery ||
+        current.messageRecovery.originOperationId !== agent.messageRecovery.originOperationId ||
+        current.messageRecovery.sourceIdentity !== agent.messageRecovery.sourceIdentity ||
+        digest(current.messageRecovery.issue) !== digest(agent.messageRecovery.issue) ||
+        (agent.messageRecovery.correctionOperationId &&
+          current.messageRecovery.correctionOperationId !==
+            agent.messageRecovery.correctionOperationId) ||
+        (agent.messageRecovery.resolved && !current.messageRecovery.resolved))
+    )
+      conflict("TEAM_MESSAGE_RECOVERY_CANNOT_REWIND");
   }
 }

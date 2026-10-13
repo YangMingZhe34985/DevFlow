@@ -7,6 +7,7 @@ export const TeamConfigurationSchema = z.strictObject({
   maxInvestigators: z.number().int().min(1).max(4).default(4),
   maxTasks: z.number().int().min(1).max(12).default(12),
   maxMessages: z.number().int().min(1).max(64).default(64),
+  diagnosticsEnabled: z.boolean().optional(),
 });
 export type TeamConfiguration = z.infer<typeof TeamConfigurationSchema>;
 export const TeamMessageTypeSchema = z.enum([
@@ -30,12 +31,17 @@ export const TeamActionSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("SEND"),
-    toAgentId: z.string().min(1),
-    taskId: z.string().min(1),
+    toAgentId: z.string().min(1).describe("Recipient Agent ID from the task board."),
+    taskId: z.string().min(1).describe("Related task ID from the task board, not a message ID."),
     messageType: TeamMessageTypeSchema,
     body: text,
     evidenceIds: refs,
-    replyTo: z.string().optional(),
+    replyTo: z
+      .string()
+      .optional()
+      .describe(
+        "Optional message ID from your inbox: reply to its sender about the same task and current source view. Omit for a new message; never use a task ID here.",
+      ),
   }),
   z.strictObject({ type: z.literal("CANCEL"), taskId: z.string(), reason: text }),
   z.strictObject({
@@ -115,6 +121,22 @@ export interface TeamAgent {
   seenActions: string[];
   observedEvidenceIds: string[];
   acquiredEvidenceIds?: string[];
+  /** One argument correction per Session; persisted across handoff, restart and source changes. */
+  messageRecovery?: {
+    originOperationId: string;
+    sourceIdentity: string;
+    issue: TeamMessageArgumentIssue;
+    correctionOperationId?: string;
+    resolved?: boolean;
+  };
+}
+export interface TeamMessageArgumentIssue {
+  field: "replyTo";
+  expected: "messageId";
+  actual: string;
+  reason: "TASK_ID_IN_MESSAGE_FIELD" | "MESSAGE_ID_NOT_FOUND";
+  availableReplies: { messageId: string; fromAgentId: string; taskId: string }[];
+  guidance: string;
 }
 export interface TeamTask {
   id: string;

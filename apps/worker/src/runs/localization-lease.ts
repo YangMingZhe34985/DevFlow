@@ -93,7 +93,10 @@ export function localizationLease(input: {
       ...(input.dynamic && input.deadlines
         ? {
             timeMs: id.startsWith("planner:")
-              ? input.deadlines.planner
+              ? // PlanAgent owns one absolute phase deadline, including output recovery.
+                id === "planner:existing-recovery"
+                ? 0
+                : input.deadlines.planner
               : id.startsWith("coding:")
                 ? input.deadlines.coding
                 : 0,

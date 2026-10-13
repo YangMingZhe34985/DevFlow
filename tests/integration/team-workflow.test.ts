@@ -172,8 +172,8 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
             DEVFLOW_TEAM_ENABLED: "true",
             DEVFLOW_MAX_TOTAL_TOKENS: "320000",
             DEVFLOW_MAX_TOOL_CALLS: "75",
-            // Deliberately below downstream 1260s + configured 180s. The current
-            // request must use a real shorter deadline, not discard future work.
+            // 1080s downstream + one shared 180s Coordinator closing request leaves
+            // less than 180s for investigators; their actual deadline must be fitted.
             DEVFLOW_TIMEOUT_MS: "1400000",
             DEVFLOW_MAX_COST_MICROS: "4000000",
             DEVFLOW_MODEL_PRICES_JSON: JSON.stringify({
@@ -248,11 +248,11 @@ describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
           };
           expect(ledger.consumed.modelCalls).toBe(requests.length);
           expect(ledger.reservations["team:shared-downstream"]?.status).toBe("RELEASED");
-          const firstDecision = state.operations.find((op) => op.kind === "MODEL")!;
-          expect(ledger.reservations[firstDecision.id]?.quote.resources.timeMs).toBeLessThan(
+          const investigatorDecision = state.operations.find((op) => op.kind === "MODEL" && op.agentId !== state.coordinatorId)!;
+          expect(ledger.reservations[investigatorDecision.id]?.quote.resources.timeMs).toBeLessThan(
             180000,
           );
-          expect(ledger.reservations[firstDecision.id]?.executionDeadlineAt).toBeTypeOf("number");
+          expect(ledger.reservations[investigatorDecision.id]?.executionDeadlineAt).toBeTypeOf("number");
           const durable = (await database.budgetLedgers.get(run!.id))!.value as {
             reservations: Record<string, { quote: { dispatchGroup?: string } }>;
             violations: unknown[];

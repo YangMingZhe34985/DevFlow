@@ -66,6 +66,46 @@ it("keeps complete counterevidence after inbox consumption and records actual om
   expect(projected.omitted).toContain("background");
   expect(JSON.stringify(projected.request.messages)).toContain("assert(value === expected)");
 });
+it("keeps field correction feedback visible after trimming history and distinguishes message IDs from task IDs", async () => {
+  const input = view();
+  input.messageValidationFeedback = {
+    originOperationId: "send-1",
+    sourceIdentity: "base",
+    issue: {
+      field: "replyTo",
+      expected: "messageId",
+      actual: "task-id",
+      reason: "TASK_ID_IN_MESSAGE_FIELD",
+      availableReplies: [],
+      guidance: "Omit replyTo to start a new message.",
+    },
+  };
+  input.history = [
+    {
+      input: {},
+      output: {
+        summary: "old output".repeat(500),
+        actions: [{ type: "STOP", reason: "STALLED", missing: [] }],
+      },
+    },
+  ];
+  const projected = await projectTeamRequest(
+    input,
+    {
+      generate: async () => {
+        throw new Error("must not dispatch");
+      },
+    },
+    AbortSignal.timeout(1000),
+    { bytes: 8000, tokens: 8000, outputTokens: 1000 },
+  );
+  const user = JSON.parse(
+    projected.request.messages.find((m) => m.role === "USER")!.content as string,
+  );
+  expect(user.messageValidationFeedback).toEqual(input.messageValidationFeedback);
+  expect(user.history).toEqual([]);
+  expect(projected.request.messages[0]!.content).toContain("never a task ID");
+});
 it("blocks when mandatory evidence cannot fit and does not treat configuration errors as capacity", async () => {
   const model = {
     generate: async () => {

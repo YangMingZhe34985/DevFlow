@@ -313,10 +313,14 @@ export class ResourceBudgetRuntime {
           costMicros: modelCost(options.price, inputTokens, outputTokens),
         };
         if (request.resourceContinuation) {
-          const { costStatus, audit, ...continuation } = request.resourceContinuation;
-          const futureTokens = continuation.tokens ?? 0;
+          const { costStatus, audit, sameModelRecovery, ...continuation } =
+            request.resourceContinuation;
+          const recoveryTokens = sameModelRecovery
+            ? sameModelRecovery.inputTokens + sameModelRecovery.outputTokens
+            : 0;
+          const futureTokens = Math.max(0, (continuation.tokens ?? 0) - recoveryTokens);
           const futurePriced =
-            costStatus === "UNPRICED"
+            costStatus === "UNPRICED" || (sameModelRecovery !== undefined && !options.price)
               ? false
               : costStatus === "PRICED" ||
                 futureTokens === 0 ||
@@ -331,6 +335,14 @@ export class ResourceBudgetRuntime {
             continuation.costMicros = Math.ceil(
               (futureTokens * options.continuationMicrosPerMillionTokens) / 1_000_000,
             );
+          if (sameModelRecovery)
+            continuation.costMicros =
+              (continuation.costMicros ?? 0) +
+              modelCost(
+                options.price,
+                sameModelRecovery.inputTokens,
+                sameModelRecovery.outputTokens,
+              );
           if (audit !== undefined)
             await this.record({
               budgetScheduler: {

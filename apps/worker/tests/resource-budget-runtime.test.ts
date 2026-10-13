@@ -25,6 +25,66 @@ import {
 
 const signal = () => new AbortController().signal;
 
+it("prices Planner continuation and its recovery at separate bindings without charging reservations", async () => {
+  const { runtime, scheduler } = await fixture({ costMicros: 800 });
+  const raw = new FakeLanguageModel([
+    fakeModelResponse({
+      text: "done",
+      toolCalls: [],
+      usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+    }),
+  ]);
+  const model = runtime.model(raw, {
+    stage: "PLANNER",
+    outputTokens: 100,
+    timeoutMs: 100,
+    price: { inputMicrosPerMillionTokens: 1000000, outputMicrosPerMillionTokens: 2000000 },
+    continuationMicrosPerMillionTokens: 99000000,
+  });
+  const request: ModelRequest = {
+    messages: [{ role: "USER", content: "task" }],
+    tools: [],
+    resourceContinuation: {
+      tokens: 200,
+      modelCalls: 2,
+      costMicros: 200,
+      costStatus: "PRICED",
+      sameModelRecovery: { inputTokens: 80, outputTokens: 20 },
+    },
+  };
+  await model.generate(request, { signal: signal() });
+  expect(raw.requests).toHaveLength(1);
+  expect((await scheduler.snapshot()).consumed.costMicros).toBe(14);
+});
+
+it("an unknown recovery price cannot inherit priced downstream status or dispatch", async () => {
+  const { runtime } = await fixture({ costMicros: 1000000 });
+  const raw = new FakeLanguageModel([]);
+  await expect(
+    runtime
+      .model(raw, {
+        stage: "PLANNER",
+        outputTokens: 100,
+        timeoutMs: 100,
+        continuationMicrosPerMillionTokens: 1,
+      })
+      .generate(
+        {
+          messages: [],
+          tools: [],
+          resourceContinuation: {
+            tokens: 100,
+            costStatus: "PRICED",
+            costMicros: 0,
+            sameModelRecovery: { inputTokens: 80, outputTokens: 20 },
+          },
+        },
+        { signal: signal() },
+      ),
+  ).rejects.toMatchObject({ code: "EXECUTION_BUDGET_EXCEEDED" });
+  expect(raw.requests).toHaveLength(0);
+});
+
 it("passes an admitted shorter deadline to the actual transport without shrinking output or future holds", async () => {
   const startedAt = Date.now();
   const scheduler = await ResourceBudgetScheduler.open({

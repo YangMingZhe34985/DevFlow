@@ -968,6 +968,22 @@ class PlanSession {
               ...request.resourceContinuation,
               tokens: (request.resourceContinuation?.tokens ?? 0) + reserveTokens,
               modelCalls: (request.resourceContinuation?.modelCalls ?? 0) + reserveCalls,
+              ...(reserveCalls > 0
+                ? {
+                    sameModelRecovery: {
+                      inputTokens:
+                        reserveTokens -
+                        Math.max(
+                          this.limits.finalOutputTokens,
+                          this.limits.formatRepairOutputTokens,
+                        ),
+                      outputTokens: Math.max(
+                        this.limits.finalOutputTokens,
+                        this.limits.formatRepairOutputTokens,
+                      ),
+                    },
+                  }
+                : {}),
             },
           },
           { signal: this.signal },

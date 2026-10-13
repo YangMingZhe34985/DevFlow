@@ -168,6 +168,7 @@ export function localizationLease(input: {
     planner,
     execute,
     continuation,
+    codingOperationPlan: codingOperations,
     serializedInput,
     growthAllowance,
     desired,

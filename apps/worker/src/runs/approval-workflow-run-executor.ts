@@ -21,6 +21,7 @@ import {
   ResourceBudgetScheduler,
   estimateOperationPlan,
   type ResourceBudgetLedger,
+  type ResourceBudgetOperationPlan,
 } from "./resource-budget-scheduler.js";
 import {
   ResourceBudgetRuntime,
@@ -670,29 +671,31 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         },
         metrics,
       );
-      const localizationBudget = localizationLease({
-        dynamic: dynamicLocalization,
-        deadlines: {
-          planner: this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
-          coding: 60000,
-          validation: Math.min(planTiming.timeoutMs, 300000),
-          review: this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS,
-          recovery: this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS,
-          finalize: this.environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
-        },
-        remainingTokens: planBudget.remainingTotalTokens(metrics),
-        title: run.task.title,
-        description: run.task.description,
-        evidence: planningEvidence.evidence,
-        outputs: {
-          localization:
-            this.modelBindings.get(localizationModel)?.settings?.maxOutputTokens ?? 4096,
-          planner: this.modelBindings.get(model)?.settings?.maxOutputTokens ?? 4096,
-          execute: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
-          repair: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
-          review: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 4096,
-        },
-      });
+      const currentLocalizationLease = () =>
+        localizationLease({
+          dynamic: dynamicLocalization,
+          deadlines: {
+            planner: this.environment.DEVFLOW_PLAN_AGENT_TIMEOUT_MS ?? 120000,
+            coding: 60000,
+            validation: Math.min(planTiming.timeoutMs, 300000),
+            review: this.environment.DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS,
+            recovery: this.environment.DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS,
+            finalize: this.environment.DEVFLOW_FINALIZE_TIMEOUT_MS,
+          },
+          remainingTokens: planBudget!.remainingTotalTokens(metrics),
+          title: run.task.title,
+          description: run.task.description,
+          evidence: planningEvidence.evidence,
+          outputs: {
+            localization:
+              this.modelBindings.get(localizationModel)?.settings?.maxOutputTokens ?? 4096,
+            planner: this.modelBindings.get(model)?.settings?.maxOutputTokens ?? 4096,
+            execute: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+            repair: this.environment.stageModels?.EXECUTE?.maxOutputTokens ?? 8192,
+            review: this.environment.stageModels?.REVIEW?.maxOutputTokens ?? 4096,
+          },
+        });
+      const localizationBudget = currentLocalizationLease();
       const issueLocalization = await (async () => {
         if (run.executionMode && run.executionMode !== "workflow") {
           planningEvidence = await investigateWithTeam({
@@ -1014,9 +1017,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
         "onRequest" | "onResponse" | "onGenerationError"
       > = {
         onRequest: async ({ purpose, formatRepair, request }) => {
-          request.resourceContinuation = {
-            tokens: localizationBudget.execute + localizationBudget.continuation.total,
-          };
+          const current = currentLocalizationLease();
+          request.resourceContinuation = this.priceContinuation(run, {
+            kind: "SEQUENCE",
+            id: "planner:downstream",
+            operations: [current.codingOperationPlan, current.continuation.operationPlan],
+          });
           planBudget?.assertWithinLimits("PLAN", metrics);
           ensureStructuredStepCapacity(metrics, "PLAN");
           planBudget?.requireAgentSteps("PLAN");
@@ -1591,13 +1597,8 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
           continuing: { tokens: 0, steps: 0, tools: 0, timeMs: 0 },
           ...(replanBranch ? { replanning: replanBranch.required } : {}),
         });
-        const prices = this.environment.DEVFLOW_MODEL_PRICES_JSON
-          ? (JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<
-              string,
-              ModelResourcePrice
-            >)
-          : {};
-        const pricedPlan = priceModelOperationPlan(
+        const priced = this.priceContinuation(
+          run,
           codingContinuationOperationPlan({
             finalModels: reserve.operationPlan,
             validationAndFinalize: {
@@ -1609,38 +1610,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             ...(replanBranch ? { replan: replanBranch.operationPlan } : {}),
             submitCurrent: operation === "SUBMIT_CURRENT",
           }),
-          (id) => {
-            const stage = id.startsWith("review:")
-              ? "REVIEW"
-              : id.startsWith("planner:")
-                ? "PLANNER"
-                : "EXECUTE";
-            // Injected transports use the same explicit identity as bindStageModel.
-            // They must not resolve unrelated live credentials merely to quote a path.
-            if (stage === "REVIEW" ? this.reviewerFactory : this.modelFactory)
-              return prices["injected:injected"];
-            const actualStage =
-              run.executionMode === "single" && stage !== "REVIEW" ? "EXECUTE" : stage;
-            const override = this.environment.stageModels?.[actualStage];
-            const provider =
-              override?.provider ?? run.modelProvider ?? this.environment.LLM_PROVIDER;
-            const model = override?.model ?? run.modelName ?? this.environment.LLM_MODEL;
-            // A missing future binding remains UNPRICED; actual dispatch still validates
-            // its full configuration. Quotation never requires or reads its credential.
-            return provider && model ? prices[`${provider}:${model}`] : undefined;
-          },
         );
-        const pricedEstimate = estimateOperationPlan(pricedPlan);
         return {
           ...frontier.required,
-          costMicros: pricedEstimate.resources.costMicros,
-          modelCalls: pricedEstimate.resources.modelCalls,
-          costStatus: pricedEstimate.unpricedOperationIds.length
-            ? ("UNPRICED" as const)
-            : ("PRICED" as const),
+          costMicros: priced.costMicros,
+          modelCalls: priced.modelCalls,
+          costStatus: priced.costStatus,
           audit: {
             ...frontier,
-            pricedOperationPlan: pricedPlan,
+            pricedOperationPlan: priced.audit,
             timeOperationPlan: codingTimePathPlan({
               sharedFinal: finalValidationReviewTimePlan(
                 this.environment,
@@ -3732,7 +3710,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             };
           },
           onRequest: async ({ purpose, formatRepair, preflight, request }) => {
-            request.resourceContinuation = { tokens: downstreamTokens };
+            request.resourceContinuation = this.priceContinuation(run, reserve.operationPlan);
             budget.requireAgentSteps("PLAN");
             budget.requireModelCall("PLAN", metrics);
             if (budget.remainingTotalTokens(metrics) < preflight.requiredTokens + downstreamTokens)
@@ -6923,6 +6901,15 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
             steps: requiredSteps - 1,
             modelCalls: requiredSteps - 1,
             timeMs: reservedTimeMs,
+            costStatus: "PRICED",
+            ...(reservedTokens > 0
+              ? {
+                  sameModelRecovery: {
+                    inputTokens: Math.max(0, reservedTokens - outputCap),
+                    outputTokens: outputCap,
+                  },
+                }
+              : {}),
           };
           const requiredTimeMs = requestTimeoutMs + reservedTimeMs;
           const remainingTimeMs = budget.remainingTimeMs;
@@ -7254,6 +7241,43 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       this.modelBindings.get(model)?.settings?.maxOutputTokens ??
       this.environment.stageModels?.PLANNER?.maxOutputTokens;
     return cap === undefined ? {} : { finalOutputTokens: cap };
+  }
+
+  private priceContinuation(run: RunExecutionRecord, plan: ResourceBudgetOperationPlan) {
+    const prices = this.environment.DEVFLOW_MODEL_PRICES_JSON
+      ? (JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON) as Record<
+          string,
+          ModelResourcePrice
+        >)
+      : {};
+    const pricedPlan = priceModelOperationPlan(plan, (id) => {
+      const stage = id.startsWith("review:")
+        ? "REVIEW"
+        : id.startsWith("planner:")
+          ? "PLANNER"
+          : "EXECUTE";
+      // Injected transports use the same explicit identity as bindStageModel.
+      // They must not resolve unrelated live credentials merely to quote a path.
+      if (stage === "REVIEW" ? this.reviewerFactory : this.modelFactory)
+        return prices["injected:injected"];
+      const actualStage = run.executionMode === "single" && stage !== "REVIEW" ? "EXECUTE" : stage;
+      const override = this.environment.stageModels?.[actualStage];
+      const provider = override?.provider ?? run.modelProvider ?? this.environment.LLM_PROVIDER;
+      const model = override?.model ?? run.modelName ?? this.environment.LLM_MODEL;
+      // A missing future binding remains UNPRICED; actual dispatch still validates
+      // its full configuration. Quotation never requires or reads its credential.
+      return provider && model ? prices[`${provider}:${model}`] : undefined;
+    });
+    const estimate = estimateOperationPlan(pricedPlan);
+    return {
+      tokens: estimate.resources.tokens,
+      modelCalls: estimate.resources.modelCalls,
+      costMicros: estimate.resources.costMicros,
+      costStatus: estimate.unpricedOperationIds.length
+        ? ("UNPRICED" as const)
+        : ("PRICED" as const),
+      audit: pricedPlan,
+    };
   }
 
   private bindStageModel(

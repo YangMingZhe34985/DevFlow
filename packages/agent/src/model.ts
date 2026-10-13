@@ -73,6 +73,8 @@ export interface ModelRequest {
     costMicros?: number;
     /** Explicit host pricing result. Unknown prices must not fall back to a free request. */
     costStatus?: "PRICED" | "UNPRICED";
+    /** Included in tokens/modelCalls, but priced separately at this request's binding. */
+    sameModelRecovery?: { inputTokens: number; outputTokens: number };
     /** Persisted quote provenance only; never sent to the Provider. */
     audit?: unknown;
   };

@@ -35,13 +35,8 @@ import { prepareGitHubPushApproval, requireFullCommit } from "../runs/github-del
 import { ensureLocalRunSnapshot } from "../runs/local-run-snapshot.js";
 import { discoverPublicVerification } from "../runs/public-verification.js";
 import type { RunExecutionOutcome, RunExecutionPort } from "../runs/run-execution.js";
-import {
-  exportWorkspacePatch,
-  readHead,
-  runAutonomousSolve,
-  type PublicCheck,
-  type SolveResult,
-} from "./solve.js";
+import { exportWorkspacePatch, readHead, type PublicCheck, type SolveResult } from "./solve.js";
+import { runAttempts, type AttemptResult, type AttemptsResult } from "./attempts.js";
 
 const PROJECT_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 export const AUTONOMOUS_CHECKPOINT_ARTIFACT = "autonomous-checkpoint.json";
@@ -58,6 +53,7 @@ export interface AutonomousModel {
 export interface AutonomousRunExecutorOptions {
   /** Test seam; production uses the configured EXECUTE stage binding. */
   modelFactory?: (run: RunExecutionRecord) => AutonomousModel;
+  reviewModelFactory?: (run: RunExecutionRecord) => AutonomousModel;
   /** Test seam; production creates a lease-fenced Docker sandbox. */
   sandboxFactory?: (run: RunExecutionRecord, signal: AbortSignal) => Promise<SandboxSession>;
 }
@@ -69,6 +65,8 @@ interface Checkpoint {
   messages: ModelMessage[];
   /** Workspace diff at the checkpoint, applied to a fresh sandbox on resume. */
   patch: string;
+  attempt?: number;
+  revisions?: number;
 }
 
 /**
@@ -88,8 +86,22 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     const startedAt = run.startedAt ? Date.parse(run.startedAt) : started;
     const deadlineAt = startedAt + this.environment.DEVFLOW_TIMEOUT_MS;
     const binding = this.model(run);
+    const reviewer =
+      this.environment.DEVFLOW_AUTONOMOUS_REVIEW === "1" ? this.model(run, "REVIEW") : undefined;
     const prior = await this.priorUsage(run.id);
-    const checkpoint = await this.loadCheckpoint(run.id, binding.bindingHash);
+    const bindingHash = reviewer
+      ? `${binding.bindingHash}:${reviewer.bindingHash}`
+      : binding.bindingHash;
+    const checkpoint = await this.loadCheckpoint(run.id, bindingHash);
+    const completedRecords = (await this.database.artifacts.list(run.id))
+      .filter((a) => /^autonomous-transcript-attempt-\d+\.json$/u.test(a.name) && a.content)
+      .map((a) => JSON.parse(a.content!) as AttemptResult)
+      .sort((a, b) => a.attempt - b.attempt);
+    const completed = [
+      ...new Map(completedRecords.map((result) => [result.attempt, result])).values(),
+    ];
+    const currentAttempt = Math.max(checkpoint?.attempt ?? 1, (completed.at(-1)?.attempt ?? 0) + 1);
+    let attempt = currentAttempt;
     const metrics = emptyMetrics();
     await this.database.runs.transition({
       runId: run.id,
@@ -103,11 +115,13 @@ export class AutonomousRunExecutor implements RunExecutionPort {
       }),
     });
     let sandbox: SandboxSession | undefined;
+    const sandboxes = new Map<number, SandboxSession>();
     try {
       sandbox = await (this.options.sandboxFactory ?? ((r, s) => this.createSandbox(r, s)))(
         run,
         signal,
       );
+      sandboxes.set(currentAttempt, sandbox);
       const benchmark = await prepareBenchmarkEvaluation(this.database, run, sandbox, signal);
       const profile =
         benchmark?.configuration.runtime.publicVerificationProfile ??
@@ -118,15 +132,59 @@ export class AutonomousRunExecutor implements RunExecutionPort {
           ? `${path} is protected (${benchmark ? "it grades the fix" : "repository plumbing"}); change other files instead. Put scratch scripts in /tmp.`
           : undefined;
       const baseCommit = await readHead(sandbox, signal);
-      const resume = await this.restore(run.id, sandbox, checkpoint, prior, signal);
-      const solve = await runAutonomousSolve({
-        sandbox,
+      const activeCheckpoint =
+        (checkpoint?.attempt ?? 1) === currentAttempt ? checkpoint : undefined;
+      const resume = await this.restore(run.id, sandbox, activeCheckpoint, prior, signal);
+      let attemptState: KernelResume = resume ?? {
+        messages: [],
+        usage: prior.usage,
+        turns: prior.turns,
+      };
+      const attempts = await runAttempts({
+        onAttemptStarted: (number, state) => {
+          attempt = number;
+          attemptState = state!;
+        },
+        sandboxFactory: async (number) => {
+          attempt = number;
+          if (sandboxes.has(number)) return sandboxes.get(number)!;
+          const fresh = await (this.options.sandboxFactory ?? ((r, s) => this.createSandbox(r, s)))(
+            run,
+            signal,
+          );
+          sandboxes.set(number, fresh);
+          await prepareBenchmarkEvaluation(this.database, run, fresh, signal);
+          await this.saveCheckpoint(
+            run.id,
+            fresh,
+            baseCommit,
+            bindingHash,
+            attemptState,
+            signal,
+            number,
+            0,
+          );
+          return fresh;
+        },
+        completed,
+        currentAttempt,
+        maxAttempts: this.environment.DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS,
+        resumeRevisions: activeCheckpoint?.revisions ?? 0,
         baseCommit,
         issue: { title: run.task.title, body: run.task.description },
         checks: profile.checks as PublicCheck[],
         model: binding.model,
         settings: binding.settings,
         ...(binding.price ? { price: binding.price } : {}),
+        ...(reviewer
+          ? {
+              review: {
+                ...reviewer,
+                maxTurns: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS,
+                reserve: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_RESERVE,
+              },
+            }
+          : {}),
         limits: {
           maxTurns: this.environment.DEVFLOW_AUTONOMOUS_MAX_TURNS,
           ...(this.environment.DEVFLOW_MAX_COST_MICROS === undefined
@@ -141,10 +199,54 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         ...(resume ? { resume } : {}),
         signal,
         onEvent: (event) => this.recordKernelEvent(run.id, event, metrics),
-        onTurnEnd: (state) =>
-          state.turns % this.environment.DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS === 0
-            ? this.saveCheckpoint(run.id, sandbox!, baseCommit, binding.bindingHash, state, signal)
-            : undefined,
+        onTurnEnd: (state, revisions) => {
+          attemptState = state;
+          const last = state.messages.at(-1);
+          return state.turns % this.environment.DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS === 0 ||
+            last?.role === "USER" ||
+            (last?.role === "TOOL" && last.toolName === "submit")
+            ? this.saveCheckpoint(
+                run.id,
+                sandboxes.get(attempt)!,
+                baseCommit,
+                bindingHash,
+                state,
+                signal,
+                attempt,
+                revisions,
+              )
+            : undefined;
+        },
+        onReview: async (outcome) => {
+          await this.append(run.id, outcome ? "REVIEW_RESULT" : "REVIEW_STARTED", {
+            attempt,
+            ...(outcome ?? { verdict: null, findings: [], usage: attemptState.usage }),
+          });
+          if (outcome)
+            await this.database.artifacts.create({
+              runId: run.id,
+              kind: "REVIEW_REPORT",
+              name: `autonomous-review-attempt-${attempt}.json`,
+              mimeType: "application/json",
+              content: JSON.stringify(outcome),
+            });
+        },
+        onAttemptComplete: async (result) => {
+          await this.database.artifacts.create({
+            runId: run.id,
+            kind: "OTHER",
+            name: `autonomous-transcript-attempt-${result.attempt}.json`,
+            mimeType: "application/json",
+            content: JSON.stringify(result),
+          });
+          await this.append(run.id, "WORKFLOW_CHECKPOINT", {
+            attempt: result.attempt,
+            outcome: {
+              hostPassed: result.solve.verification?.passed ?? false,
+              review: result.solve.review?.verdict ?? null,
+            },
+          });
+        },
         onVerification: async (verification, revision) => {
           await this.append(run.id, "TEST_RESULT", {
             revision,
@@ -157,14 +259,36 @@ export class AutonomousRunExecutor implements RunExecutionPort {
           });
         },
       });
+      const solve = attempts.selected;
+      // Earlier candidates restored from artifacts need a clean workspace for GitHub delivery.
+      let selectedSandbox = sandboxes.get(attempts.selectedAttempt);
+      if (!selectedSandbox) {
+        selectedSandbox = await (
+          this.options.sandboxFactory ?? ((r, s) => this.createSandbox(r, s))
+        )(run, signal);
+        sandboxes.set(attempts.selectedAttempt, selectedSandbox);
+        const applied = await selectedSandbox.exec(
+          {
+            program: "git",
+            args: ["apply", "--binary", "-"],
+            stdin: solve.patch,
+            timeoutMs: 60_000,
+            maxOutputBytes: 100_000,
+          },
+          signal,
+        );
+        if (applied.exitCode !== 0)
+          throw new Error("Cannot restore selected candidate for delivery.");
+      }
       return await this.finish(
         run,
-        sandbox,
+        selectedSandbox,
         solve,
         metrics,
         started,
         profile.checks.length,
         signal,
+        attempts,
       );
     } catch (error) {
       metrics.durationMs = Date.now() - started;
@@ -183,7 +307,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         error: normalized.toJSON(),
       };
     } finally {
-      await sandbox?.dispose().catch(() => undefined);
+      for (const session of sandboxes.values()) await session.dispose().catch(() => undefined);
     }
   }
 
@@ -195,11 +319,12 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     started: number,
     configuredChecks: number,
     signal: AbortSignal,
+    attempts: AttemptsResult,
   ): Promise<RunExecutionOutcome> {
-    const usage = solve.kernel.usage;
+    const usage = attempts.usage;
     Object.assign(metrics, {
       durationMs: Date.now() - started,
-      steps: solve.kernel.turns,
+      steps: attempts.turns,
       modelCalls: usage.modelCalls,
       reasoningTokens: usage.reasoningTokens,
       tokenUsage: {
@@ -220,6 +345,9 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         stopReason: solve.kernel.stopReason,
         summary: solve.kernel.summary ?? null,
         revisions: solve.revisions,
+        selectedAttempt: attempts.selectedAttempt,
+        attempts: attempts.attempts.length,
+        review: solve.review,
         usage,
         messages: solve.kernel.messages,
       }),
@@ -233,7 +361,11 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         mimeType: "application/json",
         content: JSON.stringify(verification, null, 2),
       });
-    const passed = verification?.passed === true;
+    const passed = verification?.passed === true && solve.review?.verdict !== "FAIL";
+    const reviewNote = solve.review
+      ? ` Independent review: ${solve.review.verdict}.${solve.review.verdict === "NEEDS_EVIDENCE" ? " 未经独立审查确认 (not independently confirmed)." : ""}`
+      : "";
+    const attemptNote = ` Selected attempt ${attempts.selectedAttempt} of ${attempts.attempts.length}.`;
     const stopNote =
       solve.kernel.stopReason === "SUBMITTED"
         ? ""
@@ -243,7 +375,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         run.id,
         metrics,
         "NO_PROGRESS",
-        `The agent produced no changes.${stopNote}`,
+        `The agent produced no changes.${stopNote}${reviewNote}${attemptNote}`,
         solve,
       );
     const files = solve.changedFiles.length;
@@ -275,7 +407,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         run.id,
         metrics,
         "PATCH_ATTEMPT_REJECTED",
-        `Host verification failed (${reason}).${stopNote}`,
+        `${solve.review?.verdict === "FAIL" ? "Independent review failed." : `Host verification failed (${reason}).`}${stopNote}${reviewNote}${attemptNote}`,
         solve,
       );
     }
@@ -285,6 +417,8 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         ? "Independent host verification passed."
         : "No public checks are configured; the change is unverified by the host.",
       stopNote.trim(),
+      reviewNote.trim(),
+      attemptNote.trim(),
     ]
       .filter(Boolean)
       .join(" ");
@@ -310,7 +444,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     return {
       runId,
       status: "FAILED",
-      summary: solve.kernel.summary ?? message,
+      summary: `${solve.kernel.summary ?? ""} ${message}`.trim(),
       metrics,
       error: new DevflowError({
         code,
@@ -362,8 +496,12 @@ export class AutonomousRunExecutor implements RunExecutionPort {
   }
 
   /** Usage already spent by earlier dispatches of this Run, from its own event log. */
-  private async priorUsage(runId: string): Promise<{ usage: KernelUsage }> {
-    return { usage: usageFromEvents(await this.database.events.list(runId)) };
+  private async priorUsage(runId: string): Promise<{ usage: KernelUsage; turns: number }> {
+    const events = await this.database.events.list(runId);
+    return {
+      usage: usageFromEvents(events),
+      turns: events.filter((event) => event.type === "LLM_REQUEST").length,
+    };
   }
 
   private async loadCheckpoint(
@@ -388,7 +526,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     runId: string,
     sandbox: SandboxSession,
     checkpoint: Checkpoint | undefined,
-    prior: { usage: KernelUsage },
+    prior: { usage: KernelUsage; turns: number },
     signal: AbortSignal,
   ): Promise<KernelResume | undefined> {
     if (prior.usage.modelCalls === 0 && !checkpoint) return undefined;
@@ -415,11 +553,11 @@ export class AutonomousRunExecutor implements RunExecutionPort {
           },
           "WARN",
         );
-        return { messages: [], usage, turns: usage.modelCalls };
+        return { messages: [], usage, turns: prior.turns };
       }
     }
-    if (!checkpoint) return { messages: [], usage, turns: usage.modelCalls };
-    return { messages: checkpoint.messages, usage, turns: usage.modelCalls };
+    if (!checkpoint) return { messages: [], usage, turns: prior.turns };
+    return { messages: checkpoint.messages, usage, turns: Math.max(checkpoint.turns, prior.turns) };
   }
 
   private async saveCheckpoint(
@@ -429,6 +567,8 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     bindingHash: string,
     state: KernelResume,
     signal: AbortSignal,
+    attempt = 1,
+    revisions = 0,
   ): Promise<void> {
     const { patch } = await exportWorkspacePatch(sandbox, baseCommit, undefined, signal);
     const checkpoint: Checkpoint = {
@@ -437,6 +577,8 @@ export class AutonomousRunExecutor implements RunExecutionPort {
       turns: state.turns,
       messages: [...state.messages],
       patch,
+      attempt,
+      revisions,
     };
     await this.database.artifacts.create({
       runId,
@@ -448,9 +590,11 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     });
   }
 
-  private model(run: RunExecutionRecord): AutonomousModel {
-    if (this.options.modelFactory) return this.options.modelFactory(run);
-    const binding = resolveStageModel("EXECUTE", this.environment, run);
+  private model(run: RunExecutionRecord, stage: "EXECUTE" | "REVIEW" = "EXECUTE"): AutonomousModel {
+    const factory =
+      stage === "REVIEW" ? this.options.reviewModelFactory : this.options.modelFactory;
+    if (factory) return factory(run);
+    const binding = resolveStageModel(stage, this.environment, run);
     const { contextMaxBytes: _contextMaxBytes, ...config } = binding.config;
     const prices = JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON ?? "{}") as Record<
       string,

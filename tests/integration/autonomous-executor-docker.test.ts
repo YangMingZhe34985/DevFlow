@@ -105,15 +105,31 @@ function runRecord(): RunExecutionRecord {
   } as unknown as RunExecutionRecord;
 }
 
-function executor(database: DatabaseAdapter, model: FakeLanguageModel) {
+function executor(
+  database: DatabaseAdapter,
+  model: FakeLanguageModel,
+  reviewer = new FakeLanguageModel([
+    step("review", "submit_review", {
+      verdict: "PASS",
+      findings: [],
+      summary: "Fixture behaviour verified.",
+    }),
+  ]),
+  created: string[] = [],
+) {
   const environment = loadWorkerEnvironment({
     DATABASE_URL: "postgresql://devflow:devflow@localhost:5432/devflow",
     DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS: "1",
   });
   return new AutonomousRunExecutor(database, environment, {
     modelFactory: () => ({ model, settings: {}, bindingHash: "fake-binding" }),
-    sandboxFactory: async (run) =>
-      await new DockerSandboxManager({
+    reviewModelFactory: () => ({
+      model: reviewer,
+      settings: {},
+      bindingHash: "fake-review-binding",
+    }),
+    sandboxFactory: async (run) => {
+      const session = await new DockerSandboxManager({
         image: "devflow-sandbox:local",
         workspaceRoot: path.resolve("tests/fixtures"),
       }).create({
@@ -126,7 +142,10 @@ function executor(database: DatabaseAdapter, model: FakeLanguageModel) {
           timeoutMs: 120_000,
           networkEnabled: false,
         },
-      }),
+      });
+      created.push(session.id);
+      return session;
+    },
   });
 }
 
@@ -163,7 +182,7 @@ describe.skipIf(!enabled)("autonomous executor in Docker", () => {
 
     expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
     expect(result.summary).toContain("Independent host verification passed");
-    expect(result.metrics.modelCalls).toBe(5);
+    expect(result.metrics.modelCalls).toBe(6);
     const tests = memory.events.filter((e) => e.type === "TEST_RESULT");
     expect(tests.map((e) => (e.payload as { passed: boolean }).passed)).toEqual([false, true]);
     const diff = memory.artifacts.find((a) => a.kind === "DIFF")?.content ?? "";
@@ -213,13 +232,122 @@ describe.skipIf(!enabled)("autonomous executor in Docker", () => {
     )) as RunResult;
 
     expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
-    // One settled call from the interrupted dispatch plus two after resuming.
-    expect(result.metrics.modelCalls).toBe(3);
+    // One settled call before interruption, two resumed solver calls and one review.
+    expect(result.metrics.modelCalls).toBe(4);
     const started = memory.events.filter((e) => e.type === "RUN_STARTED");
     expect((started.at(-1)!.payload as { resumed: boolean }).resumed).toBe(true);
     expect(memory.artifacts.find((a) => a.kind === "DIFF")?.content).toContain(
       "+  return left - right;",
     );
+  }, 300_000);
+
+  it("sends Review FAIL to the same solver conversation, revises, verifies and reviews again to PASS", async () => {
+    const memory = memoryDatabase(runRecord());
+    const partialFix = "left === 7 && right === 4 ? left - right : left + right";
+    const model = new FakeLanguageModel([
+      step("1", "edit_file", {
+        path: "src/calculator.js",
+        old_text: BUG,
+        new_text: BUG.replace("left + right", partialFix),
+      }),
+      step("2", "submit", { summary: "arithmetic corrected" }),
+      async (request) => {
+        expect(JSON.stringify(request.messages)).toContain("arithmetic corrected");
+        expect(String(request.messages.at(-1)?.content)).toContain("subtract(5, 3) still adds");
+        return step("3", "edit_file", {
+          path: "src/calculator.js",
+          old_text: partialFix,
+          new_text: "left - right",
+        });
+      },
+      step("4", "submit", { summary: "all operands now subtract" }),
+    ]);
+    const reviewer = new FakeLanguageModel([
+      step("r1", "bash", {
+        command:
+          "node --input-type=module -e 'import { subtract } from \"./src/calculator.js\"; console.log(subtract(5, 3))'",
+      }),
+      step("r2", "submit_review", {
+        verdict: "FAIL",
+        findings: [
+          {
+            severity: "blocking",
+            file: "src/calculator.js",
+            line: 7,
+            description: "subtract(5, 3) still adds",
+            evidence: "node --input-type=module reproduction printed 8; Issue expects 2",
+          },
+        ],
+        summary: "Scripted blocking feedback to exercise revision.",
+      }),
+      step("r3", "submit_review", { verdict: "PASS", findings: [], summary: "Revision verified." }),
+    ]);
+    const created: string[] = [];
+    const result = (await executor(memory.database, model, reviewer, created).execute(
+      memory.current(),
+      AbortSignal.timeout(300_000),
+    )) as RunResult;
+    expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+    expect(created).toHaveLength(1);
+    expect(
+      memory.events
+        .filter((event) => event.type === "REVIEW_RESULT")
+        .map((event) => (event.payload as { verdict: string }).verdict),
+    ).toEqual(["FAIL", "PASS"]);
+    expect(memory.events.filter((event) => event.type === "TEST_RESULT")).toHaveLength(2);
+    expect(memory.artifacts.filter((artifact) => artifact.kind === "REVIEW_REPORT")).toHaveLength(
+      2,
+    );
+    expect(result.summary).toContain("Independent review: PASS");
+  }, 300_000);
+
+  it("uses a new sandbox after exhausted host revisions and delivers only the second attempt", async () => {
+    const memory = memoryDatabase(runRecord());
+    const model = new FakeLanguageModel([
+      step("1", "edit_file", {
+        path: "src/calculator.js",
+        old_text: BUG,
+        new_text: BUG.replace("left + right", "left * right"),
+      }),
+      step("2", "submit", { summary: "first attempt with wrong arithmetic" }),
+      step("3", "submit", { summary: "first revision still wrong" }),
+      step("4", "submit", { summary: "second revision still wrong" }),
+      async (request) => {
+        expect(request.messages).toHaveLength(2);
+        expect(String(request.messages.at(-1)?.content)).toContain("Previous failed attempt");
+        expect(JSON.stringify(request.messages)).not.toContain("left * right");
+        return step("5", "edit_file", {
+          path: "src/calculator.js",
+          old_text: BUG,
+          new_text: BUG.replace("left + right", "left - right"),
+        });
+      },
+      step("6", "submit", { summary: "independent second attempt subtracts correctly" }),
+    ]);
+    const created: string[] = [];
+    const result = (await executor(memory.database, model, undefined, created).execute(
+      memory.current(),
+      AbortSignal.timeout(300_000),
+    )) as RunResult;
+    expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
+    expect(created).toHaveLength(2);
+    expect(created[0]).not.toBe(created[1]);
+    expect(result.summary).toContain("Selected attempt 2 of 2");
+    const diff = memory.artifacts.find((artifact) => artifact.kind === "DIFF")!.content!;
+    expect(diff).toContain("+  return left - right;");
+    expect(diff).not.toContain("+  return left * right;");
+    expect(memory.artifacts.map((artifact) => artifact.name)).toEqual(
+      expect.arrayContaining([
+        "autonomous-transcript-attempt-1.json",
+        "autonomous-transcript-attempt-2.json",
+      ]),
+    );
+    const checkpoint = JSON.parse(
+      memory.artifacts
+        .filter((artifact) => artifact.name === AUTONOMOUS_CHECKPOINT_ARTIFACT)
+        .at(-1)!.content!,
+    );
+    expect(checkpoint.attempt).toBe(2);
   }, 300_000);
 });
 
@@ -260,6 +388,17 @@ describe.skipIf(
         database.runs,
         new AutonomousRunExecutor(database, environment, {
           modelFactory: () => ({ model, settings: {}, bindingHash: "fake-binding" }),
+          reviewModelFactory: () => ({
+            model: new FakeLanguageModel([
+              step("review", "submit_review", {
+                verdict: "PASS",
+                findings: [],
+                summary: "Fixture verified.",
+              }),
+            ]),
+            settings: {},
+            bindingHash: "fake-review-binding",
+          }),
         }),
         { workerId: "autonomous-test", leaseMs: 60_000, cancellationPollMs: 1_000 },
       );
@@ -274,7 +413,7 @@ describe.skipIf(
       expect(outcome).toMatchObject({ outcome: "COMPLETED", status: "SUCCEEDED" });
       const stored = await database.runs.findById(run.id);
       expect(stored?.status).toBe("SUCCEEDED");
-      expect(stored?.result?.metrics.modelCalls).toBe(3);
+      expect(stored?.result?.metrics.modelCalls).toBe(4);
       const types = (await database.events.list(run.id)).map((e) => e.type);
       expect(types).toEqual(
         expect.arrayContaining([

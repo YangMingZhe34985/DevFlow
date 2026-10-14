@@ -128,9 +128,11 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
   const golden = await goldenFiles(fixture.slug);
   const protectedPaths = fixture.config.protectedPaths ?? [];
   const protectedPath = (file: string) =>
-    scorer.isProtectedDatasetPath(file, protectedPaths)
-      ? `${file} is protected: tests and build/test configuration grade your fix, so change source files instead. Put scratch scripts in /tmp.`
-      : undefined;
+    file.startsWith("/") || file.split("/").includes("..")
+      ? `${file} is outside the repository: edit files under /workspace, or put scratch files in /tmp.`
+      : scorer.isProtectedDatasetPath(file, protectedPaths)
+        ? `${file} is protected: tests and build/test configuration grade your fix, so change source files instead. Put scratch scripts in /tmp.`
+        : undefined;
   const controller = new AbortController();
   const started = Date.now();
   const deadlineAt = started + Number(args["timeout-min"]) * 60_000;
@@ -346,6 +348,41 @@ function scriptedModel(
       step("edit_file", { path: "tests/devflow_probe.txt", old_text: "", new_text: "x" }),
       submit,
     ]);
+  if (name === "paths") {
+    // Path forms real models use: absolute /workspace paths, ./ prefixes and /tmp scratch.
+    const source = fixture.snapshot.files.find((f) => f.path.startsWith("src/"))!;
+    const firstLine = Buffer.from(source.contentBase64 ?? "", "base64")
+      .toString("utf8")
+      .split("\n")[0]!;
+    return new FakeLanguageModel([
+      step("read_file", { path: `/workspace/${source.path}`, end_line: 3 }),
+      step("edit_file", {
+        path: `/workspace/${source.path}`,
+        old_text: firstLine,
+        new_text: `${firstLine} `,
+      }),
+      step("edit_file", {
+        path: `./${source.path}`,
+        old_text: `${firstLine} `,
+        new_text: firstLine,
+      }),
+      step("edit_file", {
+        path: `/workspace/${source.path}`,
+        old_text: firstLine,
+        new_text: `${firstLine}\n`,
+      }),
+      step("edit_file", { path: "/tmp/devflow-repro.txt", old_text: "", new_text: "scratch\n" }),
+      step("read_file", { path: "/tmp/devflow-repro.txt" }),
+      step("edit_file", {
+        path: "/workspace/tests/devflow_probe.txt",
+        old_text: "",
+        new_text: "x",
+      }),
+      step("edit_file", { path: "/etc/passwd", old_text: "root", new_text: "x" }),
+      step("bash", { command: "git status --short" }),
+      submit,
+    ]);
+  }
   if (name === "golden") {
     // Restores the golden bytes of every injected file through edit_file. It validates the
     // tools, export and scoring end to end and is never used as agent evidence.

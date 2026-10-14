@@ -3,17 +3,18 @@ import { z } from "zod";
 
 import { defineAciTool, type AciTool } from "./contracts.js";
 
-// Both scripts run inside the sandbox with node, resolve paths against the real
-// /workspace and refuse anything (including symlinks) that escapes it.
+// Both scripts run inside the sandbox with node. Paths resolve against the real /workspace
+// (or /tmp for scratch files); anything else, including symlink escapes, is refused.
 const GUARD = String.raw`
 const fs = require("node:fs"), path = require("node:path");
 const input = JSON.parse(fs.readFileSync(0, "utf8"));
-const root = fs.realpathSync("/workspace");
+const scratch = input.path === "/tmp" || input.path.startsWith("/tmp/");
+const root = fs.realpathSync(scratch ? "/tmp" : "/workspace");
 const inside = (p) => p === root || p.startsWith(root + path.sep);
 const target = path.resolve(root, input.path);
-if (!inside(target)) { console.log(JSON.stringify({ error: "Path is outside /workspace." })); process.exit(0); }
+if (!inside(target)) { console.log(JSON.stringify({ error: "Paths must be inside /workspace (or /tmp for scratch files)." })); process.exit(0); }
 const exists = fs.existsSync(target);
-if (exists && !inside(fs.realpathSync(target))) { console.log(JSON.stringify({ error: "Path resolves outside /workspace." })); process.exit(0); }
+if (exists && !inside(fs.realpathSync(target))) { console.log(JSON.stringify({ error: "Path resolves outside its allowed root." })); process.exit(0); }
 const numbered = (lines, first) => lines.map((l, i) => String(first + i).padStart(6) + "\t" + l).join("\n");
 `;
 
@@ -92,6 +93,21 @@ async function runScript(
   return JSON.parse(result.stdout) as Record<string, unknown>;
 }
 
+/**
+ * Returns the workspace-relative form of a path the model wrote as /workspace/x, ./x or x.
+ * Scratch paths under /tmp and paths outside the workspace are returned unchanged.
+ */
+export function normalizeWorkspacePath(path: string): string {
+  const trimmed = path.trim().replace(/\\/gu, "/");
+  if (trimmed === "/workspace" || trimmed === "/workspace/") return ".";
+  const relative = trimmed.startsWith("/workspace/")
+    ? trimmed.slice("/workspace/".length)
+    : trimmed;
+  return relative.replace(/^(?:\.\/)+/u, "") || ".";
+}
+
+const isScratch = (path: string) => path === "/tmp" || path.startsWith("/tmp/");
+
 export interface FileToolOptions {
   sandbox: SandboxSession;
   /** Returns a reason when the path must not be edited (for example, graded tests). */
@@ -102,14 +118,15 @@ export function createReadFileTool(options: FileToolOptions): AciTool {
   const maxLines = 600;
   return defineAciTool({
     name: "read_file",
-    description: `Read a text file with line numbers. Paths are relative to /workspace. Reads at most ${maxLines} lines per call; pass start_line/end_line to page through larger files.`,
+    description: `Read a text file with line numbers. Paths are relative to /workspace (absolute /workspace/... and /tmp/... paths also work). Reads at most ${maxLines} lines per call; pass start_line/end_line to page through larger files.`,
     inputSchema: z.object({
       path: z.string().min(1),
       start_line: z.number().int().positive().optional(),
       end_line: z.number().int().positive().optional(),
     }),
     readOnly: true,
-    async run({ path, start_line, end_line }, signal) {
+    async run({ path: raw, start_line, end_line }, signal) {
+      const path = normalizeWorkspacePath(raw);
       const out = await runScript(
         options.sandbox,
         READ_SCRIPT,
@@ -130,7 +147,7 @@ export function createEditFileTool(options: FileToolOptions): AciTool {
   return defineAciTool({
     name: "edit_file",
     description:
-      "Replace exact text in a file, or create a new file. old_text must match the file exactly (including indentation) and be unique unless replace_all is true. To create a file, pass an empty old_text. Returns the edited region with line numbers.",
+      "Replace exact text in a file, or create a new file. Paths are relative to /workspace; scratch files may go in /tmp. old_text must match the file exactly (including indentation) and be unique unless replace_all is true. To create a file, pass an empty old_text. Returns the edited region with line numbers.",
     inputSchema: z.object({
       path: z.string().min(1),
       old_text: z.string().describe("Exact text to replace; empty to create a new file."),
@@ -138,8 +155,9 @@ export function createEditFileTool(options: FileToolOptions): AciTool {
       replace_all: z.boolean().optional(),
     }),
     readOnly: false,
-    async run({ path, old_text, new_text, replace_all }, signal) {
-      const blocked = options.protectedPath?.(path.replace(/^\.\//u, ""));
+    async run({ path: raw, old_text, new_text, replace_all }, signal) {
+      const path = normalizeWorkspacePath(raw);
+      const blocked = isScratch(path) ? undefined : options.protectedPath?.(path);
       if (blocked) return { isError: true, content: blocked };
       if (old_text === new_text && old_text !== "")
         return {

@@ -2,7 +2,14 @@
 
 方案见 [DevFlow_v4.0_Autonomous_Refactor_Plan.md](../../DevFlow_v4.0_Autonomous_Refactor_Plan.md)。本文只记录**已验证的状态**和下一步，最新条目在上方。
 
-## 2026-10-14：Phase 1 开发完成（等待门槛评测授权）
+## 2026-10-14：Phase 1 门槛评测（Codex 执行）
+
+- **结果**：E01–E07 各 3 次共 21 次，全部严格 PASS。E08 的 3 次在评分阶段超时：3 个 Agent 与评分器同机并发，baseline 测试超过评分器默认的 300 秒。用同一个冻结评分器单路重评后 3 次全部严格 PASS（baseline 183 秒），确认为评测负载问题。E09 的 3 次被止损中断，E10 未运行。
+- **门槛判定**：在计划的 30 次中已确认 24 次通过。即使剩余 6 次全部失败，pass@1 也有 8/10，因此三项门槛（不低于 7/10、不低于旧系统的 5/10、平均费用不超过 ¥4）均已满足。缓存感知口径已结算 ¥12.25，未确认上界 ¥3.32。
+- **未观察到的部分**：24 次运行中修订回路一次也没有被触发（Agent 都是自测通过后才提交），因此它的真实收益尚无数据。
+- 详细报告：`.devflow/v4-research/phase1-gate-report.md`；重评脚本：`.devflow/v4-phase1-gate/rescore-e08.mjs`。
+
+## 2026-10-14：Phase 1 开发完成
 
 Kernel 已成为产品主路径，使用说明见 [autonomous-mode.md](autonomous-mode.md)。
 

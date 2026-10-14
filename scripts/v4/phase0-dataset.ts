@@ -42,12 +42,28 @@ const { values: args } = parseArgs({
     "max-output": { type: "string", default: "8192" },
     "context-tokens": { type: "string", default: "100000" },
     "max-revisions": { type: "string", default: "2" },
+    // Bailian bills implicit prompt-cache hits at 20% of the input rate; 0 keeps the
+    // uncached upper basis used by the legacy batches.
+    "cached-price-ratio": { type: "string", default: "0" },
     concurrency: { type: "string", default: "1" },
   },
 });
 
 // Same CNY basis as the legacy ledger: Bailian busy-hour uncached upper rates.
-const PRICE = { inputMicrosPerMillionTokens: 8_000_000, outputMicrosPerMillionTokens: 28_000_000 };
+const UNCACHED = {
+  inputMicrosPerMillionTokens: 8_000_000,
+  outputMicrosPerMillionTokens: 28_000_000,
+};
+const cachedRatio = Number(args["cached-price-ratio"]);
+const PRICE =
+  cachedRatio > 0
+    ? {
+        ...UNCACHED,
+        cachedInputMicrosPerMillionTokens: Math.round(
+          UNCACHED.inputMicrosPerMillionTokens * cachedRatio,
+        ),
+      }
+    : UNCACHED;
 const CNY = 1_000_000;
 
 interface Fixture {
@@ -218,6 +234,12 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
       },
       usage: attempt.kernel.usage,
       costCny: attempt.kernel.usage.costMicros / CNY,
+      priceBasis: cachedRatio > 0 ? `cached-hits-at-${cachedRatio}` : "uncached-upper",
+      uncachedBasisCny:
+        (attempt.kernel.usage.inputTokens * UNCACHED.inputMicrosPerMillionTokens +
+          attempt.kernel.usage.outputTokens * UNCACHED.outputMicrosPerMillionTokens) /
+        1_000_000 /
+        CNY,
       wallSeconds: Math.round((Date.now() - started) / 1000),
       changedFiles: attempt.changedFiles,
       excludedFiles: attempt.excludedFiles,

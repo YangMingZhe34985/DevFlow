@@ -2,6 +2,14 @@
 
 方案见 [DevFlow_v4.0_Autonomous_Refactor_Plan.md](../../DevFlow_v4.0_Autonomous_Refactor_Plan.md)。本文只记录**已验证的状态**和下一步，最新条目在上方。
 
+## 2026-10-15：Phase 2 开发完成（待 Claude 验收）
+
+- 增加带只读工具的独立 Reviewer、结构化结论与工作区恢复；blocking findings 回原求解会话，与宿主失败共用修订计数。
+- 增加仅失败时追加的新沙箱尝试与候选选择；Run 费用、轮数和期限累计；已结束尝试从 Artifact 恢复。
+- 记录 Review 事件与报告 Artifact，各次尝试保留 transcript；结果写明审查结论和所选尝试。
+- 隐藏评分通过进程内互斥串行运行，Agent 保持可并发；评分器与数据集未修改。
+- 仅使用 Fake Model；lint、typecheck、Prettier 通过；全量 Vitest 限定 maxWorkers=2 后 1246 通过、65 跳过、0 失败，默认并发两轮存在已知负载超时。Docker/PostgreSQL 因权限拒绝 NOT_RUN；.git 只读，提交未完成。详见 `.devflow/v4-research/phase2-dev-report.md`。真实模型收益与 Phase 2 门槛尚未评测。
+
 ## 2026-10-14：Phase 1 门槛评测（Codex 执行）
 
 - **结果**：E01–E07 各 3 次共 21 次，全部严格 PASS。E08 的 3 次在评分阶段超时：3 个 Agent 与评分器同机并发，baseline 测试超过评分器默认的 300 秒。用同一个冻结评分器单路重评后 3 次全部严格 PASS（baseline 183 秒），确认为评测负载问题。E09 的 3 次被止损中断，E10 未运行。

@@ -66,6 +66,7 @@ try {
       "tests/integration/team-coding.test.ts",
       "tests/integration/run-ownership-postgres.test.ts",
       "tests/integration/public-diagnostic-docker.test.ts",
+      "tests/integration/autonomous-executor-docker.test.ts",
     ],
     env,
   );

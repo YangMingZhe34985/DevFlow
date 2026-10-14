@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const ExecutionModeSchema = z.enum(["workflow", "team", "single"]);
+export const ExecutionModeSchema = z.enum(["workflow", "team", "single", "autonomous"]);
 export type ExecutionMode = z.infer<typeof ExecutionModeSchema>;
 export const TeamConfigurationSchema = z.strictObject({
   concurrency: z.number().int().min(1).max(2).default(2),

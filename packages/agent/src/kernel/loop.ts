@@ -42,7 +42,14 @@ export interface KernelUsage {
 export type KernelEvent =
   | { type: "model_request"; turn: number; worstCaseMicros: number }
   | { type: "model"; turn: number; response: ModelResponse; costMicros: number }
-  | { type: "model_error"; turn: number; message: string; willRetry: boolean }
+  | {
+      type: "model_error";
+      turn: number;
+      message: string;
+      willRetry: boolean;
+      /** Worst case added to unconfirmed cost because the request may have been billed. */
+      unconfirmedMicros: number;
+    }
   | {
       type: "tool";
       turn: number;
@@ -62,7 +69,7 @@ export interface KernelResult {
   error?: string;
 }
 
-/** A transcript and its metered usage, from a checkpoint or an earlier loop. */
+/** A transcript and its metered usage, from a checkpoint or an earlier loop (may be empty). */
 export interface KernelResume {
   messages: readonly ModelMessage[];
   usage: KernelUsage;
@@ -110,7 +117,8 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
     inputSchema,
     readOnly,
   }));
-  const messages: ModelMessage[] = options.resume
+  // An empty resumed transcript restarts the conversation but keeps usage and turns.
+  const messages: ModelMessage[] = options.resume?.messages.length
     ? structuredClone([...options.resume.messages])
     : [
         { role: "SYSTEM", content: options.system },
@@ -179,12 +187,19 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
         );
       } catch (error) {
         if (signal.aborted) throw error;
-        if (!notIssued(error)) usage.unconfirmedCostMicros += worstCase;
+        const unconfirmedMicros = notIssued(error) ? 0 : worstCase;
+        usage.unconfirmedCostMicros += unconfirmedMicros;
         const message = error instanceof Error ? error.message : String(error);
         const willRetry =
           attempt < MAX_MODEL_RETRIES &&
           (limits.maxCostMicros === undefined || spent() + worstCase <= limits.maxCostMicros);
-        await options.onEvent?.({ type: "model_error", turn, message, willRetry });
+        await options.onEvent?.({
+          type: "model_error",
+          turn,
+          message,
+          willRetry,
+          unconfirmedMicros,
+        });
         if (!willRetry) return finish("MODEL_ERROR", { error: message });
         await new Promise((resolve) =>
           setTimeout(resolve, (options.retryDelayMs ?? 2000) * (attempt + 1)),

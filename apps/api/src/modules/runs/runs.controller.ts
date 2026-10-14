@@ -73,8 +73,7 @@ export class RunsController {
   async create(@Body() body: unknown) {
     const input = CreateRunSchema.parse(body);
     if (
-      input.executionMode &&
-      input.executionMode !== "workflow" &&
+      (input.executionMode === "team" || input.executionMode === "single") &&
       process.env.DEVFLOW_TEAM_ENABLED !== "true"
     )
       throw new DevflowError({

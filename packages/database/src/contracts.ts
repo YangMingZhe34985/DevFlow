@@ -103,7 +103,7 @@ export interface TaskStore {
 }
 
 export interface RunRecord {
-  executionMode?: "workflow" | "team" | "single";
+  executionMode?: "workflow" | "team" | "single" | "autonomous";
   teamConfiguration?: TeamConfiguration;
   localizationMode?: "legacy" | "legacy-dynamic" | "prg";
   id: RunId;
@@ -134,7 +134,7 @@ export interface RunExecutionRecord extends RunRecord {
 }
 
 export interface CreateRunInput {
-  executionMode?: "workflow" | "team" | "single" | undefined;
+  executionMode?: "workflow" | "team" | "single" | "autonomous" | undefined;
   teamConfiguration?: TeamConfiguration | undefined;
   localizationMode?: "legacy" | "legacy-dynamic" | "prg" | undefined;
   taskId: string;

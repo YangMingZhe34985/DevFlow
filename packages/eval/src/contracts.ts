@@ -48,7 +48,7 @@ export const BenchmarkRuntimeConfigurationSchema = z
     maxTestRetries: z.number().int().min(0).max(20).optional(),
     maxReviewRetries: z.number().int().min(0).max(10).optional(),
     localizationMode: z.enum(["legacy", "legacy-dynamic", "prg"]).optional(),
-    executionMode: z.enum(["workflow", "team", "single"]).optional(),
+    executionMode: z.enum(["workflow", "team", "single", "autonomous"]).optional(),
     publicVerificationProfile: PublicVerificationProfileSchema.optional(),
   })
   .strict();

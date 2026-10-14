@@ -152,12 +152,10 @@ import {
 } from "./review-evidence-retention.js";
 import {
   EnvironmentGitHubCredentialSource,
-  GitHubBranchSchema,
   GitHubChangeSchema,
   GitHubProviderError,
   GitHubPublicationCoordinator,
   GitHubRestProvider,
-  branchNameForRun,
   operationKeyForRun,
   redactGitHubSecrets,
   type GitHubApprovalGrant,
@@ -238,6 +236,7 @@ import {
   isGitHubRepositoryUri,
   parseGitHubRepositoryUri,
 } from "./github-changeset.js";
+import { prepareGitHubPushApproval, requireFullCommit } from "./github-delivery.js";
 import { ensureLocalRunSnapshot, requireLocalRunSnapshot } from "./local-run-snapshot.js";
 import type { RunExecutionOutcome, RunExecutionPort } from "./run-execution.js";
 import {
@@ -5068,63 +5067,7 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     summary: string,
     metrics: RunMetrics,
   ): Promise<RunExecutionOutcome> {
-    const repository = parseGitHubRepositoryUri(run.repository.sourceUri);
-    const baseCommit = requireFullCommit(run.task.baseCommitSha);
-    const baseBranch = GitHubBranchSchema.parse(
-      run.task.baseRef ?? run.repository.defaultBranch ?? "main",
-    );
-    const branchName = branchNameForRun(run.id);
-    const pushOperationKey = operationKeyForRun(run.id, "push");
-    const artifact = await this.database.artifacts.create({
-      runId: run.id,
-      kind: "GITHUB_CHANGESET",
-      name: "github-changeset.json",
-      mimeType: "application/json",
-      content: JSON.stringify(
-        {
-          version: 1,
-          changes,
-          summary,
-          metrics,
-          pullRequest: {
-            title: run.task.title,
-            body: `${summary}\n\nCreated by DevFlow run ${run.id}.`,
-          },
-        },
-        null,
-        2,
-      ),
-      metadata: asJson({
-        repository,
-        baseCommit,
-        baseBranch,
-        branchName,
-        filesChanged: changes.length,
-      }),
-    });
-    return {
-      status: "WAITING_APPROVAL",
-      approvalKind: "GITHUB",
-      approval: {
-        kind: "GITHUB_PUSH",
-        request: {
-          operationKey: pushOperationKey,
-          repository,
-          baseCommit,
-          baseBranch,
-          branchName,
-          filesChanged: changes.length,
-        },
-        publication: {
-          repository,
-          baseCommit,
-          baseBranch,
-          branchName,
-          pushOperationKey,
-          changesArtifactId: artifact.id,
-        },
-      },
-    };
+    return await prepareGitHubPushApproval(this.database, run, changes, summary, metrics);
   }
 
   private async pushApprovedBranch(
@@ -7596,16 +7539,6 @@ function parseGitHubRunChangeSet(content: string): GitHubRunChangeSet {
       cause: error,
     });
   }
-}
-
-function requireFullCommit(value: string | undefined): string {
-  if (value === undefined || !/^[0-9a-f]{40}$/iu.test(value)) {
-    throw new DevflowError({
-      code: "VALIDATION_ERROR",
-      message: "GitHub publication requires a fixed 40-character task base commit SHA.",
-    });
-  }
-  return value.toLowerCase();
 }
 
 function recordValue(value: unknown): Record<string, unknown> {

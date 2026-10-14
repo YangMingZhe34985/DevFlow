@@ -215,7 +215,10 @@ describe("runAgentLoop", () => {
     const first = await runAgentLoop({
       model: new FakeLanguageModel([
         fakeModelResponse({ toolCalls: [call("1", "echo", { text: "a" })], usage: usage(100) }),
-        fakeModelResponse({ toolCalls: [call("2", "submit", { summary: "v1" })], usage: usage(200) }),
+        fakeModelResponse({
+          toolCalls: [call("2", "submit", { summary: "v1" })],
+          usage: usage(200),
+        }),
       ]),
       system: "s",
       task: "t",

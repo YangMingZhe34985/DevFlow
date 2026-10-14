@@ -237,7 +237,7 @@ function verifiedTerminalObservation(run: RunRecord, input: unknown): Evaluation
 
 function assertRuntimeConfigurationApplied(
   configuration: {
-    executionMode?: "workflow" | "team" | "single" | undefined;
+    executionMode?: "workflow" | "team" | "single" | "autonomous" | undefined;
     localizationMode?: "legacy" | "legacy-dynamic" | "prg" | undefined;
     maxSteps?: number | undefined;
     maxTestRetries?: number | undefined;

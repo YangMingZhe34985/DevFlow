@@ -167,6 +167,11 @@ const WorkerEnvironmentSchema = z.object({
     .transform((value) => value === "true"),
   DEVFLOW_GITHUB_API_BASE_URL: z.string().url().default("https://api.github.com"),
   DEVFLOW_GITHUB_WEB_BASE_URL: z.string().url().default("https://github.com"),
+  // executionMode=autonomous: one agent loop; the Run deadline and cost cap above still apply.
+  DEVFLOW_AUTONOMOUS_MAX_TURNS: z.coerce.number().int().min(1).max(500).default(100),
+  DEVFLOW_AUTONOMOUS_CONTEXT_TOKENS: z.coerce.number().int().min(8_000).default(100_000),
+  DEVFLOW_AUTONOMOUS_MAX_REVISIONS: z.coerce.number().int().min(0).max(10).default(2),
+  DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS: z.coerce.number().int().min(1).max(50).default(5),
 });
 
 export type WorkerEnvironment = z.infer<typeof WorkerEnvironmentSchema> & {

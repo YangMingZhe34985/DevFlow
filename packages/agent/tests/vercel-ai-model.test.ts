@@ -49,7 +49,27 @@ describe("VercelAiLanguageModel", () => {
       outputTokens: 3,
       totalTokens: 10,
       reasoningTokens: 0,
+      cachedInputTokens: 0,
     });
+  });
+
+  it("reports provider prompt-cache hits as cachedInputTokens", async () => {
+    const model = new MockLanguageModelV4({
+      doGenerate: {
+        content: [{ type: "text", text: "done" }],
+        finishReason: { unified: "stop", raw: "stop" },
+        usage: {
+          inputTokens: { total: 1000, noCache: 200, cacheRead: 800, cacheWrite: 0 },
+          outputTokens: { total: 5, text: 5, reasoning: 0 },
+        },
+        warnings: [],
+      },
+    });
+    const result = await new VercelAiLanguageModel(model).generate(
+      { messages: [{ role: "USER", content: "work" }], tools: [] },
+      { signal: new AbortController().signal },
+    );
+    expect(result.usage).toMatchObject({ inputTokens: 1000, cachedInputTokens: 800 });
   });
 
   it("uses Output.object, validates the value, and forwards stage reasoning", async () => {

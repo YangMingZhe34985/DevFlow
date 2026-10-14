@@ -565,11 +565,13 @@ function toTokenUsage(usage: LanguageModelUsage | undefined): ModelResponse["usa
   const inputTokens = usage?.inputTokens ?? 0;
   const outputTokens = usage?.outputTokens ?? 0;
   const reasoningTokens = usage?.outputTokenDetails.reasoningTokens;
+  const cachedInputTokens = usage?.inputTokenDetails?.cacheReadTokens;
   return {
     inputTokens,
     outputTokens,
     totalTokens: usage?.totalTokens ?? inputTokens + outputTokens,
     ...(reasoningTokens === undefined ? {} : { reasoningTokens }),
+    ...(cachedInputTokens === undefined ? {} : { cachedInputTokens }),
   };
 }
 

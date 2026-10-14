@@ -85,8 +85,14 @@ const WorkerEnvironmentSchema = z.object({
         Object.values(parsed).every((rate: unknown) => {
           if (!rate || typeof rate !== "object") return false;
           const values = rate as Record<string, unknown>;
-          return [values.inputMicrosPerMillionTokens, values.outputMicrosPerMillionTokens].every(
-            (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0,
+          const rateValue = (n: unknown) =>
+            typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+          return (
+            [values.inputMicrosPerMillionTokens, values.outputMicrosPerMillionTokens].every(
+              rateValue,
+            ) &&
+            (values.cachedInputMicrosPerMillionTokens === undefined ||
+              rateValue(values.cachedInputMicrosPerMillionTokens))
           );
         })
       );

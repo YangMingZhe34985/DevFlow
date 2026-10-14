@@ -1481,6 +1481,14 @@ export class DefaultAgentRuntime implements AgentRuntime {
                   inputTokens: state.metrics.tokenUsage.inputTokens + response.usage.inputTokens,
                   outputTokens: state.metrics.tokenUsage.outputTokens + response.usage.outputTokens,
                   totalTokens: state.metrics.tokenUsage.totalTokens + response.usage.totalTokens,
+                  ...(response.usage.cachedInputTokens === undefined &&
+                  state.metrics.tokenUsage.cachedInputTokens === undefined
+                    ? {}
+                    : {
+                        cachedInputTokens:
+                          (state.metrics.tokenUsage.cachedInputTokens ?? 0) +
+                          (response.usage.cachedInputTokens ?? 0),
+                      }),
                 },
               },
             };

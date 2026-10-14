@@ -374,6 +374,25 @@ describe("Resource Budget Scheduler execution boundary", () => {
     expect((await scheduler.snapshot()).consumed.costMicros).toBe(1520);
     expect(JSON.stringify(events)).toContain('"costMicros":56000');
   });
+  it("settles provider prompt-cache hits at the cached input rate", async () => {
+    const { runtime, scheduler } = await fixture({ costMicros: 10_000_000 });
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [],
+        usage: { inputTokens: 1000, cachedInputTokens: 800, outputTokens: 0, totalTokens: 1000 },
+      }),
+    ]);
+    await runtime
+      .model(model, {
+        stage: "EXECUTE",
+        outputTokens: 16384,
+        timeoutMs: 1000,
+        price: { ...price, cachedInputMicrosPerMillionTokens: 1_000_000 },
+      })
+      .generate(request, { signal: signal() });
+    // 200 uncached × 8 + 800 cached × 1 = 2,400 micros (uncached pricing would be 8,000).
+    expect((await scheduler.snapshot()).consumed.costMicros).toBe(2400);
+  });
   it("persists the actual projection before dispatch and settles reasoning-inclusive usage exactly once", async () => {
     const { scheduler, runtime } = await fixture({ costMicros: 1_000_000 });
     const model = new FakeLanguageModel([

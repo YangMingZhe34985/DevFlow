@@ -245,6 +245,10 @@ function addUsage(target: TokenUsage, source: TokenUsage): void {
   target.reasoningTokens =
     nonnegativeInteger(target.reasoningTokens ?? 0) +
     nonnegativeInteger(source.reasoningTokens ?? 0);
+  if (source.cachedInputTokens !== undefined)
+    target.cachedInputTokens =
+      nonnegativeInteger(target.cachedInputTokens ?? 0) +
+      nonnegativeInteger(source.cachedInputTokens);
 }
 
 function nonnegativeInteger(value: number): number {

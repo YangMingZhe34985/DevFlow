@@ -17,6 +17,8 @@ export interface ModelResourcePrice {
   /** All prices and caps use the same configured currency, in millionths. */
   inputMicrosPerMillionTokens: number;
   outputMicrosPerMillionTokens: number;
+  /** Prompt-cache hit rate. Quotes stay at the uncached rate; only settlement uses this. */
+  cachedInputMicrosPerMillionTokens?: number;
 }
 
 /** One dispatch context; the scheduler's persisted ledger belongs to the whole Run. */
@@ -485,6 +487,7 @@ export class ResourceBudgetRuntime {
             options.price,
             response.usage.inputTokens,
             response.usage.outputTokens,
+            response.usage.cachedInputTokens,
           ),
         };
         await this.scheduler.settle(id, actual, { costStatus: priced ? "PRICED" : "UNPRICED" });
@@ -677,13 +680,21 @@ export function priceModelOperationPlan(
   };
 }
 
-function modelCost(price: ModelResourcePrice | undefined, input: number, output: number): number {
-  return price
-    ? Math.ceil(
-        (input * price.inputMicrosPerMillionTokens + output * price.outputMicrosPerMillionTokens) /
-          1_000_000,
-      )
-    : 0;
+export function modelCost(
+  price: ModelResourcePrice | undefined,
+  input: number,
+  output: number,
+  cachedInput = 0,
+): number {
+  if (!price) return 0;
+  const cached = Math.min(Math.max(0, cachedInput), input);
+  const cachedRate = price.cachedInputMicrosPerMillionTokens ?? price.inputMicrosPerMillionTokens;
+  return Math.ceil(
+    ((input - cached) * price.inputMicrosPerMillionTokens +
+      cached * cachedRate +
+      output * price.outputMicrosPerMillionTokens) /
+      1_000_000,
+  );
 }
 
 function blocked(operationId: string, diagnostics: unknown): DevflowError {

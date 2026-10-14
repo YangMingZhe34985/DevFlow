@@ -77,6 +77,13 @@ export function solverTaskMessage(input: {
 }
 
 export async function runSolveAttempt(input: SolveAttemptInput): Promise<SolveAttemptResult> {
+  // Pin the starting commit so the candidate survives commits the agent makes itself.
+  const head = await input.sandbox.exec(
+    { program: "git", args: ["rev-parse", "HEAD"], timeoutMs: 30_000, maxOutputBytes: 1000 },
+    input.signal,
+  );
+  if (head.exitCode !== 0) throw new Error(`Cannot read the workspace base commit: ${head.stderr}`);
+  const baseCommit = head.stdout.trim();
   const tools = [
     createBashTool({ sandbox: input.sandbox }),
     createReadFileTool({ sandbox: input.sandbox }),
@@ -98,7 +105,12 @@ export async function runSolveAttempt(input: SolveAttemptInput): Promise<SolveAt
     ...(input.onEvent ? { onEvent: input.onEvent } : {}),
   });
   // Whatever the stop reason, the workspace is the candidate; nothing done is lost.
-  const exported = await exportWorkspacePatch(input.sandbox, input.protectedPath, input.signal);
+  const exported = await exportWorkspacePatch(
+    input.sandbox,
+    baseCommit,
+    input.protectedPath,
+    input.signal,
+  );
   return { kernel, ...exported };
 }
 
@@ -107,6 +119,7 @@ const BUILD_OUTPUT =
 
 export async function exportWorkspacePatch(
   sandbox: SandboxSession,
+  baseCommit: string,
   protectedPath: ((path: string) => string | undefined) | undefined,
   signal: AbortSignal,
 ): Promise<Omit<SolveAttemptResult, "kernel">> {
@@ -125,7 +138,7 @@ export async function exportWorkspacePatch(
       throw new Error(`git ${args[0]} failed: ${result.stderr || result.stdout}`);
     return result.stdout;
   };
-  const tracked = (await git(["diff", "--no-renames", "--name-only", "-z", "HEAD"]))
+  const tracked = (await git(["diff", "--no-renames", "--name-only", "-z", baseCommit]))
     .split("\0")
     .filter(Boolean);
   const untracked = (await git(["ls-files", "--others", "--exclude-standard", "-z"]))
@@ -142,7 +155,7 @@ export async function exportWorkspacePatch(
     ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"],
     changedFiles.join("\0"),
   );
-  const patch = await git(["diff", "--cached", "--binary", "--no-renames", "HEAD"]);
+  const patch = await git(["diff", "--cached", "--binary", "--no-renames", baseCommit]);
   return { patch, changedFiles, excludedFiles };
 }
 

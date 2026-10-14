@@ -41,6 +41,7 @@ const { values: args } = parseArgs({
     reasoning: { type: "string", default: "low" },
     "max-output": { type: "string", default: "8192" },
     "context-tokens": { type: "string", default: "100000" },
+    concurrency: { type: "string", default: "1" },
   },
 });
 
@@ -54,7 +55,7 @@ interface Fixture {
   family: string;
   repositoryPath: string;
   baseCommitSha: string;
-  snapshot: { sourceHead: string; files: { path: string }[] };
+  snapshot: { sourceHead: string; files: { path: string; contentBase64?: string }[] };
   task: { title: string; description: string };
   config: { protectedPaths?: string[]; family: string; setupCommand?: CommandSpec };
   image?: { imageDigest: string; setupCommand?: CommandSpec };
@@ -84,25 +85,33 @@ const output = path.resolve(
     `.devflow/v4-phase0/${new Date().toISOString().replace(/[:.]/gu, "-")}-${args.script}`,
 );
 await fs.mkdir(output, { recursive: true });
-let spentMicros = 0;
 const summaries: Record<string, unknown>[] = [];
-
-for (const caseId of caseIds)
-  for (let repeat = 1; repeat <= repeats; repeat++) {
-    if (
-      live &&
-      spendCap !== undefined &&
-      spentMicros + Number(args["max-cost-cny"]) * CNY > spendCap * CNY
-    ) {
-      console.log(`Stopping: the next attempt could exceed the ${spendCap} CNY spend cap.`);
-      break;
+const queue = caseIds.flatMap((caseId) =>
+  Array.from({ length: repeats }, (_, i) => ({ caseId, repeat: i + 1 })),
+);
+const perAttemptCap = Number(args["max-cost-cny"]) * CNY;
+let spentMicros = 0;
+let inFlight = 0;
+// Every in-flight attempt holds its full cost ceiling until it settles.
+const worker = async () => {
+  for (let job = queue.shift(); job; job = queue.shift()) {
+    if (live && spentMicros + (inFlight + 1) * perAttemptCap > spendCap! * CNY) {
+      console.log(`Skipping ${job.caseId}-${job.repeat}: it could exceed the ${spendCap} CNY cap.`);
+      continue;
     }
-    const summary = await runCase(caseId, repeat);
-    spentMicros += Number((summary.usage as { costMicros?: number } | undefined)?.costMicros ?? 0);
+    inFlight += 1;
+    const summary = await runCase(job.caseId, job.repeat);
+    inFlight -= 1;
+    const usage = summary.usage as
+      { costMicros?: number; unconfirmedCostMicros?: number } | undefined;
+    spentMicros += (usage?.costMicros ?? 0) + (usage?.unconfirmedCostMicros ?? 0);
     summaries.push(summary);
     await fs.writeFile(path.join(output, "summary.json"), JSON.stringify(summaries, null, 2));
   }
+};
+await Promise.all(Array.from({ length: Math.max(1, Number(args.concurrency)) }, worker));
 console.log(JSON.stringify(summaries.map(brief), null, 2));
+console.log(`Total cost (uncached upper basis): ${(spentMicros / CNY).toFixed(4)} CNY`);
 
 async function runCase(caseId: string, repeat: number): Promise<Record<string, unknown>> {
   const fixture = inputs.fixtures.find((f) => f.caseId === caseId);
@@ -137,7 +146,6 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
         repository: {
           sourceUri: fixture.repositoryPath,
           snapshot: fixture.snapshot as never,
-          baseCommit: fixture.snapshot.sourceHead,
         },
         limits: {
           cpuCount: 2,
@@ -175,12 +183,14 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
     await fs.writeFile(path.join(dir, "candidate.diff"), attempt.patch);
     await session.dispose();
     session = undefined;
+    clearTimeout(timer);
+    // Scoring has its own budget: the agent's deadline must not cut grading short.
     const score = await scorer.evaluateDatasetCandidate({
       fixture: { ...fixture, image: { imageDigest }, manifest: { environment: { imageDigest } } },
       patch: attempt.patch,
       imageDigest,
       outputDirectory: path.join(dir, "scoring"),
-      signal: controller.signal,
+      signal: AbortSignal.timeout(30 * 60_000),
     });
     const groups = score.groups as Record<string, { status: string }> | undefined;
     result = {
@@ -336,23 +346,34 @@ function scriptedModel(
       step("edit_file", { path: "tests/devflow_probe.txt", old_text: "", new_text: "x" }),
       submit,
     ]);
-  if (name === "golden")
-    // Applies the reverse injection: validates export + scoring, never used as evidence.
+  if (name === "golden") {
+    // Restores the golden bytes of every injected file through edit_file. It validates the
+    // tools, export and scoring end to end and is never used as agent evidence.
+    const content = (files: { path: string; contentBase64?: string }[], file: string) =>
+      Buffer.from(files.find((f) => f.path === file)?.contentBase64 ?? "", "base64").toString(
+        "utf8",
+      );
+    const golden = (fixture.goldenSnapshot as { files: { path: string }[] }).files;
     return new FakeLanguageModel([
-      async (_request: ModelRequest): Promise<ModelResponse> => {
-        const patch = (
-          await fs.readFile(
-            path.join(ROOT, "datasets", fixture.slug, "benchmark", "injection.patch"),
-            "utf8",
-          )
-        ).replace(/\r\n/gu, "\n");
-        return step("bash", {
-          command: `git apply -R --whitespace=nowarn <<'DEVFLOW_EOF' && git diff --stat\n${patch}\nDEVFLOW_EOF`,
-        });
-      },
-      step("bash", { command: `${testCommand} 2>&1 | tail -15`, timeout_seconds: 600 }),
+      async (_request: ModelRequest): Promise<ModelResponse> =>
+        fakeModelResponse({
+          toolCalls: (await goldenFiles(fixture.slug)).map((file) => ({
+            id: `s${++id}`,
+            name: "edit_file",
+            input: {
+              path: file,
+              old_text: content(fixture.snapshot.files, file),
+              new_text: content(golden, file),
+            },
+          })),
+        }),
+      step("bash", {
+        command: `git diff --stat; ${testCommand} 2>&1 | tail -15`,
+        timeout_seconds: 600,
+      }),
       submit,
     ]);
+  }
   throw new Error(`Unknown script ${name}`);
 }
 

@@ -2,12 +2,13 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { FakeLanguageModel, fakeModelResponse, type ModelRequest } from "@devflow/agent";
-import type {
-  ArtifactRecord,
-  CreateArtifactInput,
-  DatabaseAdapter,
-  RunExecutionRecord,
-  RunTransitionInput,
+import {
+  PrismaDatabaseAdapter,
+  type ArtifactRecord,
+  type CreateArtifactInput,
+  type DatabaseAdapter,
+  type RunExecutionRecord,
+  type RunTransitionInput,
 } from "@devflow/database";
 import { DockerSandboxManager } from "@devflow/sandbox";
 import { DevflowError, type AgentEvent, type NewAgentEvent, type RunResult } from "@devflow/shared";
@@ -17,6 +18,7 @@ import {
   AutonomousRunExecutor,
 } from "../../apps/worker/src/autonomous/executor.js";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.js";
+import { RunProcessor } from "../../apps/worker/src/runs/run.processor.js";
 
 const enabled =
   process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION === "1" ||
@@ -218,5 +220,82 @@ describe.skipIf(!enabled)("autonomous executor in Docker", () => {
     expect(memory.artifacts.find((a) => a.kind === "DIFF")?.content).toContain(
       "+  return left - right;",
     );
+  }, 300_000);
+});
+
+describe.skipIf(
+  !process.env.TEST_DATABASE_URL || process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1",
+)("autonomous run through RunProcessor and PostgreSQL", () => {
+  it("claims, executes in a LOCAL snapshot sandbox, persists events and artifacts, and completes", async () => {
+    const database = PrismaDatabaseAdapter.fromConnectionString(process.env.TEST_DATABASE_URL!);
+    await database.connect();
+    try {
+      const repository = await database.repositories.create({
+        name: `autonomous-${randomUUID()}`,
+        sourceKind: "LOCAL",
+        sourceUri: fixture,
+      });
+      const task = await database.tasks.create({
+        repositoryId: repository.id,
+        title: "subtract adds instead of subtracting",
+        description: "subtract(5, 3) returns 8; it should return 2.",
+      });
+      const run = (await database.runs.create({ taskId: task.id, executionMode: "autonomous" }))
+        .run;
+      expect(run.executionMode).toBe("autonomous");
+      const model = new FakeLanguageModel([
+        step("1", "edit_file", {
+          path: "src/calculator.js",
+          old_text: BUG,
+          new_text: BUG.replace("left + right", "left - right"),
+        }),
+        step("2", "bash", { command: "npm test 2>&1 | tail -5" }),
+        step("3", "submit", { summary: "subtract now subtracts" }),
+      ]);
+      const environment = loadWorkerEnvironment({
+        DATABASE_URL: process.env.TEST_DATABASE_URL!,
+        DEVFLOW_SANDBOX_IMAGE: "devflow-sandbox:local",
+      });
+      const processor = new RunProcessor(
+        database.runs,
+        new AutonomousRunExecutor(database, environment, {
+          modelFactory: () => ({ model, settings: {}, bindingHash: "fake-binding" }),
+        }),
+        { workerId: "autonomous-test", leaseMs: 60_000, cancellationPollMs: 1_000 },
+      );
+      const outcome = await processor.process({
+        id: "job-autonomous",
+        data: { version: 1, runId: run.id, dispatchRevision: run.dispatchRevision },
+        opts: { attempts: 1 },
+        attemptsMade: 0,
+        timestamp: Date.now(),
+      } as never);
+
+      expect(outcome).toMatchObject({ outcome: "COMPLETED", status: "SUCCEEDED" });
+      const stored = await database.runs.findById(run.id);
+      expect(stored?.status).toBe("SUCCEEDED");
+      expect(stored?.result?.metrics.modelCalls).toBe(3);
+      const types = (await database.events.list(run.id)).map((e) => e.type);
+      expect(types).toEqual(
+        expect.arrayContaining([
+          "RUN_STARTED",
+          "LLM_REQUEST",
+          "LLM_RESPONSE",
+          "TOOL_RESULT",
+          "TEST_RESULT",
+          "DIFF_GENERATED",
+          "RUN_COMPLETED",
+        ]),
+      );
+      const artifacts = await database.artifacts.list(run.id);
+      expect(artifacts.find((a) => a.kind === "DIFF")?.content).toContain(
+        "+  return left - right;",
+      );
+      expect(artifacts.map((a) => a.name)).toEqual(
+        expect.arrayContaining(["autonomous-transcript.json", "autonomous-verification.json"]),
+      );
+    } finally {
+      await database.disconnect();
+    }
   }, 300_000);
 });

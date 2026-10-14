@@ -211,6 +211,48 @@ describe("runAgentLoop", () => {
     expect(outputs.slice(-13, -1).every((content) => content === big)).toBe(true);
   });
 
+  it("resumes a transcript with carried usage, turns and limits, checkpointing each turn", async () => {
+    const first = await runAgentLoop({
+      model: new FakeLanguageModel([
+        fakeModelResponse({ toolCalls: [call("1", "echo", { text: "a" })], usage: usage(100) }),
+        fakeModelResponse({ toolCalls: [call("2", "submit", { summary: "v1" })], usage: usage(200) }),
+      ]),
+      system: "s",
+      task: "t",
+      tools: [echoTool(), createSubmitTool()],
+      limits: { maxTurns: 4 },
+      signal: signal(),
+    });
+    const checkpoints: number[] = [];
+    const resumedModel = new FakeLanguageModel([
+      fakeModelResponse({ toolCalls: [call("3", "echo", { text: "b" })], usage: usage(300) }),
+      fakeModelResponse({ toolCalls: [call("4", "echo", { text: "c" })], usage: usage(400) }),
+    ]);
+    const second = await runAgentLoop({
+      model: resumedModel,
+      system: "ignored",
+      task: "ignored",
+      tools: [echoTool(), createSubmitTool()],
+      limits: { maxTurns: 4 },
+      signal: signal(),
+      resume: {
+        messages: [...first.messages, { role: "USER", content: "Verification failed: fix it." }],
+        usage: first.usage,
+        turns: first.turns,
+      },
+      onTurnEnd: (state) => void checkpoints.push(state.turns),
+    });
+    // The turn limit covers the whole conversation: 2 earlier + 2 resumed turns.
+    expect(second).toMatchObject({ stopReason: "TURN_LIMIT", turns: 4 });
+    expect(second.usage).toMatchObject({ modelCalls: 4, inputTokens: 1000 });
+    expect(checkpoints).toEqual([3, 4]);
+    expect(resumedModel.requests[0]!.messages.at(-1)).toMatchObject({
+      role: "USER",
+      content: "Verification failed: fix it.",
+    });
+    expect(first.messages).toHaveLength(6);
+  });
+
   it("stops at the turn limit and warns the model as it approaches", async () => {
     const steps = Array.from({ length: 6 }, (_, i) =>
       fakeModelResponse({ toolCalls: [call(String(i), "echo", { text: String(i) })] }),

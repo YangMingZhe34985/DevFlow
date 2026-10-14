@@ -21,7 +21,7 @@ import {
 } from "@devflow/agent";
 import { DockerSandboxManager, type CommandSpec, type SandboxSession } from "@devflow/sandbox";
 
-import { runSolveAttempt, type PublicCheck } from "../../apps/worker/src/autonomous/attempt.ts";
+import { runAutonomousSolve, type PublicCheck } from "../../apps/worker/src/autonomous/solve.ts";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.ts";
 import { resolveStageModel } from "../../apps/worker/src/config/stage-models.ts";
 
@@ -41,6 +41,7 @@ const { values: args } = parseArgs({
     reasoning: { type: "string", default: "low" },
     "max-output": { type: "string", default: "8192" },
     "context-tokens": { type: "string", default: "100000" },
+    "max-revisions": { type: "string", default: "2" },
     concurrency: { type: "string", default: "1" },
   },
 });
@@ -163,7 +164,7 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
     await prepareEnvironment(session, fixture, controller.signal);
     const binding = live ? liveModel() : undefined;
     const model = binding?.model ?? scriptedModel(args.script, fixture, profile.checks);
-    const attempt = await runSolveAttempt({
+    const attempt = await runAutonomousSolve({
       sandbox: session,
       issue: { title: fixture.task.title, body: fixture.task.description },
       checks: profile.checks,
@@ -176,11 +177,20 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
         deadlineAt,
         maxInputTokens: Number(args["context-tokens"]),
       },
+      maxRevisions: Number(args["max-revisions"]),
       protectedPath,
       protectedSummary: `Existing tests and build/test configuration are fixed and grade your fix; do not edit them (${protectedPaths.join(", ")}). Put scratch scripts in /tmp.`,
       signal: controller.signal,
       onEvent: (event) =>
         trajectory.write(`${JSON.stringify(eventRecord(event))}\n`).then(() => {}),
+      onVerification: async (verification, revision) => {
+        const checks = verification.checks.map(({ output, ...rest }) => ({
+          ...rest,
+          output: output.slice(-3000),
+        }));
+        const record = { type: "verification", revision, ...verification, checks };
+        await trajectory.write(`${JSON.stringify(record)}\n`);
+      },
     });
     await fs.writeFile(path.join(dir, "candidate.diff"), attempt.patch);
     await session.dispose();
@@ -201,6 +211,11 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
       summary: attempt.kernel.summary,
       error: attempt.kernel.error,
       turns: attempt.kernel.turns,
+      revisions: attempt.revisions,
+      hostVerification: attempt.verification && {
+        passed: attempt.verification.passed,
+        checks: attempt.verification.checks.map((check) => `${check.kind}:${check.status}`),
+      },
       usage: attempt.kernel.usage,
       costCny: attempt.kernel.usage.costMicros / CNY,
       wallSeconds: Math.round((Date.now() - started) / 1000),
@@ -383,32 +398,45 @@ function scriptedModel(
       submit,
     ]);
   }
-  if (name === "golden") {
-    // Restores the golden bytes of every injected file through edit_file. It validates the
-    // tools, export and scoring end to end and is never used as agent evidence.
+  if (name === "golden" || name === "revise") {
+    // Restores the golden bytes of injected files through edit_file. "golden" fixes all of
+    // them; "revise" leaves the last one for after host verification fails, exercising the
+    // revision loop. Both validate tooling and scoring and are never agent evidence.
     const content = (files: { path: string; contentBase64?: string }[], file: string) =>
       Buffer.from(files.find((f) => f.path === file)?.contentBase64 ?? "", "base64").toString(
         "utf8",
       );
     const golden = (fixture.goldenSnapshot as { files: { path: string }[] }).files;
+    const restore = (files: string[]) =>
+      fakeModelResponse({
+        toolCalls: files.map((file) => ({
+          id: `s${++id}`,
+          name: "edit_file",
+          input: {
+            path: file,
+            old_text: content(fixture.snapshot.files, file),
+            new_text: content(golden, file),
+          },
+        })),
+      });
+    const check = step("bash", {
+      command: `git diff --stat; ${testCommand} 2>&1 | tail -15`,
+      timeout_seconds: 600,
+    });
     return new FakeLanguageModel([
-      async (_request: ModelRequest): Promise<ModelResponse> =>
-        fakeModelResponse({
-          toolCalls: (await goldenFiles(fixture.slug)).map((file) => ({
-            id: `s${++id}`,
-            name: "edit_file",
-            input: {
-              path: file,
-              old_text: content(fixture.snapshot.files, file),
-              new_text: content(golden, file),
-            },
-          })),
-        }),
-      step("bash", {
-        command: `git diff --stat; ${testCommand} 2>&1 | tail -15`,
-        timeout_seconds: 600,
-      }),
+      async () => {
+        const files = await goldenFiles(fixture.slug);
+        return restore(name === "revise" ? files.slice(0, -1) : files);
+      },
+      check,
       submit,
+      async (request: ModelRequest): Promise<ModelResponse> => {
+        const feedback = request.messages.at(-1);
+        if (feedback?.role !== "USER" || !feedback.content.includes("verification"))
+          throw new Error("revise script expected host verification feedback");
+        return restore((await goldenFiles(fixture.slug)).slice(-1));
+      },
+      step("submit", { summary: "scripted revise: fixed after host feedback" }),
     ]);
   }
   throw new Error(`Unknown script ${name}`);

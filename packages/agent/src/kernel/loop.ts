@@ -40,6 +40,7 @@ export interface KernelUsage {
 }
 
 export type KernelEvent =
+  | { type: "model_request"; turn: number; worstCaseMicros: number }
   | { type: "model"; turn: number; response: ModelResponse; costMicros: number }
   | { type: "model_error"; turn: number; message: string; willRetry: boolean }
   | {
@@ -61,6 +62,13 @@ export interface KernelResult {
   error?: string;
 }
 
+/** A transcript and its metered usage, from a checkpoint or an earlier loop. */
+export interface KernelResume {
+  messages: readonly ModelMessage[];
+  usage: KernelUsage;
+  turns: number;
+}
+
 export interface KernelOptions {
   model: LanguageModelPort;
   system: string;
@@ -75,6 +83,13 @@ export interface KernelOptions {
   retryDelayMs?: number;
   /** Per-call timeout (default 4 minutes); a timed-out call is retried. */
   callTimeoutMs?: number;
+  /**
+   * Continue an earlier transcript instead of starting from system + task. Usage and turns
+   * carry over, so limits apply to the whole conversation, not to each continuation.
+   */
+  resume?: KernelResume;
+  /** Called after every turn's tool results are appended; used for durable checkpoints. */
+  onTurnEnd?(state: KernelResume): void | Promise<void>;
 }
 
 const KEEP_RECENT_TOOL_RESULTS = 12;
@@ -95,24 +110,28 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
     inputSchema,
     readOnly,
   }));
-  const messages: ModelMessage[] = [
-    { role: "SYSTEM", content: options.system },
-    { role: "USER", content: options.task },
-  ];
-  const usage: KernelUsage = {
-    modelCalls: 0,
-    inputTokens: 0,
-    cachedInputTokens: 0,
-    outputTokens: 0,
-    reasoningTokens: 0,
-    costMicros: 0,
-    unconfirmedCostMicros: 0,
-  };
+  const messages: ModelMessage[] = options.resume
+    ? structuredClone([...options.resume.messages])
+    : [
+        { role: "SYSTEM", content: options.system },
+        { role: "USER", content: options.task },
+      ];
+  const usage: KernelUsage = options.resume
+    ? { ...options.resume.usage }
+    : {
+        modelCalls: 0,
+        inputTokens: 0,
+        cachedInputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        costMicros: 0,
+        unconfirmedCostMicros: 0,
+      };
   const maxOutput = options.settings?.maxOutputTokens ?? 8192;
   let lastPromptTokens = 0;
   let lastPromptBytes = 0;
   let idleReplies = 0;
-  let turn = 0;
+  let turn = options.resume?.turns ?? 0;
   const finish = (stopReason: KernelStopReason, extra: Partial<KernelResult> = {}) => ({
     stopReason,
     turns: turn,
@@ -140,13 +159,14 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
     if (limits.maxCostMicros !== undefined && spent() + worstCase > limits.maxCostMicros)
       return finish("COST_LIMIT");
     turn += 1;
+    await options.onEvent?.({ type: "model_request", turn, worstCaseMicros: worstCase });
 
     let response: ModelResponse | undefined;
     for (let attempt = 0; response === undefined; attempt++) {
       try {
         response = await model.generate(
           {
-            messages,
+            messages: [...messages],
             tools: descriptors,
             ...(options.settings ? { settings: options.settings } : {}),
           },
@@ -205,6 +225,7 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
             ? "Your reply hit the output limit before any tool call. Be brief and call a tool."
             : "Continue by calling a tool. When the fix is complete and verified, call submit.",
       });
+      await options.onTurnEnd?.({ messages, usage: { ...usage }, turns: turn });
       continue;
     }
     idleReplies = 0;
@@ -247,6 +268,7 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
         return finish("SUBMITTED", { summary: result.submitted.summary });
       }
     }
+    await options.onTurnEnd?.({ messages, usage: { ...usage }, turns: turn });
   }
   return finish("TURN_LIMIT");
 }

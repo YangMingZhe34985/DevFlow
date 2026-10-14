@@ -1,3 +1,4 @@
+export * from "./aci/index.js";
 export * from "./builtins.js";
 export * from "./contracts.js";
 export * from "./executor.js";

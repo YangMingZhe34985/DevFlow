@@ -448,9 +448,16 @@ function toAiMessage(message: ModelMessage): AiModelMessage {
             type: "tool-result",
             toolCallId: message.toolCallId,
             toolName: message.toolName,
-            output: message.isError
-              ? { type: "error-json", value: toJsonValue(message.content) }
-              : { type: "json", value: toJsonValue(message.content) },
+            // Plain-text results (shell output, numbered source) stay readable instead of
+            // being JSON-escaped, which also keeps their token count down.
+            output:
+              typeof message.content === "string"
+                ? message.isError
+                  ? { type: "error-text", value: message.content }
+                  : { type: "text", value: message.content }
+                : message.isError
+                  ? { type: "error-json", value: toJsonValue(message.content) }
+                  : { type: "json", value: toJsonValue(message.content) },
           },
         ],
       };

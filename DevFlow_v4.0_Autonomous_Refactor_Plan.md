@@ -22,19 +22,19 @@
 
 数据来自十题批次 `0bf544c` 和截至 `1f55499` 的定向复测。
 
-| 案例                            | 直接失败原因                                                                                                                                  | 关键证据                                                                                                                                          | 根因        |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
-| E01 MiniIndex（C++，11.8 万行） | 十题批次：公开测试未通过，但独立评分通过。复测：补丁已全部验收通过，但在 Review 前被费用预检拦下。                                            | Coding 在提交前无法自己运行公开测试；Review 预约在补丁完成后才竞争剩余费用。                                                                      | R2 R4       |
-| E06 LogStream（C++）            | 始终没有形成 Plan。三个 Investigator 都以 STALLED/BUDGET_STOP 结束，最后报 “Resource Budget Scheduler denied the operation before dispatch”。 | 12 次请求、11.2 万输入 Token 全部花在调查上，Coding 一次也没派发。                                                                                | R3 R4 R6    |
-| E07 FormStudio                  | 十题批次：“Collaboration ended: MODEL_OUTPUT_INVALID”。定向复测 PASS。                                                                        | 一次决策 Schema 不合规就终止整个协作。                                                                                                            | R7          |
-| E08 PyPlugin（Python）          | 三个 Investigator 都没找到 `run` 命令的查找代码，结果为 INSUFFICIENT_EVIDENCE。复测时 Repair 差 10,439 Token，没有派发。                      | Investigator 把 `PluginNotFoundError(`、`plugin_group.command("r` 当查询词，交给了自然语言检索。19 次团队请求消耗 12.9 万输入 Token，占全程 70%。 | R3 R4 R6    |
-| E10 FlowEngine（TS）            | 四个注入文件找到三个。第四个（event codec）在测试反馈后已被模型准确诊断，但写入范围被锁定，而 Replan 报价需要 43 次逻辑工具，只剩 22 次。     | 见 §1.2                                                                                                                                           | R1 R2 R4 R5 |
+| 案例                            | 直接失败原因                                                                                                                                                                       | 关键证据                                                                                                                                          | 根因        |
+| ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ----------- |
+| E01 MiniIndex（C++，11.8 万行） | 十题批次：公开测试未通过，但独立评分通过。复测：补丁已全部验收通过，但在 Review 前被费用预检拦下。                                                                                 | Coding 在提交前无法自己运行公开测试；Review 预约在补丁完成后才竞争剩余费用。                                                                      | R2 R4       |
+| E06 LogStream（C++）            | 始终没有形成 Plan。三个 Investigator 都以 STALLED/BUDGET_STOP 结束，最后报 “Resource Budget Scheduler denied the operation before dispatch”。                                      | 12 次请求、11.2 万输入 Token 全部花在调查上，Coding 一次也没派发。                                                                                | R3 R4 R6    |
+| E07 FormStudio                  | 十题批次：“Collaboration ended: MODEL_OUTPUT_INVALID”。定向复测 PASS。                                                                                                             | 一次决策 Schema 不合规就终止整个协作。                                                                                                            | R7          |
+| E08 PyPlugin（Python）          | 三个 Investigator 都没找到 `run` 命令的查找代码，结果为 INSUFFICIENT_EVIDENCE。复测时 Repair 差 10,439 Token，没有派发。                                                           | Investigator 把 `PluginNotFoundError(`、`plugin_group.command("r` 当查询词，交给了自然语言检索。19 次团队请求消耗 12.9 万输入 Token，占全程 70%。 | R3 R4 R6    |
+| E10 FlowEngine（TS）            | 四个注入文件中三个的故障代码被定位；第四个（event codec）只看到无关的 5 行，故障分支在测试反馈后才被模型准确诊断，但写入范围被锁定，而 Replan 报价需要 43 次逻辑工具，只剩 22 次。 | 见 §1.2                                                                                                                                           | R1 R2 R4 R5 |
 
 ### 1.2 E10 解剖：模型知道答案，但只剩 `finishPhase` 可用
 
 数据来自 `docs/performance/results/new-dataset-failed-five-e10-r1-20261013/requests/`。
 
-1. **团队调查**：2 次 Coordinator 请求加 7 次 Investigator 请求，共 64,022 输入 Token。正确找到 `status-codec.ts`、`run-serializer.ts`、`run-summary-builder.ts`，漏掉了 `event-codec.ts`。
+1. **团队调查**：2 次 Coordinator 请求加 7 次 Investigator 请求，共 64,022 输入 Token。正确定位了 `status-codec.ts`、`run-serializer.ts`、`run-summary-builder.ts` 中的故障代码。`event-codec.ts` 虽然出现在证据里，但只展示了与故障无关的第 106–110 行（`decodeEventRecords` 开头），被注入的 `encodeEvent` 分支从未进入模型视野（Codex 只读核查更正，见 `.devflow/v4-research/B-batch-analysis.md`）。
 2. **Plan 审批**：把这三个文件批准为 EDIT 范围。
 3. **Coding**：7 次请求，共 121,208 输入 Token，改了三个文件。其中一次 `replaceText` 返回 `TEXT_MATCH_COUNT`，需要重试。随后 finishPhase，宿主验证结果为 build/typecheck/lint PASS，test FAIL，还剩 18 个失败。
 4. **模型的判断完全正确**：剩余失败都在事件发射和 codec 上（`emitted-events.test.ts:105` 收到的是 NODE_COMPLETED），不在批准的三文件范围内。于是它提交 `SCOPE_CONFLICT`，并附上三个测试文件作为证据。

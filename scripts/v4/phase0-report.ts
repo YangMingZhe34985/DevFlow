@@ -71,7 +71,7 @@ const passedCases = [...byCase.values()].filter((runs) =>
 lines.push(
   "",
   `运行 ${rows.length} 次，严格通过 ${rows.filter((r) => r.strictPatchPass).length} 次；至少通过一次的案例 ${passedCases}/${byCase.size}。`,
-  `总费用（无缓存上限口径）¥${fmt(
+  `总费用（配置价格、缓存感知已结算口径）¥${fmt(
     rows.reduce((n, r) => n + (r.costCny ?? 0), 0),
     4,
   )}，未确认上界 ¥${fmt(unconfirmed, 4)}；输入 ${input} Token，其中缓存命中 ${cached}（${input ? fmt((cached / input) * 100, 1) : "0"}%）。`,

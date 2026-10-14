@@ -14,16 +14,21 @@ import {
   createConfiguredLanguageModel,
   FakeLanguageModel,
   fakeModelResponse,
+  kernelCost,
   type KernelEvent,
+  type KernelPrice,
   type LanguageModelPort,
   type ModelRequest,
   type ModelResponse,
+  type ModelReasoningEffort,
 } from "@devflow/agent";
 import { DockerSandboxManager, type CommandSpec, type SandboxSession } from "@devflow/sandbox";
 
-import { runAutonomousSolve, type PublicCheck } from "../../apps/worker/src/autonomous/solve.ts";
+import { type PublicCheck } from "../../apps/worker/src/autonomous/solve.ts";
+import { runAttempts } from "../../apps/worker/src/autonomous/attempts.ts";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.ts";
 import { resolveStageModel } from "../../apps/worker/src/config/stage-models.ts";
+import { serialScore } from "./scoring-queue.ts";
 
 const ROOT = path.resolve(fileURLToPath(new URL("../../", import.meta.url)));
 const { values: args } = parseArgs({
@@ -128,7 +133,9 @@ const worker = async () => {
 };
 await Promise.all(Array.from({ length: Math.max(1, Number(args.concurrency)) }, worker));
 console.log(JSON.stringify(summaries.map(brief), null, 2));
-console.log(`Total cost (uncached upper basis): ${(spentMicros / CNY).toFixed(4)} CNY`);
+console.log(
+  `Total cost (configured cache-aware prices, including unconfirmed upper bound): ${(spentMicros / CNY).toFixed(4)} CNY`,
+);
 
 async function runCase(caseId: string, repeat: number): Promise<Record<string, unknown>> {
   const fixture = inputs.fixtures.find((f) => f.caseId === caseId);
@@ -150,6 +157,8 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
       : scorer.isProtectedDatasetPath(file, protectedPaths)
         ? `${file} is protected: tests and build/test configuration grade your fix, so change source files instead. Put scratch scripts in /tmp.`
         : undefined;
+  let reviewActive = false;
+  let uncachedMicros = 0;
   const controller = new AbortController();
   const started = Date.now();
   const deadlineAt = started + Number(args["timeout-min"]) * 60_000;
@@ -158,35 +167,77 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
   let session: SandboxSession | undefined;
   let result: Record<string, unknown> = { caseId, repeat, script: live ? "live" : args.script };
   try {
-    session = await manager.create(
-      {
-        runId: randomUUID(),
-        owner: { executionOwner: "v4-phase0", dispatchRevision: 0, segment: randomUUID() },
-        repository: {
-          sourceUri: fixture.repositoryPath,
-          snapshot: fixture.snapshot as never,
+    const sandboxFactory = async () => {
+      await session?.dispose();
+      session = await manager.create(
+        {
+          runId: randomUUID(),
+          owner: { executionOwner: "v4-phase0", dispatchRevision: 0, segment: randomUUID() },
+          repository: {
+            sourceUri: fixture.repositoryPath,
+            snapshot: fixture.snapshot as never,
+          },
+          limits: {
+            cpuCount: 2,
+            memoryMb: 4096,
+            pids: 512,
+            timeoutMs: 900_000,
+            networkEnabled: false,
+          },
+          environment: sandboxEnvironment(fixture.family),
         },
-        limits: {
-          cpuCount: 2,
-          memoryMb: 4096,
-          pids: 512,
-          timeoutMs: 900_000,
-          networkEnabled: false,
-        },
-        environment: sandboxEnvironment(fixture.family),
-      },
-      controller.signal,
-    );
-    await prepareEnvironment(session, fixture, controller.signal);
+        controller.signal,
+      );
+      await prepareEnvironment(session, fixture, controller.signal);
+      return session;
+    };
+    const environment = loadWorkerEnvironment({
+      DATABASE_URL: "postgresql://unused:unused@localhost/unused",
+      ...process.env,
+    });
     const binding = live ? liveModel() : undefined;
     const model = binding?.model ?? scriptedModel(args.script, fixture, profile.checks);
-    const attempt = await runAutonomousSolve({
-      sandbox: session,
+    const reviewer =
+      environment.DEVFLOW_AUTONOMOUS_REVIEW === "1"
+        ? live
+          ? liveModel("REVIEW")
+          : {
+              model: new FakeLanguageModel([
+                fakeModelResponse({
+                  toolCalls: [
+                    {
+                      id: "review",
+                      name: "submit_review",
+                      input: {
+                        verdict: "PASS",
+                        findings: [],
+                        summary: "Scripted review for harness verification only.",
+                      },
+                    },
+                  ],
+                }),
+              ]),
+              settings: {},
+              price: PRICE,
+            }
+        : undefined;
+    const attempts = await runAttempts({
+      sandboxFactory,
+      maxAttempts: environment.DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS,
       issue: { title: fixture.task.title, body: fixture.task.description },
       checks: profile.checks,
       model,
       ...(binding ? { settings: binding.settings } : {}),
       price: PRICE,
+      ...(reviewer
+        ? {
+            review: {
+              ...reviewer,
+              maxTurns: environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS,
+              reserve: environment.DEVFLOW_AUTONOMOUS_REVIEW_RESERVE,
+            },
+          }
+        : {}),
       limits: {
         maxTurns: Number(args["max-turns"]),
         maxCostMicros: Number(args["max-cost-cny"]) * CNY,
@@ -197,8 +248,28 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
       protectedPath,
       protectedSummary: `Existing tests and build/test configuration are fixed and grade your fix; do not edit them (${protectedPaths.join(", ")}). Put scratch scripts in /tmp.`,
       signal: controller.signal,
-      onEvent: (event) =>
-        trajectory.write(`${JSON.stringify(eventRecord(event))}\n`).then(() => {}),
+      onEvent: async (event) => {
+        if (event.type === "model")
+          uncachedMicros += kernelCost(
+            reviewActive ? (reviewer?.price ?? PRICE) : PRICE,
+            event.response.usage.inputTokens,
+            0,
+            event.response.usage.outputTokens,
+          );
+        await trajectory.write(`${JSON.stringify(eventRecord(event))}\n`);
+      },
+      onAttemptComplete: async (result) => {
+        await fs.writeFile(
+          path.join(dir, `autonomous-transcript-attempt-${result.attempt}.json`),
+          JSON.stringify(result),
+        );
+      },
+      onReview: async (review) => {
+        reviewActive = review === undefined;
+        await trajectory.write(
+          `${JSON.stringify({ type: review ? "review_result" : "review_started", review })}\n`,
+        );
+      },
       onVerification: async (verification, revision) => {
         const checks = verification.checks.map(({ output, ...rest }) => ({
           ...rest,
@@ -208,38 +279,42 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
         await trajectory.write(`${JSON.stringify(record)}\n`);
       },
     });
+    const attempt = attempts.selected;
     await fs.writeFile(path.join(dir, "candidate.diff"), attempt.patch);
-    await session.dispose();
+    await session?.dispose();
     session = undefined;
     clearTimeout(timer);
     // Scoring has its own budget: the agent's deadline must not cut grading short.
-    const score = await scorer.evaluateDatasetCandidate({
-      fixture: { ...fixture, image: { imageDigest }, manifest: { environment: { imageDigest } } },
-      patch: attempt.patch,
-      imageDigest,
-      outputDirectory: path.join(dir, "scoring"),
-      signal: AbortSignal.timeout(30 * 60_000),
-    });
+    const score = await serialScore(() =>
+      scorer.evaluateDatasetCandidate({
+        fixture: { ...fixture, image: { imageDigest }, manifest: { environment: { imageDigest } } },
+        patch: attempt.patch,
+        imageDigest,
+        outputDirectory: path.join(dir, "scoring"),
+        signal: AbortSignal.timeout(30 * 60_000),
+      }),
+    );
     const groups = score.groups as Record<string, { status: string }> | undefined;
     result = {
       ...result,
       stopReason: attempt.kernel.stopReason,
       summary: attempt.kernel.summary,
       error: attempt.kernel.error,
-      turns: attempt.kernel.turns,
+      turns: attempts.turns,
       revisions: attempt.revisions,
       hostVerification: attempt.verification && {
         passed: attempt.verification.passed,
         checks: attempt.verification.checks.map((check) => `${check.kind}:${check.status}`),
       },
-      usage: attempt.kernel.usage,
-      costCny: attempt.kernel.usage.costMicros / CNY,
+      review: attempt.review
+        ? { verdict: attempt.review.verdict, findings: attempt.review.findings.length }
+        : null,
+      attempts: attempts.attempts.length,
+      selectedAttempt: attempts.selectedAttempt,
+      usage: attempts.usage,
+      costCny: attempts.usage.costMicros / CNY,
       priceBasis: cachedRatio > 0 ? `cached-hits-at-${cachedRatio}` : "uncached-upper",
-      uncachedBasisCny:
-        (attempt.kernel.usage.inputTokens * UNCACHED.inputMicrosPerMillionTokens +
-          attempt.kernel.usage.outputTokens * UNCACHED.outputMicrosPerMillionTokens) /
-        1_000_000 /
-        CNY,
+      uncachedBasisCny: uncachedMicros / CNY,
       wallSeconds: Math.round((Date.now() - started) / 1000),
       changedFiles: attempt.changedFiles,
       excludedFiles: attempt.excludedFiles,
@@ -261,18 +336,33 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
   return result;
 }
 
-function liveModel(): {
+function liveModel(stage: "EXECUTE" | "REVIEW" = "EXECUTE"): {
   model: LanguageModelPort;
-  settings: { reasoningEffort: never; maxOutputTokens: number };
+  settings: {
+    reasoningEffort?: ModelReasoningEffort;
+    maxOutputTokens?: number;
+  };
+  price?: KernelPrice;
 } {
-  const binding = resolveStageModel("EXECUTE", loadWorkerEnvironment(process.env));
+  const binding = resolveStageModel(stage, loadWorkerEnvironment(process.env));
   const { contextMaxBytes: _ignored, ...config } = binding.config;
+  const prices = JSON.parse(process.env.DEVFLOW_MODEL_PRICES_JSON ?? "{}") as Record<
+    string,
+    KernelPrice
+  >;
+  const price = prices[`${binding.provenance.provider}:${binding.provenance.model}`];
+  if (stage === "REVIEW" && !price)
+    throw new Error("Reviewer requires a configured price in DEVFLOW_MODEL_PRICES_JSON.");
   return {
     model: createConfiguredLanguageModel(config),
-    settings: {
-      reasoningEffort: args.reasoning as never,
-      maxOutputTokens: Number(args["max-output"]),
-    },
+    ...(price ? { price } : {}),
+    settings:
+      stage === "REVIEW"
+        ? binding.settings
+        : {
+            reasoningEffort: args.reasoning as never,
+            maxOutputTokens: Number(args["max-output"]),
+          },
   };
 }
 

@@ -741,6 +741,7 @@ function RunForm({
   }) {
   const selectedTask = tasks.find((task) => task.id === selectedTaskId);
   const [idempotencyKey, setIdempotencyKey] = useState("");
+  const [executionMode, setExecutionMode] = useState<"workflow" | "autonomous">("workflow");
   const [modelProvider, setModelProvider] = useState("");
   const [modelName, setModelName] = useState("");
   const [maxSteps, setMaxSteps] = useState("25");
@@ -754,6 +755,7 @@ function RunForm({
     try {
       const response = await createRun({
         taskId: selectedTaskId,
+        executionMode,
         ...(idempotencyKey.trim() === "" ? {} : { idempotencyKey: idempotencyKey.trim() }),
         ...(modelProvider.trim() === "" ? {} : { modelProvider: modelProvider.trim() }),
         ...(modelName.trim() === "" ? {} : { modelName: modelName.trim() }),
@@ -810,6 +812,19 @@ function RunForm({
             </div>
           </dl>
         )}
+        <label>
+          Execution mode
+          <select
+            data-testid="run-execution-mode"
+            value={executionMode}
+            onChange={(event) =>
+              setExecutionMode(event.target.value === "autonomous" ? "autonomous" : "workflow")
+            }
+          >
+            <option value="workflow">workflow（规划 → 审批 → 编码 → 验证 → Review）</option>
+            <option value="autonomous">autonomous（v4：单 Agent 自主求解 + 宿主验证）</option>
+          </select>
+        </label>
         <label>
           Idempotency key
           <input

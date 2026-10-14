@@ -348,9 +348,11 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         turn: event.turn,
         name: event.call.name,
         input: JSON.stringify(event.call.input).slice(0, 2000),
-        isError: event.isError,
+        ok: !event.isError,
         durationMs: event.durationMs,
-        output: event.content.slice(0, 4000),
+        ...(event.isError
+          ? { error: event.content.slice(0, 4000) }
+          : { output: event.content.slice(0, 4000) }),
       });
     } else if (event.type === "model_error") {
       await this.append(runId, "WORKFLOW_CHECKPOINT", { modelError: event }, "WARN");

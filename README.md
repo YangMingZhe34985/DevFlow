@@ -1,43 +1,10 @@
 # DevFlow 2.4.0
 
-Version **2.4.0** adds opt-in Progressive Repository Graph localization. Its frozen real
-batch strictly passed **1/3 (E05)**; E06 and E10 remain unresolved. The E05 legacy-dynamic
-control stopped on Planner output validation, so this comparison does not isolate PRG's
-localization benefit. See [the real results](docs/prg-validation-20261012.md) and
-[implementation and limits](docs/prg-implementation.md). The default mode remains `legacy`.
+The package remains **2.4.0**. PRG localization is opt-in; legacy remains the default. Dynamic teams are experimental, disabled by default and have not met the v3.0 release gate.
 
-The opt-in **v3 multi-agent experiment** adds persistent tasks, independent read-only investigators,
-evidence messages and shared Run accounting while retaining one Coding writer and existing approvals.
-It remains disabled by default and has **not** met its release gate. After the initial two attempts,
-four further E10 iterations still stopped before Planner; an unknown Provider receipt halted further paid runs.
-Package version stays **2.4.0**. See [the architecture and rollback guide](docs/v3-multi-agent.md),
-[engineering checks](docs/v3-validation.md) and [the latest iteration results](docs/v3-e10-iterations-20261013.md).
-
-The subsequent [stability and controlled-action update](docs/stability-autonomy-architecture-20261013.md)
-corrects continuation pricing, reserves a shared Coordinator decision, persists bounded message
-correction, and fences expired Worker ownership. Optional `runDiagnostic` is disabled by default;
-it uses a frozen public verification profile in an isolated copy and cannot replace final validation
-or independent Review. See [the acceptance record](docs/stability-autonomy-validation-20261013.md)
-for free replay evidence and remaining real-model gates.
-
-The [context-management follow-up](docs/context-management-repair-20261013.md) adds recoverable
-team working memory, same-version source-range references and bounded Coding summaries through
-the existing Scheduler. Frozen-request replay checks evidence preservation and serialized input;
-it is not a new real-model success-rate result.
-
-The **2.3.1 baseline** shares one persistent Coding Session for editing and failure repair. The earlier Resource Budget Scheduler batch strictly passed **1/4** cases (E07). E10 dispatched Replan, received a new approval and resumed Coding, but did not complete a repair; that batch did not meet its E10-specific version gate. See [the scheduler architecture](docs/resource-budget-scheduler.md), [its results and unresolved issues](docs/resource-budget-validation-20261008.md), and [the earlier v2.3 validation](docs/unified-coding-loop-20261008.md).
-
-The later [E10 Runtime P0 follow-up](docs/e10-runtime-p0-20261008.md) passed original-request Docker replay and engineering checks. Its separate real E10 attempt failed public tests and stopped on downstream time preflight; **0/1 strict passes**. That experiment used package version 2.3.0.
-
-The separate [Tool Call Recovery follow-up](docs/tool-call-recovery-e02-live-20261009.md) passed one fresh E02 full run, including public validation, replan/new approval, same-session recovery, independent scoring and Review (**1/1**). Malformed-argument recovery was verified by original-request Docker replay; the fresh run did not reproduce that error. This is a single-case result on a later frozen version, not a new cohort success rate.
-
-On that unchanged production Runtime, the later [E05/E06/E08/E10 directed validation](docs/four-case-validation-20261009.md) strictly passed **1/4 (E08)**. E05 retained a public-test failure, E06 stopped with insufficient implementation evidence, and E10 replanned/resumed but stopped at the tool limit with unresolved failures. These are separate case results; E10 still has not met the v2.4 gate.
-
-The **2.3.1 patch release** packages the verified scheduler, deterministic context projection and bounded tool-call recovery improvements. See the [current technical report](docs/technical-report-v2.3.1-20261010.md) for architecture, validation and remaining limitations. Historical experiment versions and results are preserved.
+Read the [version history, implementation and current issues](docs/devflow-history-and-architecture.md) (Chinese) or the [documentation index](docs/README.md). The latest full ten-case frozen batch passed 5/10 strictly. Subsequent directed repairs passed E07; E01 passed independent patch acceptance but could not issue Review under its cost preflight. The other directed cases did not strictly pass. These separate versions must not be combined into a current success rate. Real accepted AgentMessage count remains zero; explicit communication is not yet validated in real runs.
 
 [中文](README_CN.md) | [English](README.md)
-
-For a module-by-module explanation of the current implementation, read the [project architecture study guide (Chinese)](docs/project-study-guide-v2.3.1.md). It covers end-to-end execution, runtime internals, design tradeoffs and source reading paths.
 
 DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, approved planning, an iterative Coding Loop, deterministic final validation and independent review.
 
@@ -52,12 +19,8 @@ The API persists intent and queues work. The Worker owns execution; agents acces
 - Tool-free Review with bounded host evidence and public reproductions; confirmed defects return to the same Coding Session with diagnostic tasks, SHA-linked evidence and checked answers.
 - Public build/typecheck/lint/test profiles, source-aware diagnostic handoff and one bounded scope replan requiring a new approval.
 - One Coding Session retains history, checkpoints, tool policy and resource consumption across edits and public test/review failures. Repeated observations cannot earn new progress; edit-format, tool-argument and output correction share one bounded credit.
-- A stable patch remains editable within approval. `finishPhase` yields to Workflow-owned final validation; failures or explicit unfinished work can return to the same session within the remaining limits. Final Review remains independent. See [the current Coding lifecycle](docs/unified-coding-loop-20261008.md).
+- A stable patch remains editable within approval. `finishPhase` yields to Workflow-owned final validation; failures or explicit unfinished work can return to the same session within the remaining limits. Final Review remains independent. See [the current Coding lifecycle](docs/devflow-history-and-architecture.md).
 - A Run-scoped Resource Budget Scheduler with persisted admission/settlement, actual-request estimates and operation-based replan reservations. Logical tools, internal execution and IO have separate accounting; hard limits and protected write scope remain enforced.
-
-An earlier nine-case cohort on a different version passed strict end-to-end acceptance in 5/9 cases. A separate financial continuation passed one spending-interrupted case, bringing that historical nine-case coverage to six strict successes. These are not results for the current Scheduler version. This small dataset demonstrates capability within the tested repositories; broader evaluation is needed to estimate general repair success. See [validation and known limits](docs/validation-v2.md).
-
-The v2.2 dataset experiments separately validated E09 and E01 in one frozen batch and E08 in a subsequent single-case batch. These records use different versions and are not a combined cohort success rate. See [the current experiment records](docs/new-dataset-validation-20261007.md).
 
 ## Quick start
 
@@ -96,7 +59,7 @@ Repository + pinned Task -> Localization -> Planner -> Plan Approval
   -> Diff -> Local completion or approved GitHub Push / Pull Request
 ```
 
-A valid proposal, a passing test suite and a verified Issue repair are separate results. Empty/all-inspection plans do not authorize writes. New scope requires approval. Review is independent and remains tool-free with host-provided current evidence. See [stage responsibilities and guardrails](docs/v2-workflow.md).
+A valid proposal, a passing test suite and a verified Issue repair are separate results. Empty/all-inspection plans do not authorize writes. New scope requires approval. Review is independent and remains tool-free with host-provided current evidence. See [stage responsibilities and guardrails](docs/devflow-history-and-architecture.md).
 
 ## Repository
 
@@ -120,4 +83,4 @@ node scripts/check-release-files.mjs
 
 Docker integration runners require explicit opt-in and local infrastructure. The standard unit suite has no paid-model requirement. GitHub publication is disabled by default and requires approval plus platform credentials kept outside the sandbox.
 
-[Architecture](docs/architecture.md) · [Test layout](tests/README.md) · [Scripts](scripts/README.md) · [MIT License](LICENSE)
+[Architecture](docs/devflow-history-and-architecture.md) · [Test layout](tests/README.md) · [Scripts](scripts/README.md) · [MIT License](LICENSE)

@@ -1,5 +1,7 @@
 # ADR-0001：使用 npm workspaces 与端口式模块边界
 
+历史决定，保留作为设计来源。原文中的“暂不引入多 Agent”等描述是初始化时的范围；后续 v2.4 开发分支已增加可关闭的团队实验，但仍复用原 Worker、端口和持久化设施。当前架构及验证边界见[溯源书](../devflow-history-and-architecture.md)。
+
 - 状态：Accepted
 - 日期：2026-09-18
 

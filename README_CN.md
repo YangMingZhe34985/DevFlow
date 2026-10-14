@@ -1,26 +1,10 @@
 # DevFlow 2.4.0
 
-**2.4.0** 增加可选 PRG 渐进定位，冻结真实批次严格通过 **1/3（E05）**，E06/E10 仍未修复。
-E05 的 legacy-dynamic 对照被 Planner 输出校验阻断，尚不能单独确认 PRG 的定位增益。
-详见[真实验收报告](docs/prg-validation-20261012.md)和[接入及局限](docs/prg-implementation.md)。未指定模式时继续使用 `legacy`。
+当前包版本为 **2.4.0**。PRG 为可选定位模式，默认仍为 legacy；动态多 Agent 为默认关闭的实验功能，尚未达到 v3.0 发布门槛。
 
-可选的 **v3 多 Agent 实验实现**新增持久化任务板、独立只读调查者、证据消息和共享 Run 预算，保留唯一 Coding 写者及原审批。
-团队模式默认关闭，**尚未达到发布门槛**：初始两次之后的四次 E10 迭代仍在 Planner 前停止，最新一次存在未知 Provider 回执，已暂停新增付费运行。包版本保持 **2.4.0**。
-详见[架构与启用／回退说明](docs/v3-multi-agent.md)、[工程验收](docs/v3-validation.md)及[最新迭代结果](docs/v3-e10-iterations-20261013.md)。
-
-**2.3.1 基线**的代码编辑与失败修复共用持久化 Coding Session。此前 Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，未达到该批次的 E10 专用升级条件。见[资源调度架构](docs/resource-budget-scheduler.md)、[该批结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
-
-后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），该实验使用包版本 2.3.0。
-
-独立的[Tool Call Recovery 定向验收](docs/tool-call-recovery-e02-live-20261009.md)重新运行 E02 一次，公开验证、重新规划／新审批、同 Session 恢复、独立评分及 Review 均通过（**1/1**）。畸形参数恢复由原请求 Docker 回放验证，本次真实实验未重现该错误。这是后续冻结版本的单题结果，不是新的整批成功率。
-
-同一生产 Runtime 的后续[E05/E06/E08/E10 定向验证](docs/four-case-validation-20261009.md)严格通过 **1/4（E08）**。E05 原测试仍失败，E06 因实现证据不足停止，E10 已重新规划并恢复但仍有失败、最终停在工具上限。各批结果分别保留，E10 仍未达到 v2.4 条件。
-
-**2.3.1 补丁版本**整合已验证的资源调度、确定性上下文投影和有界工具参数恢复改进；详见[当前版本技术报告](docs/technical-report-v2.3.1-20261010.md)。历史实验版本与结果原样保留，本次版本整理不等于新增真实验收。
+项目复习与历史追溯请阅读[版本变更、架构与当前问题](docs/devflow-history-and-architecture.md)，操作文档见[文档入口](docs/README.md)。最近完整十题冻结批次严格通过 5/10；后续五题定向修复中 E07 严格通过，E01 补丁独立验收通过但 Review 被费用预检阻断，其余未严格通过。这些是不同版本的实验，不能合并为当前成功率。真实有效 AgentMessage 仍为 0，显式通信闭环尚未获得真实验证。
 
 [中文](README_CN.md) | [English](README.md)
-
-**项目复习入口：[整体技术报告与源码阅读指南](docs/project-study-guide-v2.3.1.md)**。从完整任务流转开始，介绍重点模块的内部机制、接口、设计取舍和源码入口，并提供自测问题。
 
 DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。
 
@@ -35,12 +19,8 @@ API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略
 - Review 保持无工具，可请求宿主进行有界补证和隔离的公开复现；确认的缺陷携带诊断任务、与当前 SHA 关联的证据和经校验的答复，返回同一 Coding Session。
 - 公开 build/typecheck/lint/test 验证 profile、源码诊断交接，以及需要新审批的一次有界范围重新规划。
 - 同一 Coding Session 在编辑、公开测试失败和 Review 反馈之间保留历史、检查点、工具策略及资源消费。重复观察不算新进展；编辑格式、工具参数和输出纠正共享一次有界纠正额度。
-- 稳定补丁仍可在批准范围内继续编辑。`finishPhase` 将候选交给 Workflow 强制执行最终验证；验证失败或明确的未完成事项，在剩余资源允许时返回同一会话。最终 Review 保持独立，见[当前 Coding 生命周期](docs/unified-coding-loop-20261008.md)。
+- 稳定补丁仍可在批准范围内继续编辑。`finishPhase` 将候选交给 Workflow 强制执行最终验证；验证失败或明确的未完成事项，在剩余资源允许时返回同一会话。最终 Review 保持独立，见[当前 Coding 生命周期](docs/devflow-history-and-architecture.md)。
 - Run 级 Resource Budget Scheduler：持久化准入与结算，按实际请求和重新规划操作清单估算资源；分别记录逻辑工具、内部执行及 IO，保持硬上限和受保护写入范围。
-
-此前不同版本的九题单批严格通过 5/9；其中一题因费用阈值中断，单独续测后通过，历史九题覆盖中共有 6 题获得严格端到端成功证据。这些不是当前 Scheduler 版本的成绩。该小型数据集证明限定仓库中的实际修复能力，仍不足以代表任意仓库的成功率，见[验证结果与限制](docs/validation-v2.md)。
-
-v2.2 新数据集实验中，E09、E01 在同一冻结批次获得严格成功，E08 在后续单题批次通过。这些记录来自不同版本，不合并为同一批通过率，见[当前实验记录](docs/new-dataset-validation-20261007.md)。
 
 ## 快速开始
 
@@ -79,7 +59,7 @@ Web：http://localhost:3000；API：http://localhost:3001/api/v1；Worker 就绪
   -> Diff -> 本地完成或经批准的 GitHub Push / Pull Request
 ```
 
-提案合法、测试通过和 Issue 修复成立是不同结果。空目标或全 INSPECT 计划不授予写权限；扩大范围需重新审批。Review 默认无工具，由宿主提供当前证据。见[阶段职责、图的用途和保护规则](docs/v2-workflow.md)。
+提案合法、测试通过和 Issue 修复成立是不同结果。空目标或全 INSPECT 计划不授予写权限；扩大范围需重新审批。Review 默认无工具，由宿主提供当前证据。见[阶段职责、图的用途和保护规则](docs/devflow-history-and-architecture.md)。
 
 ## 仓库结构
 
@@ -103,4 +83,4 @@ node scripts/check-release-files.mjs
 
 Docker 集成需显式启用并配置本地基础设施，普通单元测试不调用付费模型。GitHub 发布默认关闭，需要审批；平台凭证不传入沙箱。
 
-[架构](docs/architecture.md) · [测试说明](tests/README.md) · [脚本说明](scripts/README.md) · [MIT License](LICENSE)
+[架构](docs/devflow-history-and-architecture.md) · [测试说明](tests/README.md) · [脚本说明](scripts/README.md) · [MIT License](LICENSE)

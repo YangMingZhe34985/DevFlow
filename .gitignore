@@ -58,6 +58,7 @@ codex.md
 # Private migration notes, raw model traffic, billing and trusted evaluation data
 /datasets
 /docs/Devflow-*
+!/docs/devflow-history-and-architecture.md
 /docs/current-technical-report.md
 /docs/performance/
 /docs/archive/

@@ -5,6 +5,7 @@ import {
   type KernelPrice,
   type KernelResult,
   type KernelResume,
+  type KernelUsage,
   type LanguageModelPort,
   type ModelGenerationSettings,
 } from "@devflow/agent";
@@ -16,6 +17,8 @@ import {
   createSubmitTool,
   truncateMiddle,
 } from "@devflow/tools";
+
+import { runIndependentReview, type ReviewOutcome } from "./review.js";
 
 /** A public project check (build, typecheck, lint, test) from a verification profile. */
 export interface PublicCheck {
@@ -55,6 +58,15 @@ export interface SolveInput {
   limits: KernelLimits;
   /** Host verification failures sent back to the same session before giving up. */
   maxRevisions?: number;
+  review?: {
+    model: LanguageModelPort;
+    settings?: ModelGenerationSettings;
+    price?: KernelPrice | undefined;
+    maxTurns?: number;
+    reserve?: number;
+  };
+  failureSummary?: string;
+  resumeRevisions?: number;
   /** Returns a reason when a path must not be edited, such as graded tests or CI config. */
   protectedPath?: (path: string) => string | undefined;
   protectedSummary?: string;
@@ -63,14 +75,16 @@ export interface SolveInput {
   resume?: KernelResume;
   signal: AbortSignal;
   onEvent?(event: KernelEvent): void | Promise<void>;
-  onTurnEnd?(state: KernelResume): void | Promise<void>;
+  onTurnEnd?(state: KernelResume, revisions: number): void | Promise<void>;
   onVerification?(verification: Verification, revision: number): void | Promise<void>;
+  onReview?(outcome: ReviewOutcome | undefined): void | Promise<void>;
 }
 
 export interface SolveResult {
   kernel: KernelResult;
   /** Host verification of the final candidate; undefined when nothing changed. */
   verification?: Verification;
+  review?: ReviewOutcome;
   revisions: number;
   baseCommit: string;
   /** Unified diff of the workspace against baseCommit, binary-safe. */
@@ -95,6 +109,7 @@ export function solverTaskMessage(input: {
   issue: { title: string; body: string };
   checks: readonly PublicCheck[];
   protectedSummary?: string | undefined;
+  failureSummary?: string | undefined;
 }): string {
   const checks = input.checks.length
     ? input.checks.map((check) => `- ${check.kind}: ${renderCommand(check.command)}`).join("\n")
@@ -107,6 +122,14 @@ export function solverTaskMessage(input: {
     "# Project checks (run from /workspace; the same checks will be run independently on your submission)",
     checks,
     ...(input.protectedSummary ? ["", "# Protected files", input.protectedSummary] : []),
+    ...(input.failureSummary
+      ? [
+          "",
+          "# Previous failed attempt",
+          input.failureSummary,
+          "Try a different approach; independently explore and verify the fix.",
+        ]
+      : []),
   ].join("\n");
 }
 
@@ -126,38 +149,119 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
     createSubmitTool(),
   ];
   let resume = input.resume;
-  let revisions = 0;
+  let revisions = input.resumeRevisions ?? 0;
   let kernel: KernelResult;
   let verification: Verification | undefined;
+  let review: ReviewOutcome | undefined;
+  const solverLimits = {
+    ...input.limits,
+    ...(input.review && input.limits.maxCostMicros !== undefined
+      ? {
+          maxCostMicros: Math.floor(
+            input.limits.maxCostMicros * (1 - (input.review.reserve ?? 0.15)),
+          ),
+        }
+      : {}),
+  };
+  // A checkpoint after submit resumes host verification, not another model turn.
+  const lastMessage = resume?.messages.at(-1);
+  let submittedResume = lastMessage?.role === "TOOL" && lastMessage.toolName === "submit";
+  const lastSubmission = resume?.messages
+    .flatMap((message) =>
+      message.role === "ASSISTANT"
+        ? (message.toolCalls?.filter((call) => call.name === "submit") ?? [])
+        : [],
+    )
+    .at(-1)?.input as { summary?: string } | undefined;
   for (;;) {
-    kernel = await runAgentLoop({
-      model: input.model,
-      system: SOLVER_SYSTEM_PROMPT,
-      task: solverTaskMessage(input),
-      tools,
-      limits: input.limits,
-      ...(input.settings ? { settings: input.settings } : {}),
-      ...(input.price ? { price: input.price } : {}),
-      ...(resume ? { resume } : {}),
-      signal: input.signal,
-      ...(input.onEvent ? { onEvent: input.onEvent } : {}),
-      ...(input.onTurnEnd ? { onTurnEnd: input.onTurnEnd } : {}),
-    });
+    const previousReview = review;
+    const priorCalls = resume?.usage.modelCalls ?? 0;
+    review = undefined;
+    kernel =
+      submittedResume && resume
+        ? {
+            ...resume,
+            messages: [...resume.messages],
+            stopReason: "SUBMITTED",
+            summary: lastSubmission?.summary ?? "Resumed submitted candidate.",
+          }
+        : await runAgentLoop({
+            model: input.model,
+            system: SOLVER_SYSTEM_PROMPT,
+            task: solverTaskMessage(input),
+            tools,
+            limits: solverLimits,
+            ...(input.settings ? { settings: input.settings } : {}),
+            ...(input.price ? { price: input.price } : {}),
+            ...(resume ? { resume } : {}),
+            signal: input.signal,
+            ...(input.onEvent ? { onEvent: input.onEvent } : {}),
+            ...(input.onTurnEnd
+              ? { onTurnEnd: (state: KernelResume) => input.onTurnEnd!(state, revisions) }
+              : {}),
+          });
+    submittedResume = false;
+    if (kernel.stopReason === "SUBMITTED") await input.onTurnEnd?.(kernel, revisions);
     verification = (await hasChanges(input.sandbox, baseCommit, input.signal))
       ? await verifyCandidate(input, baseCommit)
       : undefined;
     if (verification) await input.onVerification?.(verification, revisions);
+    // A denied revision cannot erase an already evidenced FAIL on the unchanged candidate.
+    if (previousReview?.verdict === "FAIL" && kernel.usage.modelCalls === priorCalls)
+      review = previousReview;
+    if (verification?.passed && input.review && !review) {
+      const { patch } = await exportWorkspacePatch(
+        input.sandbox,
+        baseCommit,
+        input.protectedPath,
+        input.signal,
+      );
+      await input.onReview?.(undefined);
+      review = await runIndependentReview({
+        sandbox: input.sandbox,
+        issue: input.issue,
+        diff: patch,
+        verification,
+        model: input.review.model,
+        ...(input.review.settings ? { settings: input.review.settings } : {}),
+        ...(input.review.price ? { price: input.review.price } : {}),
+        limits: {
+          ...input.limits,
+          maxTurns: Math.max(
+            0,
+            Math.min(input.review.maxTurns ?? 30, input.limits.maxTurns - kernel.turns),
+          ),
+        },
+        usage: kernel.usage,
+        signal: input.signal,
+        ...(input.onEvent ? { onEvent: input.onEvent } : {}),
+      });
+      for (const key of Object.keys(review.usage) as (keyof KernelUsage)[])
+        kernel.usage[key] += review.usage[key];
+      kernel.turns += review.turns;
+      await input.onReview?.(review);
+    }
     const canRevise =
       kernel.stopReason === "SUBMITTED" &&
       revisions < (input.maxRevisions ?? 0) &&
       kernel.turns < input.limits.maxTurns;
-    if (!verification || verification.passed || !canRevise) break;
+    if (!verification || (verification.passed && review?.verdict !== "FAIL") || !canRevise) break;
     revisions += 1;
     resume = {
-      messages: [...kernel.messages, { role: "USER", content: verificationFeedback(verification) }],
+      messages: [
+        ...kernel.messages,
+        {
+          role: "USER",
+          content:
+            review?.verdict === "FAIL"
+              ? `Independent review found blocking problems:\n${JSON.stringify(review.findings.filter((f) => f.severity === "blocking"))}\nFix these problems, run the checks, and submit again.`
+              : verificationFeedback(verification),
+        },
+      ],
       usage: kernel.usage,
       turns: kernel.turns,
     };
+    await input.onTurnEnd?.(resume, revisions);
   }
   const exported = await exportWorkspacePatch(
     input.sandbox,
@@ -168,6 +272,7 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
   return {
     kernel,
     ...(verification ? { verification } : {}),
+    ...(review ? { review } : {}),
     revisions,
     baseCommit,
     ...exported,
@@ -179,7 +284,13 @@ async function verifyCandidate(input: SolveInput, baseCommit: string): Promise<V
   const protectedChanges = input.protectedPath
     ? tracked.filter((path) => input.protectedPath!(path) !== undefined)
     : [];
-  const checks = await runChecks(input.sandbox, input.checks, input.signal);
+  const checks = await runChecks(
+    input.sandbox,
+    input.checks,
+    input.signal,
+    600,
+    input.limits.deadlineAt,
+  );
   return {
     passed: protectedChanges.length === 0 && checks.every((check) => check.status === "PASS"),
     checks,
@@ -223,6 +334,7 @@ export async function runChecks(
   checks: readonly PublicCheck[],
   signal: AbortSignal,
   maxSecondsPerCheck = 600,
+  deadlineAt?: number,
 ): Promise<CheckResult[]> {
   const ordered = [...checks].sort(
     (a, b) =>
@@ -231,8 +343,21 @@ export async function runChecks(
   );
   const results: CheckResult[] = [];
   for (const check of ordered) {
+    if (deadlineAt !== undefined && Date.now() >= deadlineAt) {
+      results.push({
+        kind: check.kind,
+        status: "TIMEOUT",
+        exitCode: null,
+        output: "Run deadline reached before host verification.",
+        durationMs: 0,
+      });
+      break;
+    }
     const seconds = Math.min(
       maxSecondsPerCheck,
+      deadlineAt === undefined
+        ? Infinity
+        : Math.max(1, Math.ceil((deadlineAt - Date.now()) / 1000)),
       Math.ceil((check.command.timeoutMs ?? maxSecondsPerCheck * 1000) / 1000),
     );
     const result = await sandbox.exec(

@@ -171,6 +171,8 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
 
     let response: ModelResponse | undefined;
     for (let attempt = 0; response === undefined; attempt++) {
+      if (limits.deadlineAt !== undefined && Date.now() >= limits.deadlineAt)
+        return finish("DEADLINE");
       try {
         response = await model.generate(
           {
@@ -181,7 +183,15 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
           {
             signal: AbortSignal.any([
               signal,
-              AbortSignal.timeout(options.callTimeoutMs ?? 240_000),
+              AbortSignal.timeout(
+                Math.max(
+                  1,
+                  Math.min(
+                    options.callTimeoutMs ?? 240_000,
+                    (limits.deadlineAt ?? Infinity) - Date.now(),
+                  ),
+                ),
+              ),
             ]),
           },
         );
@@ -192,6 +202,7 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
         const message = error instanceof Error ? error.message : String(error);
         const willRetry =
           attempt < MAX_MODEL_RETRIES &&
+          (limits.deadlineAt === undefined || Date.now() < limits.deadlineAt) &&
           (limits.maxCostMicros === undefined || spent() + worstCase <= limits.maxCostMicros);
         await options.onEvent?.({
           type: "model_error",
@@ -200,6 +211,8 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
           willRetry,
           unconfirmedMicros,
         });
+        if (limits.deadlineAt !== undefined && Date.now() >= limits.deadlineAt)
+          return finish("DEADLINE", { error: message });
         if (!willRetry) return finish("MODEL_ERROR", { error: message });
         await new Promise((resolve) =>
           setTimeout(resolve, (options.retryDelayMs ?? 2000) * (attempt + 1)),
@@ -246,10 +259,22 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
     idleReplies = 0;
 
     for (const [index, call] of response.toolCalls.entries()) {
+      if (limits.deadlineAt !== undefined && Date.now() >= limits.deadlineAt)
+        return finish("DEADLINE");
       const started = Date.now();
       const tool = byName.get(call.name);
+      const toolSignal =
+        limits.deadlineAt === undefined
+          ? signal
+          : AbortSignal.any([
+              signal,
+              AbortSignal.timeout(Math.max(1, limits.deadlineAt - Date.now())),
+            ]);
       const result = tool
-        ? await tool.execute(call.input, signal)
+        ? await tool.execute(call.input, toolSignal).catch((error: unknown) => {
+            if (signal.aborted || !toolSignal.aborted) throw error;
+            return { isError: true, content: "Tool stopped at the Run deadline." };
+          })
         : {
             isError: true,
             content: `Unknown tool "${call.name}". Available tools: ${[...byName.keys()].join(", ")}.`,

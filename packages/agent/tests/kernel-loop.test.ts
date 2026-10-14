@@ -32,6 +32,66 @@ const toolMessages = (messages: readonly ModelMessage[]) =>
   messages.filter((m): m is Extract<ModelMessage, { role: "TOOL" }> => m.role === "TOOL");
 
 describe("runAgentLoop", () => {
+  it("cancels a tool at the Run deadline and does not execute later calls", async () => {
+    const log: string[] = [];
+    const slow = defineAciTool({
+      name: "slow",
+      description: "Wait for cancellation.",
+      inputSchema: z.object({}),
+      readOnly: true,
+      async run(_input, signal) {
+        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        signal.throwIfAborted();
+        return { content: "unreachable" };
+      },
+    });
+    const model = new FakeLanguageModel([
+      fakeModelResponse({
+        toolCalls: [call("1", "slow", {}), call("2", "echo", { text: "late action" })],
+      }),
+    ]);
+    const result = await runAgentLoop({
+      model,
+      system: "s",
+      task: "t",
+      tools: [slow, echoTool(log)],
+      limits: { maxTurns: 3, deadlineAt: Date.now() + 50 },
+      signal: signal(),
+    });
+    expect(result.stopReason).toBe("DEADLINE");
+    expect(model.requests).toHaveLength(1);
+    expect(log).toEqual([]);
+    expect(toolMessages(result.messages)[0]?.content).toContain("Run deadline");
+  });
+  it("bounds an in-flight model call by the Run deadline without dispatching a retry", async () => {
+    const model = new FakeLanguageModel([
+      async (_request, options) => {
+        await new Promise((resolve) =>
+          options.signal.addEventListener("abort", resolve, { once: true }),
+        );
+        throw new Error("deadline timeout");
+      },
+    ]);
+    const events: KernelEvent[] = [];
+    const result = await runAgentLoop({
+      model,
+      system: "s",
+      task: "t",
+      tools: [createSubmitTool()],
+      limits: { maxTurns: 3, deadlineAt: Date.now() + 50 },
+      signal: signal(),
+      price: { inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 0 },
+      onEvent: (event) => {
+        events.push(event);
+      },
+    });
+    expect(result.stopReason).toBe("DEADLINE");
+    expect(model.requests).toHaveLength(1);
+    expect(events.find((event) => event.type === "model_error")).toMatchObject({
+      willRetry: false,
+    });
+    expect(result.usage.unconfirmedCostMicros).toBeGreaterThan(0);
+  });
   it("runs model-chosen tools in order and stops on submit with metered usage", async () => {
     const log: string[] = [];
     const model = new FakeLanguageModel([

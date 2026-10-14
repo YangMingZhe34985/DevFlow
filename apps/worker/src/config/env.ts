@@ -172,6 +172,10 @@ const WorkerEnvironmentSchema = z.object({
   DEVFLOW_AUTONOMOUS_CONTEXT_TOKENS: z.coerce.number().int().min(8_000).default(100_000),
   DEVFLOW_AUTONOMOUS_MAX_REVISIONS: z.coerce.number().int().min(0).max(10).default(2),
   DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS: z.coerce.number().int().min(1).max(50).default(5),
+  DEVFLOW_AUTONOMOUS_REVIEW: z.enum(["0", "1"]).default("1"),
+  DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS: z.coerce.number().int().min(1).max(100).default(30),
+  DEVFLOW_AUTONOMOUS_REVIEW_RESERVE: z.coerce.number().min(0).max(1).default(0.15),
+  DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
 });
 
 export type WorkerEnvironment = z.infer<typeof WorkerEnvironmentSchema> & {

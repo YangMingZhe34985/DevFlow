@@ -173,7 +173,11 @@ const WorkerEnvironmentSchema = z.object({
   DEVFLOW_AUTONOMOUS_MAX_REVISIONS: z.coerce.number().int().min(0).max(10).default(2),
   DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS: z.coerce.number().int().min(1).max(50).default(5),
   DEVFLOW_AUTONOMOUS_REVIEW: z.enum(["0", "1"]).default("1"),
-  DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS: z.coerce.number().int().min(1).max(100).default(30),
+  DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS: z.coerce.number().int().min(1).max(8).default(8),
+  DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT: z.coerce.number().int().positive().default(4096),
+  DEVFLOW_AUTONOMOUS_REVIEW_REASONING: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .default("medium"),
   DEVFLOW_AUTONOMOUS_REVIEW_RESERVE: z.coerce.number().min(0).max(1).default(0.15),
   DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
 });

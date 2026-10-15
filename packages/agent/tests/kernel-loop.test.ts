@@ -330,5 +330,8 @@ describe("runAgentLoop", () => {
     });
     expect(result.stopReason).toBe("TURN_LIMIT");
     expect(String(toolMessages(result.messages).at(-1)!.content)).toContain("0 turns left");
+    expect(String(toolMessages(result.messages).at(-1)!.content)).toContain(
+      "wrap up and submit your result soon",
+    );
   });
 });

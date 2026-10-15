@@ -381,6 +381,6 @@ function withBudgetNote(content: string, usage: KernelUsage, limits: KernelLimit
     if (minutes <= 5) notes.push(`about ${Math.max(0, minutes)} minutes left`);
   }
   return notes.length
-    ? `${content}\n\n[budget: ${notes.join(", ")} — finish your fix and submit soon]`
+    ? `${content}\n\n[budget: ${notes.join(", ")} — wrap up and submit your result soon]`
     : content;
 }

@@ -69,6 +69,7 @@ export async function runAttempts(input: AttemptsInput): Promise<AttemptsResult>
   let resume = input.resume;
   let usage = resume?.usage ?? attempts.at(-1)?.solve.kernel.usage ?? emptyUsage();
   let turns = resume?.turns ?? attempts.at(-1)?.solve.kernel.turns ?? 0;
+  let reviewSpentMicros = input.reviewSpentMicros ?? attempts.at(-1)?.solve.reviewSpentMicros ?? 0;
   const enough = () => {
     const task = solverTaskMessage({
       ...input,
@@ -90,9 +91,9 @@ export async function runAttempts(input: AttemptsInput): Promise<AttemptsResult>
       turns < input.limits.maxTurns &&
       (input.limits.deadlineAt === undefined || Date.now() < input.limits.deadlineAt) &&
       (input.limits.maxCostMicros === undefined ||
-        (usage.costMicros + usage.unconfirmedCostMicros <
+        (usage.costMicros + usage.unconfirmedCostMicros - reviewSpentMicros <
           input.limits.maxCostMicros * (input.review ? 1 - (input.review.reserve ?? 0.15) : 1) &&
-          usage.costMicros + usage.unconfirmedCostMicros + worstCase <=
+          usage.costMicros + usage.unconfirmedCostMicros - reviewSpentMicros + worstCase <=
             input.limits.maxCostMicros * (input.review ? 1 - (input.review.reserve ?? 0.15) : 1)))
     );
   };
@@ -116,15 +117,18 @@ export async function runAttempts(input: AttemptsInput): Promise<AttemptsResult>
       ...(previous ? { failureSummary: failureSummary(previous) } : {}),
       resume: resume ?? { messages: [], usage, turns },
       resumeRevisions: resume ? (input.resumeRevisions ?? 0) : 0,
+      ...(input.review ? { reviewSpentMicros } : {}),
     });
     const result = { attempt, solve };
     attempts.push(result);
     usage = solve.kernel.usage;
     turns = solve.kernel.turns;
+    reviewSpentMicros = solve.reviewSpentMicros ?? reviewSpentMicros;
     await input.onAttemptComplete?.(result);
     resume = undefined;
     attempt += 1;
   }
   const selected = selectCandidate(attempts);
+  if (input.review && selected.solve.review) selected.solve.review.costMicros = reviewSpentMicros;
   return { attempts, selectedAttempt: selected.attempt, selected: selected.solve, usage, turns };
 }

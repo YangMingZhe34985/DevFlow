@@ -17,6 +17,17 @@ export const submission = (verdict = "PASS", findings: unknown[] = []) => ({
   findings,
   summary: "Checked both paths.",
 });
+export const triage = (
+  verdict = "PASS",
+  findings: unknown[] = [],
+  concerns: unknown[] = [],
+  cost = 0,
+) =>
+  fakeModelResponse({
+    toolCalls: [],
+    output: { ...submission(verdict, findings), concerns },
+    usage: { inputTokens: 0, outputTokens: cost, totalTokens: cost },
+  });
 export const finding = (severity: "blocking" | "suggestion") => ({
   severity,
   file: "src/a.ts",
@@ -39,7 +50,8 @@ export function fakeSandbox() {
       } else if (script.includes("git status --porcelain=v1")) stdout = state;
       else if (script.includes("find /workspace -mindepth")) state = archived;
       else if (command.args?.at(-1) === "mutate") state = "reviewer changed candidate";
-    } else if (command.program === "git") {
+    } else if (command.program === "node") stdout = "src/a.ts:1: new\nsrc/a.ts:7: return 8;\n";
+    else if (command.program === "git") {
       const args = command.args ?? [];
       if (args[0] === "rev-parse") stdout = "a".repeat(40);
       else if (args[0] === "status") stdout = " M src/a.ts\0";
@@ -73,6 +85,7 @@ export const reviewInput = (model: FakeLanguageModel, sandbox = fakeSandbox().sa
   model,
   diff: "+fixed",
   verification: pass,
+  changedContext: "src/a.ts:7: return 8;\n",
   limits: { maxTurns: 3 },
   signal,
 });
@@ -109,6 +122,10 @@ export function candidate(
             verdict,
             findings: verdict === "FAIL" ? [finding("blocking")] : [],
             usage: emptyUsage(),
+            tier: 1,
+            concerns: [],
+            concernCount: 0,
+            costMicros: 0,
             turns: 1,
             stopReason: "SUBMITTED",
           },

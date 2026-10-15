@@ -37,6 +37,7 @@ import { discoverPublicVerification } from "../runs/public-verification.js";
 import type { RunExecutionOutcome, RunExecutionPort } from "../runs/run-execution.js";
 import { exportWorkspacePatch, readHead, type PublicCheck, type SolveResult } from "./solve.js";
 import { runAttempts, type AttemptResult, type AttemptsResult } from "./attempts.js";
+import { reviewSettings } from "./review.js";
 
 const PROJECT_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 export const AUTONOMOUS_CHECKPOINT_ARTIFACT = "autonomous-checkpoint.json";
@@ -170,6 +171,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         currentAttempt,
         maxAttempts: this.environment.DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS,
         resumeRevisions: activeCheckpoint?.revisions ?? 0,
+        ...(reviewer ? { reviewSpentMicros: prior.reviewSpentMicros } : {}),
         baseCommit,
         issue: { title: run.task.title, body: run.task.description },
         checks: profile.checks as PublicCheck[],
@@ -180,7 +182,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
           ? {
               review: {
                 ...reviewer,
-                maxTurns: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS,
+                maxTurns: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS,
                 reserve: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_RESERVE,
               },
             }
@@ -217,10 +219,22 @@ export class AutonomousRunExecutor implements RunExecutionPort {
               )
             : undefined;
         },
-        onReview: async (outcome) => {
+        onReview: async (outcome, tier) => {
           await this.append(run.id, outcome ? "REVIEW_RESULT" : "REVIEW_STARTED", {
             attempt,
+            at: new Date().toISOString(),
+            ...(outcome
+              ? {
+                  review: {
+                    verdict: outcome.verdict,
+                    tier,
+                    concerns: outcome.concernCount,
+                    costMicros: outcome.costMicros,
+                  },
+                }
+              : {}),
             ...(outcome ?? { verdict: null, findings: [], usage: attemptState.usage }),
+            tier,
           });
           if (outcome)
             await this.database.artifacts.create({
@@ -496,10 +510,19 @@ export class AutonomousRunExecutor implements RunExecutionPort {
   }
 
   /** Usage already spent by earlier dispatches of this Run, from its own event log. */
-  private async priorUsage(runId: string): Promise<{ usage: KernelUsage; turns: number }> {
+  private async priorUsage(runId: string) {
     const events = await this.database.events.list(runId);
+    let reviewing = false;
+    const reviewUsage = usageFromEvents(
+      events.filter((event) => {
+        if (event.type === "REVIEW_STARTED") reviewing = true;
+        if (event.type === "REVIEW_RESULT" || event.type === "RUN_STARTED") reviewing = false;
+        return reviewing;
+      }),
+    );
     return {
       usage: usageFromEvents(events),
+      reviewSpentMicros: reviewUsage.costMicros + reviewUsage.unconfirmedCostMicros,
       turns: events.filter((event) => event.type === "LLM_REQUEST").length,
     };
   }
@@ -593,7 +616,17 @@ export class AutonomousRunExecutor implements RunExecutionPort {
   private model(run: RunExecutionRecord, stage: "EXECUTE" | "REVIEW" = "EXECUTE"): AutonomousModel {
     const factory =
       stage === "REVIEW" ? this.options.reviewModelFactory : this.options.modelFactory;
-    if (factory) return factory(run);
+    const settings = (name: string, original: ModelGenerationSettings) =>
+      stage === "REVIEW"
+        ? reviewSettings(name, original, {
+            maxOutputTokens: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT,
+            reasoningEffort: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_REASONING,
+          })
+        : original;
+    if (factory) {
+      const result = factory(run);
+      return { ...result, settings: settings("fake", result.settings) };
+    }
     const binding = resolveStageModel(stage, this.environment, run);
     const { contextMaxBytes: _contextMaxBytes, ...config } = binding.config;
     const prices = JSON.parse(this.environment.DEVFLOW_MODEL_PRICES_JSON ?? "{}") as Record<
@@ -608,9 +641,11 @@ export class AutonomousRunExecutor implements RunExecutionPort {
       });
     return {
       model: createConfiguredLanguageModel(config),
-      settings: binding.settings,
+      settings: settings(config.model, binding.settings),
       price,
-      bindingHash: binding.provenance.configurationHash,
+      bindingHash:
+        binding.provenance.configurationHash +
+        (stage === "REVIEW" ? JSON.stringify(settings(config.model, binding.settings)) : ""),
     };
   }
 

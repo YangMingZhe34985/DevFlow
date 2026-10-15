@@ -18,7 +18,8 @@ import {
   truncateMiddle,
 } from "@devflow/tools";
 
-import { runIndependentReview, type ReviewOutcome } from "./review.js";
+import { runIndependentReview, runTriageReview, emptyUsage, type ReviewOutcome } from "./review.js";
+import { readReviewContext } from "./review-context.js";
 
 /** A public project check (build, typecheck, lint, test) from a verification profile. */
 export interface PublicCheck {
@@ -67,6 +68,8 @@ export interface SolveInput {
   };
   failureSummary?: string;
   resumeRevisions?: number;
+  /** Run-wide review spending, including unconfirmed calls and previous dispatches. */
+  reviewSpentMicros?: number;
   /** Returns a reason when a path must not be edited, such as graded tests or CI config. */
   protectedPath?: (path: string) => string | undefined;
   protectedSummary?: string;
@@ -77,7 +80,7 @@ export interface SolveInput {
   onEvent?(event: KernelEvent): void | Promise<void>;
   onTurnEnd?(state: KernelResume, revisions: number): void | Promise<void>;
   onVerification?(verification: Verification, revision: number): void | Promise<void>;
-  onReview?(outcome: ReviewOutcome | undefined): void | Promise<void>;
+  onReview?(outcome: ReviewOutcome | undefined, tier: 1 | 2): void | Promise<void>;
 }
 
 export interface SolveResult {
@@ -85,6 +88,7 @@ export interface SolveResult {
   /** Host verification of the final candidate; undefined when nothing changed. */
   verification?: Verification;
   review?: ReviewOutcome;
+  reviewSpentMicros?: number;
   revisions: number;
   baseCommit: string;
   /** Unified diff of the workspace against baseCommit, binary-safe. */
@@ -153,16 +157,21 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
   let kernel: KernelResult;
   let verification: Verification | undefined;
   let review: ReviewOutcome | undefined;
-  const solverLimits = {
+  let reviewSpentMicros = input.reviewSpentMicros ?? 0;
+  const cap = input.limits.maxCostMicros;
+  const reviewCeiling =
+    cap === undefined ? undefined : Math.floor(cap * (input.review?.reserve ?? 0.15));
+  const solverLimits = () => ({
     ...input.limits,
-    ...(input.review && input.limits.maxCostMicros !== undefined
+    ...(input.review && cap !== undefined
       ? {
-          maxCostMicros: Math.floor(
-            input.limits.maxCostMicros * (1 - (input.review.reserve ?? 0.15)),
+          maxCostMicros: Math.min(
+            cap,
+            Math.floor(cap * (1 - (input.review.reserve ?? 0.15))) + reviewSpentMicros,
           ),
         }
       : {}),
-  };
+  });
   // A checkpoint after submit resumes host verification, not another model turn.
   const lastMessage = resume?.messages.at(-1);
   let submittedResume = lastMessage?.role === "TOOL" && lastMessage.toolName === "submit";
@@ -190,7 +199,7 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
             system: SOLVER_SYSTEM_PROMPT,
             task: solverTaskMessage(input),
             tools,
-            limits: solverLimits,
+            limits: solverLimits(),
             ...(input.settings ? { settings: input.settings } : {}),
             ...(input.price ? { price: input.price } : {}),
             ...(resume ? { resume } : {}),
@@ -216,30 +225,63 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
         input.protectedPath,
         input.signal,
       );
-      await input.onReview?.(undefined);
-      review = await runIndependentReview({
-        sandbox: input.sandbox,
-        issue: input.issue,
-        diff: patch,
-        verification,
-        model: input.review.model,
-        ...(input.review.settings ? { settings: input.review.settings } : {}),
-        ...(input.review.price ? { price: input.review.price } : {}),
-        limits: {
-          ...input.limits,
-          maxTurns: Math.max(
-            0,
-            Math.min(input.review.maxTurns ?? 30, input.limits.maxTurns - kernel.turns),
-          ),
-        },
-        usage: kernel.usage,
-        signal: input.signal,
-        ...(input.onEvent ? { onEvent: input.onEvent } : {}),
-      });
-      for (const key of Object.keys(review.usage) as (keyof KernelUsage)[])
-        kernel.usage[key] += review.usage[key];
-      kernel.turns += review.turns;
-      await input.onReview?.(review);
+      await input.onReview?.(undefined, 1);
+      const changedContext = await readReviewContext(input.sandbox, patch, input.signal);
+      const reviewUsage = emptyUsage();
+      let reviewTurns = 0;
+      for (const tier of [1, 2] as const) {
+        if (tier === 2 && review?.verdict !== "CONCERNS") break;
+        if (tier === 2) await input.onReview?.(undefined, tier);
+        const outcome = await (tier === 1 ? runTriageReview : runIndependentReview)({
+          sandbox: input.sandbox,
+          issue: input.issue,
+          diff: patch,
+          solverSummary: kernel.summary,
+          changedContext,
+          ...(review ? { concerns: review.concerns } : {}),
+          verification,
+          model: input.review.model,
+          ...(input.review.settings ? { settings: input.review.settings } : {}),
+          ...(input.review.price ? { price: input.review.price } : {}),
+          limits: {
+            ...input.limits,
+            ...(cap === undefined
+              ? {}
+              : {
+                  maxCostMicros: Math.max(
+                    0,
+                    Math.min(
+                      reviewCeiling! - reviewSpentMicros,
+                      cap - kernel.usage.costMicros - kernel.usage.unconfirmedCostMicros,
+                    ),
+                  ),
+                }),
+            maxTurns: Math.max(
+              0,
+              Math.min(
+                tier === 1 ? 2 : (input.review.maxTurns ?? 8),
+                input.limits.maxTurns - kernel.turns,
+              ),
+            ),
+          },
+          signal: input.signal,
+          ...(input.onEvent ? { onEvent: input.onEvent } : {}),
+        });
+        for (const key of Object.keys(outcome.usage) as (keyof KernelUsage)[]) {
+          kernel.usage[key] += outcome.usage[key];
+          reviewUsage[key] += outcome.usage[key];
+        }
+        kernel.turns += outcome.turns;
+        reviewTurns += outcome.turns;
+        reviewSpentMicros += outcome.costMicros;
+        await input.onReview?.(outcome, tier);
+        review = {
+          ...outcome,
+          usage: { ...reviewUsage },
+          turns: reviewTurns,
+          costMicros: reviewSpentMicros,
+        };
+      }
     }
     const canRevise =
       kernel.stopReason === "SUBMITTED" &&
@@ -273,6 +315,7 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
     kernel,
     ...(verification ? { verification } : {}),
     ...(review ? { review } : {}),
+    ...(input.review ? { reviewSpentMicros } : {}),
     revisions,
     baseCommit,
     ...exported,

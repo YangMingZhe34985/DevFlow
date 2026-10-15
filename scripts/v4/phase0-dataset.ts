@@ -26,6 +26,7 @@ import { DockerSandboxManager, type CommandSpec, type SandboxSession } from "@de
 
 import { type PublicCheck } from "../../apps/worker/src/autonomous/solve.ts";
 import { runAttempts } from "../../apps/worker/src/autonomous/attempts.ts";
+import { reviewSettings } from "../../apps/worker/src/autonomous/review.ts";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.ts";
 import { resolveStageModel } from "../../apps/worker/src/config/stage-models.ts";
 import { serialScore } from "./scoring-queue.ts";
@@ -204,20 +205,23 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
           : {
               model: new FakeLanguageModel([
                 fakeModelResponse({
-                  toolCalls: [
-                    {
-                      id: "review",
-                      name: "submit_review",
-                      input: {
-                        verdict: "PASS",
-                        findings: [],
-                        summary: "Scripted review for harness verification only.",
-                      },
-                    },
-                  ],
+                  toolCalls: [],
+                  output: {
+                    verdict: "PASS",
+                    findings: [],
+                    concerns: [],
+                    summary: "Scripted review for harness verification only.",
+                  },
                 }),
               ]),
-              settings: {},
+              settings: reviewSettings(
+                "fake",
+                {},
+                {
+                  maxOutputTokens: environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT,
+                  reasoningEffort: environment.DEVFLOW_AUTONOMOUS_REVIEW_REASONING,
+                },
+              ),
               price: PRICE,
             }
         : undefined;
@@ -233,7 +237,7 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
         ? {
             review: {
               ...reviewer,
-              maxTurns: environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS,
+              maxTurns: environment.DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS,
               reserve: environment.DEVFLOW_AUTONOMOUS_REVIEW_RESERVE,
             },
           }
@@ -264,10 +268,10 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
           JSON.stringify(result),
         );
       },
-      onReview: async (review) => {
+      onReview: async (review, tier) => {
         reviewActive = review === undefined;
         await trajectory.write(
-          `${JSON.stringify({ type: review ? "review_result" : "review_started", review })}\n`,
+          `${JSON.stringify({ type: review ? "review_result" : "review_started", at: new Date().toISOString(), tier, review })}\n`,
         );
       },
       onVerification: async (verification, revision) => {
@@ -307,7 +311,13 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
         checks: attempt.verification.checks.map((check) => `${check.kind}:${check.status}`),
       },
       review: attempt.review
-        ? { verdict: attempt.review.verdict, findings: attempt.review.findings.length }
+        ? {
+            verdict: attempt.review.verdict,
+            findings: attempt.review.findings.length,
+            tier: attempt.review.tier,
+            concerns: attempt.review.concernCount,
+            costMicros: attempt.review.costMicros,
+          }
         : null,
       attempts: attempts.attempts.length,
       selectedAttempt: attempts.selectedAttempt,
@@ -344,7 +354,8 @@ function liveModel(stage: "EXECUTE" | "REVIEW" = "EXECUTE"): {
   };
   price?: KernelPrice;
 } {
-  const binding = resolveStageModel(stage, loadWorkerEnvironment(process.env));
+  const environment = loadWorkerEnvironment(process.env);
+  const binding = resolveStageModel(stage, environment);
   const { contextMaxBytes: _ignored, ...config } = binding.config;
   const prices = JSON.parse(process.env.DEVFLOW_MODEL_PRICES_JSON ?? "{}") as Record<
     string,
@@ -358,7 +369,10 @@ function liveModel(stage: "EXECUTE" | "REVIEW" = "EXECUTE"): {
     ...(price ? { price } : {}),
     settings:
       stage === "REVIEW"
-        ? binding.settings
+        ? reviewSettings(config.model, binding.settings, {
+            maxOutputTokens: environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT,
+            reasoningEffort: environment.DEVFLOW_AUTONOMOUS_REVIEW_REASONING,
+          })
         : {
             reasoningEffort: args.reasoning as never,
             maxOutputTokens: Number(args["max-output"]),

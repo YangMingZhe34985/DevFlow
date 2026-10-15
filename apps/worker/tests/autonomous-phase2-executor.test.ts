@@ -10,6 +10,7 @@ import type {
 } from "@devflow/database";
 import { DevflowError, type NewAgentEvent, type RunResult } from "@devflow/shared";
 import {
+  triage,
   issue,
   step,
   submission,
@@ -23,6 +24,7 @@ describe("executor Phase 2 artifacts and results", () => {
     reviewer: FakeLanguageModel,
     env: Record<string, string> = {},
     solver = new FakeLanguageModel([step("submit", { summary: "candidate fixed" })]),
+    priced = false,
   ) {
     const events: NewAgentEvent[] = [];
     const artifacts: ArtifactRecord[] = [];
@@ -68,7 +70,14 @@ describe("executor Phase 2 artifacts and results", () => {
     });
     const executor = new AutonomousRunExecutor(database, environment, {
       modelFactory: () => ({ model: solver, settings: {}, bindingHash: "solver" }),
-      reviewModelFactory: () => ({ model: reviewer, settings: {}, bindingHash: "reviewer" }),
+      reviewModelFactory: () => ({
+        model: reviewer,
+        settings: {},
+        bindingHash: "reviewer",
+        ...(priced
+          ? { price: { inputMicrosPerMillionTokens: 0, outputMicrosPerMillionTokens: 1_000_000 } }
+          : {}),
+      }),
       sandboxFactory: factory,
     });
     return {
@@ -88,10 +97,12 @@ describe("executor Phase 2 artifacts and results", () => {
     async (verdict) => {
       const h = harness(
         new FakeLanguageModel([
-          step(
-            "submit_review",
-            submission(verdict, verdict === "FAIL" ? [finding("blocking")] : []),
+          triage(
+            verdict === "NEEDS_EVIDENCE" ? "CONCERNS" : verdict,
+            verdict === "FAIL" ? [finding("blocking")] : [],
+            verdict === "NEEDS_EVIDENCE" ? [{ question: "Does the second path still fail?" }] : [],
           ),
+          ...(verdict === "NEEDS_EVIDENCE" ? [step("submit_review", submission(verdict))] : []),
         ]),
       );
       const result = (await h.executor.execute(h.run, signal)) as RunResult;
@@ -109,7 +120,10 @@ describe("executor Phase 2 artifacts and results", () => {
       expect(h.events.map((event) => event.type)).toEqual(
         expect.arrayContaining(["REVIEW_STARTED", "REVIEW_RESULT", "WORKFLOW_CHECKPOINT"]),
       );
-      expect(result.metrics.modelCalls).toBe(2);
+      expect(result.metrics.modelCalls).toBe(verdict === "NEEDS_EVIDENCE" ? 3 : 2);
+      for (const event of h.events.filter((e) => e.type.startsWith("REVIEW_"))) {
+        expect(event.payload).toMatchObject({ at: expect.any(String), tier: expect.any(Number) });
+      }
     },
   );
   it("can disable review and preserve the single solver path", async () => {
@@ -119,8 +133,38 @@ describe("executor Phase 2 artifacts and results", () => {
     expect(h.events.some((event) => event.type === "REVIEW_STARTED")).toBe(false);
     expect(result.metrics.modelCalls).toBe(1);
   });
+  it.each(["REVIEW_RESULT", "LLM_RESPONSE"])(
+    "preserves review spending across an outage at %s",
+    async (failedEvent) => {
+      const reviewer = new FakeLanguageModel([triage("PASS", [], [], 10), triage()]);
+      const h = harness(
+        reviewer,
+        { DEVFLOW_MAX_COST_MICROS: "100", DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT: "10" },
+        undefined,
+        true,
+      );
+      h.failOn(
+        (event) => event.type === failedEvent && h.events.some((e) => e.type === "REVIEW_STARTED"),
+      );
+      await expect(h.executor.execute(h.run, signal)).rejects.toMatchObject({
+        code: "DATABASE_FAILED",
+      });
+      const result = (await h.executor.execute(h.run, signal)) as RunResult;
+      expect(result.status).toBe("SUCCEEDED");
+      expect(result.summary).toContain("NEEDS_EVIDENCE");
+      expect(reviewer.requests).toHaveLength(1);
+      const review = JSON.parse(
+        h.artifacts.filter((a) => a.kind === "REVIEW_REPORT").at(-1)!.content!,
+      );
+      expect(review).toMatchObject({ summary: "review budget exhausted" });
+      const transcript = JSON.parse(
+        h.artifacts.filter((a) => a.name === "autonomous-transcript.json").at(-1)!.content!,
+      );
+      expect(transcript.review.costMicros).toBe(10);
+    },
+  );
   it("loads completed attempts from artifacts without rerunning them after a dispatch interruption", async () => {
-    const h = harness(new FakeLanguageModel([step("submit_review", submission())]));
+    const h = harness(new FakeLanguageModel([triage()]));
     await h.executor.execute(h.run, signal);
     const result = (await h.executor.execute(h.run, signal)) as RunResult;
     expect(result.status, JSON.stringify(result.error)).toBe("SUCCEEDED");
@@ -138,10 +182,7 @@ describe("executor Phase 2 artifacts and results", () => {
       },
     ]);
     const h = harness(
-      new FakeLanguageModel([
-        step("submit_review", submission("FAIL", [finding("blocking")])),
-        step("submit_review", submission()),
-      ]),
+      new FakeLanguageModel([triage("FAIL", [finding("blocking")]), triage()]),
       { DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: "2" },
       solver,
     );

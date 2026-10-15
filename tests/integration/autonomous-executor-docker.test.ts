@@ -109,10 +109,14 @@ function executor(
   database: DatabaseAdapter,
   model: FakeLanguageModel,
   reviewer = new FakeLanguageModel([
-    step("review", "submit_review", {
-      verdict: "PASS",
-      findings: [],
-      summary: "Fixture behaviour verified.",
+    fakeModelResponse({
+      toolCalls: [],
+      output: {
+        concerns: [],
+        verdict: "PASS",
+        findings: [],
+        summary: "Fixture behaviour verified.",
+      },
     }),
   ]),
   created: string[] = [],
@@ -263,24 +267,27 @@ describe.skipIf(!enabled)("autonomous executor in Docker", () => {
       step("4", "submit", { summary: "all operands now subtract" }),
     ]);
     const reviewer = new FakeLanguageModel([
-      step("r1", "bash", {
-        command:
-          "node --input-type=module -e 'import { subtract } from \"./src/calculator.js\"; console.log(subtract(5, 3))'",
+      fakeModelResponse({
+        toolCalls: [],
+        output: {
+          concerns: [],
+          verdict: "FAIL",
+          findings: [
+            {
+              severity: "blocking",
+              file: "src/calculator.js",
+              line: 7,
+              description: "subtract(5, 3) still adds",
+              evidence: "node --input-type=module reproduction printed 8; Issue expects 2",
+            },
+          ],
+          summary: "Scripted blocking feedback to exercise revision.",
+        },
       }),
-      step("r2", "submit_review", {
-        verdict: "FAIL",
-        findings: [
-          {
-            severity: "blocking",
-            file: "src/calculator.js",
-            line: 7,
-            description: "subtract(5, 3) still adds",
-            evidence: "node --input-type=module reproduction printed 8; Issue expects 2",
-          },
-        ],
-        summary: "Scripted blocking feedback to exercise revision.",
+      fakeModelResponse({
+        toolCalls: [],
+        output: { verdict: "PASS", findings: [], concerns: [], summary: "Revision verified." },
       }),
-      step("r3", "submit_review", { verdict: "PASS", findings: [], summary: "Revision verified." }),
     ]);
     const created: string[] = [];
     const result = (await executor(memory.database, model, reviewer, created).execute(
@@ -390,10 +397,14 @@ describe.skipIf(
           modelFactory: () => ({ model, settings: {}, bindingHash: "fake-binding" }),
           reviewModelFactory: () => ({
             model: new FakeLanguageModel([
-              step("review", "submit_review", {
-                verdict: "PASS",
-                findings: [],
-                summary: "Fixture verified.",
+              fakeModelResponse({
+                toolCalls: [],
+                output: {
+                  concerns: [],
+                  verdict: "PASS",
+                  findings: [],
+                  summary: "Fixture verified.",
+                },
               }),
             ]),
             settings: {},

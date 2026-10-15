@@ -11,6 +11,7 @@ import {
 import { runAutonomousSolve, type SolveInput } from "../src/autonomous/solve.js";
 import { loadWorkerEnvironment } from "../src/config/env.js";
 import {
+  triage,
   reviewInput,
   step,
   submission,
@@ -250,9 +251,9 @@ describe("adaptive attempts", () => {
 
 describe("review and solving share a fixed cost slice", () => {
   const price = { inputMicrosPerMillionTokens: 0, outputMicrosPerMillionTokens: 1_000_000 };
-  it("stops solving at 85% and lets review use the remaining Run budget", async () => {
+  it("stops solving at 85% and caps review independently at 15%", async () => {
     const solver = new FakeLanguageModel([step("bash", { command: "true" }, 80)]);
-    const reviewer = new FakeLanguageModel([step("submit_review", submission(), 10)]);
+    const reviewer = new FakeLanguageModel([triage("PASS", [], [], 10)]);
     const result = await runAutonomousSolve({
       ...attemptInput(),
       sandbox: fakeSandbox().sandbox,
@@ -278,10 +279,7 @@ describe("review and solving share a fixed cost slice", () => {
         return step("submit", { summary: "both paths fixed" });
       },
     ]);
-    const reviewer = new FakeLanguageModel([
-      step("submit_review", submission("FAIL", [finding("blocking")])),
-      step("submit_review", submission()),
-    ]);
+    const reviewer = new FakeLanguageModel([triage("FAIL", [finding("blocking")]), triage()]);
     const result = await runAutonomousSolve({
       ...attemptInput(),
       sandbox: fakeSandbox().sandbox,
@@ -307,10 +305,8 @@ describe("review and solving share a fixed cost slice", () => {
     expect(solver.requests).toHaveLength(1);
   });
   it("keeps an evidenced FAIL if the reserved slice cannot afford any revision", async () => {
-    const solver = new FakeLanguageModel([step("submit", { summary: "first candidate" }, 75)]);
-    const reviewer = new FakeLanguageModel([
-      step("submit_review", submission("FAIL", [finding("blocking")]), 10),
-    ]);
+    const solver = new FakeLanguageModel([step("submit", { summary: "first candidate" }, 80)]);
+    const reviewer = new FakeLanguageModel([triage("FAIL", [finding("blocking")], [], 10)]);
     const result = await runAutonomousSolve({
       ...attemptInput(),
       sandbox: fakeSandbox().sandbox,
@@ -331,7 +327,9 @@ describe("review and solving share a fixed cost slice", () => {
     });
     expect(environment).toMatchObject({
       DEVFLOW_AUTONOMOUS_REVIEW: "1",
-      DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS: 30,
+      DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS: 8,
+      DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT: 4096,
+      DEVFLOW_AUTONOMOUS_REVIEW_REASONING: "medium",
       DEVFLOW_AUTONOMOUS_REVIEW_RESERVE: 0.15,
       DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: 2,
     });

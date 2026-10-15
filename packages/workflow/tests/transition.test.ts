@@ -2,13 +2,10 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, it } from "vitest";
 
-import type { AgentRuntime } from "@devflow/agent";
-
 import {
   cancelWorkflow,
   canTransition,
   createInitialWorkflowState,
-  DefaultWorkflowEngine,
   deserializeWorkflowState,
   failWorkflow,
   serializeWorkflowState,
@@ -52,20 +49,5 @@ describe("workflow transitions", () => {
     expect(failed).toMatchObject({ stage: "FAILED", status: "FAILED" });
     expect(cancelled).toMatchObject({ stage: "CANCELLED", status: "CANCELLED" });
     expect(cancelWorkflow(cancelled)).toBe(cancelled);
-  });
-
-  it("turns an aborted resume into a cancelled workflow", async () => {
-    const agent: AgentRuntime = {
-      async run() {
-        throw new Error("agent should not run");
-      },
-    };
-    const controller = new AbortController();
-    controller.abort();
-    const state = createInitialWorkflowState(randomUUID());
-
-    const result = await new DefaultWorkflowEngine(agent).resume(state, controller.signal);
-
-    expect(result).toMatchObject({ stage: "CANCELLED", status: "CANCELLED" });
   });
 });

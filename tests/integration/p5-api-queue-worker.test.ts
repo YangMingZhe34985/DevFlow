@@ -16,12 +16,10 @@ import { NestFactory } from "@nestjs/core";
 import { AppModule } from "../../apps/api/src/app.module.js";
 import { ApiExceptionFilter } from "../../apps/api/src/common/api-exception.filter.js";
 import { BullRunQueue as ApiRunQueue } from "../../apps/api/src/infrastructure/bull-run-queue.js";
+import { AutonomousRunExecutor } from "../../apps/worker/src/autonomous/executor.js";
+import { ExecutionModeRouter } from "../../apps/worker/src/autonomous/router.js";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.js";
 import { BullRunQueue as WorkerRunQueue } from "../../apps/worker/src/queue/bull-run-queue.js";
-import {
-  DockerAgentRunExecutor,
-  type LanguageModelFactory,
-} from "../../apps/worker/src/runs/docker-agent-run-executor.js";
 import type { RunExecutionPort } from "../../apps/worker/src/runs/run-execution.js";
 import { RunProcessor } from "../../apps/worker/src/runs/run.processor.js";
 import { RunRecovery } from "../../apps/worker/src/runs/run-recovery.js";
@@ -114,7 +112,7 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     expect(invalidTransition.status).toBe(409);
   }, 120_000);
 
-  it("runs API -> BullMQ -> Worker -> Agent/Docker -> PostgreSQL exactly once", async () => {
+  it("runs API -> BullMQ -> Worker -> autonomous/Docker -> PostgreSQL exactly once", async () => {
     await startWorker();
     const repository = await createRepository();
     const task = await createTask(repository.id, "Full Docker Agent");
@@ -122,6 +120,7 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     const first = await request("POST", "/runs", {
       taskId: task.id,
       idempotencyKey,
+      executionMode: "autonomous",
       maxSteps: 4,
     });
     expect(first.status).toBe(201);
@@ -131,13 +130,20 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     const succeeded = await waitForRun(runId, ["SUCCEEDED"]);
     expect(succeeded.result).toMatchObject({
       status: "SUCCEEDED",
-      metrics: { modelCalls: 2, toolCalls: 1 },
+      metrics: { modelCalls: 3, toolCalls: 2 },
     });
     expect(await database.client.event.count({ where: { runId } })).toBeGreaterThan(0);
+    expect((await database.events.list(runId)).map((event) => event.type)).toEqual(
+      expect.arrayContaining(["TOOL_RESULT", "TEST_RESULT", "REVIEW_RESULT", "RUN_COMPLETED"]),
+    );
+    expect(
+      (await database.artifacts.list(runId)).find((artifact) => artifact.kind === "DIFF")?.content,
+    ).toContain("+  return left - right;");
 
     const duplicate = await request("POST", "/runs", {
       taskId: task.id,
       idempotencyKey,
+      executionMode: "autonomous",
       maxSteps: 4,
     });
     expect(duplicate.body).toMatchObject({ created: false, run: { id: runId } });
@@ -145,6 +151,7 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     const conflictingReplay = await request("POST", "/runs", {
       taskId: task.id,
       idempotencyKey,
+      executionMode: "autonomous",
       maxSteps: 5,
     });
     expect(conflictingReplay.status).toBe(409);
@@ -194,24 +201,63 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
       DEVFLOW_SANDBOX_NETWORK_ENABLED: "false",
+      DEVFLOW_AUTONOMOUS_REVIEW: "1",
+      DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: "1",
     });
-    const modelFactory: LanguageModelFactory = (run) => {
-      modelCreations.set(run.id, (modelCreations.get(run.id) ?? 0) + 1);
-      return new FakeLanguageModel([
-        fakeModelResponse({
-          toolCalls: [{ id: randomUUID(), name: "listFiles", input: { path: "." } }],
-          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
-          latencyMs: 3,
-        }),
-        fakeModelResponse({
-          toolCalls: [],
-          text: "Inspected the repository in Docker.",
-          usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
-          latencyMs: 2,
-        }),
-      ]);
-    };
-    const dockerExecutor = new DockerAgentRunExecutor(database, environment, modelFactory);
+    const autonomousExecutor = new AutonomousRunExecutor(database, environment, {
+      modelFactory: (run) => {
+        modelCreations.set(run.id, (modelCreations.get(run.id) ?? 0) + 1);
+        return {
+          model: new FakeLanguageModel([
+            fakeModelResponse({
+              toolCalls: [
+                {
+                  id: randomUUID(),
+                  name: "edit_file",
+                  input: {
+                    path: "src/calculator.js",
+                    old_text:
+                      "  // Intentional fixture bug: the agent should change + to -.\n  return left + right;",
+                    new_text:
+                      "  // Intentional fixture bug: the agent should change + to -.\n  return left - right;",
+                  },
+                },
+              ],
+              usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+              latencyMs: 3,
+            }),
+            fakeModelResponse({
+              toolCalls: [
+                {
+                  id: randomUUID(),
+                  name: "submit",
+                  input: { summary: "Corrected subtraction in Docker." },
+                },
+              ],
+              usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
+              latencyMs: 2,
+            }),
+          ]),
+          settings: {},
+          bindingHash: "p5-fake-solver",
+        };
+      },
+      reviewModelFactory: () => ({
+        model: new FakeLanguageModel([
+          fakeModelResponse({
+            toolCalls: [],
+            output: {
+              concerns: [],
+              verdict: "PASS",
+              findings: [],
+              summary: "Subtraction verified.",
+            },
+          }),
+        ]),
+        settings: {},
+        bindingHash: "p5-fake-reviewer",
+      }),
+    });
     const compositeExecutor: RunExecutionPort = {
       execute: async (run, signal) => {
         const attempt = (executionAttempts.get(run.id) ?? 0) + 1;
@@ -222,17 +268,18 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
         if (run.task.title === "Long cancellable run") {
           return await waitUntilCancelled(run, signal);
         }
-        if (run.task.title === "Full Docker Agent") {
-          return await dockerExecutor.execute(run, signal);
-        }
         return succeededResult(run.id);
       },
     };
-    const processor = new RunProcessor(database.runs, compositeExecutor, {
-      workerId: "integration-" + randomUUID(),
-      leaseMs: 5_000,
-      cancellationPollMs: 100,
-    });
+    const processor = new RunProcessor(
+      database.runs,
+      new ExecutionModeRouter(compositeExecutor, autonomousExecutor),
+      {
+        workerId: "integration-" + randomUUID(),
+        leaseMs: 5_000,
+        cancellationPollMs: 100,
+      },
+    );
     workerRedis = new Redis(redisUrl, { maxRetriesPerRequest: null });
     workerQueue = new WorkerRunQueue(queueName, workerRedis);
     queueWorker = new Worker(
@@ -298,8 +345,9 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
   ): Promise<{ status: number; body: Record<string, unknown> }> {
     const response = await fetch(baseUrl + endpoint, {
       method,
-      headers: body === undefined ? undefined : { "content-type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined
+        ? {}
+        : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
     });
     const responseBody = (await response.json()) as Record<string, unknown>;
     return { status: response.status, body: responseBody };

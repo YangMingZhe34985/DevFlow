@@ -142,7 +142,7 @@ flowchart TB
 
 生产入口是 [Worker main](../apps/worker/src/main.ts) → [RunProcessor](../apps/worker/src/runs/run.processor.ts) → [ApprovalWorkflowRunExecutor](../apps/worker/src/runs/approval-workflow-run-executor.ts)。后者实际推进定位、规划、审批、Coding、验证、Review、Diff 和发布。
 
-[packages/workflow 的 DefaultWorkflowEngine](../packages/workflow/src/engine.ts) 仍是 `NOT_IMPLEMENTED` 占位。该包的契约/状态转移仍被使用，但不能据占位引擎推断生产流程尚不存在。生产执行器很大，是当前技术债务之一。
+`packages/workflow` 已移除未接入生产的占位引擎，保留仍在使用的[状态定义](../packages/workflow/src/state.ts)与[纯状态转移](../packages/workflow/src/transition.ts)。生产执行由 Worker 的执行器负责；现有 workflow 生产执行器很大，是当前技术债务之一。
 
 Web 使用 Next.js 展示任务、审批、diff、事件和指标；API 使用 NestJS 接收并持久化请求。Redis/BullMQ 负责排队，PostgreSQL 才是状态真相。CLI 直接组合 Runtime/Tool/Sandbox，适合开发验证，不等价于具有完整审批、独立 Review 和严格评测的生产 Worker 路径。
 

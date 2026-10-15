@@ -156,7 +156,6 @@ export const BenchmarkCaseSchema = z
 export type BenchmarkCase = z.infer<typeof BenchmarkCaseSchema>;
 
 /** @deprecated Use BenchmarkCaseSchema. */
-export const EvaluationCaseSchema = BenchmarkCaseSchema;
 /** @deprecated Use BenchmarkCase. */
 export type EvaluationCase = BenchmarkCase;
 

@@ -12,19 +12,6 @@ import type { ToolPolicy, ToolPolicyDecision } from "./policy.js";
 import { toolInputValidationDetails } from "./input-validation.js";
 import { describeTool, type ToolRegistry } from "./registry.js";
 
-export class UnimplementedToolExecutor implements ToolExecutor {
-  async execute(
-    _request: ToolExecutionRequest,
-    _context: ToolContext,
-  ): Promise<ToolExecutionResult> {
-    throw new DevflowError({
-      code: "NOT_IMPLEMENTED",
-      message:
-        "Tool execution is not implemented. The agent cannot bypass the ToolExecutor boundary.",
-    });
-  }
-}
-
 export class DefaultToolExecutor implements ToolExecutor {
   constructor(
     private readonly registry: ToolRegistry,

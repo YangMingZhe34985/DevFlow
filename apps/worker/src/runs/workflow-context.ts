@@ -21,10 +21,7 @@ import {
   type SandboxSession,
 } from "@devflow/sandbox";
 
-const REPOSITORY_CONTEXT_LIMIT = 180 * 1024;
 const REPAIR_CONTEXT_LIMIT = 32 * 1024;
-const PRELOAD_TOTAL_LIMIT = 200 * 1024;
-const PRELOAD_FILE_LIMIT = 20;
 const REVIEW_CONTEXT_LIMIT = 176 * 1024;
 
 export interface DeterministicContext {
@@ -106,54 +103,6 @@ export function readRepairEvidence(
     artifactSha256: input.sha256,
     historical: true,
     note: "Historical public repair evidence; read current workspace source before editing. This grants no permission.",
-  };
-}
-
-export async function buildRepositoryContext(
-  sandbox: SandboxSession,
-  signal: AbortSignal,
-  task?: RepositoryProfileTask,
-): Promise<DeterministicContext & { repositoryProfile: RepositoryComplexityProfile }> {
-  const startedAt = Date.now();
-  const listing = await sandbox.listFiles({ path: ".", recursive: true, maxEntries: 500 }, signal);
-  let executions = 1;
-  const files = listing.entries
-    .filter((entry) => entry.kind === "FILE" && isUsefulTextPath(entry.path))
-    .sort((left, right) => left.path.localeCompare(right.path));
-  const tree = listing.entries
-    .filter((entry) => !isIgnoredPath(entry.path))
-    .map((entry) => `${entry.kind === "DIRECTORY" ? "d" : "f"} ${entry.path}`)
-    .join("\n");
-  const totalSize = files.reduce((sum, entry) => sum + (entry.sizeBytes ?? PRELOAD_TOTAL_LIMIT), 0);
-  const sections = [`Repository tree${listing.truncated ? " (truncated)" : ""}:\n${tree}`];
-
-  if (files.length <= PRELOAD_FILE_LIMIT && totalSize <= PRELOAD_TOTAL_LIMIT) {
-    const contents = await Promise.all(
-      files.map(async (entry) => {
-        try {
-          const file = await sandbox.readFile({ path: entry.path, maxBytes: 64 * 1024 }, signal);
-          return `--- ${file.path}${file.truncated ? " (truncated)" : ""}\n${file.content}`;
-        } catch (error) {
-          return `--- ${entry.path}\n[unreadable: ${errorMessage(error)}]`;
-        }
-      }),
-    );
-    executions += files.length;
-    sections.push(`Small-repository file snapshot:\n${contents.join("\n\n")}`);
-  } else {
-    sections.push(
-      "The repository is larger than the deterministic preload threshold. Use targeted batch reads or searches only for files relevant to the task.",
-    );
-  }
-
-  return {
-    text: truncate(sections.join("\n\n"), REPOSITORY_CONTEXT_LIMIT),
-    toolExecutions: executions,
-    toolLatencyMs: Math.max(0, Date.now() - startedAt),
-    repositoryProfile: buildRepositoryComplexityProfile(listing.entries, {
-      availability: listing.truncated ? "TRUNCATED" : "COMPLETE",
-      ...(task === undefined ? {} : { task }),
-    }),
   };
 }
 
@@ -627,11 +576,6 @@ export function testResultFingerprint(result: CommandResult): string {
       stableFailureStream(result.stderr),
     ].join("\n"),
   );
-}
-
-function isUsefulTextPath(path: string): boolean {
-  if (isIgnoredPath(path)) return false;
-  return !/\.(?:png|jpe?g|gif|webp|ico|pdf|zip|gz|tar|woff2?|ttf|lock)$/iu.test(path);
 }
 
 function isIgnoredPath(path: string): boolean {

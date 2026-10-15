@@ -20,19 +20,6 @@ export interface ToolPolicy {
   ): Promise<ToolPolicyDecision>;
 }
 
-export class DenyAllToolPolicy implements ToolPolicy {
-  async evaluate(
-    tool: ToolDescriptor,
-    _request: ToolExecutionRequest,
-    _context: ToolPolicyContext,
-  ): Promise<ToolPolicyDecision> {
-    return {
-      decision: "DENY",
-      reason: `Tool '${tool.name}' is denied because no explicit policy is configured.`,
-    };
-  }
-}
-
 export class ExplicitToolPolicy implements ToolPolicy {
   private readonly allowed: ReadonlySet<ToolPermission>;
 

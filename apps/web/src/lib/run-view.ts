@@ -405,13 +405,6 @@ export function eventActivity(event: AgentEvent): EventActivityView {
   };
 }
 
-export function metricItems(
-  detail: RunDetail,
-  events: readonly AgentEvent[],
-): readonly MetricItem[] {
-  return metricGroups(detail, events).flatMap((group) => group.items);
-}
-
 export function metricGroups(
   detail: RunDetail,
   events: readonly AgentEvent[],
@@ -503,16 +496,6 @@ export function diffText(detail: RunDetail, events: readonly AgentEvent[]): stri
   if (artifact?.content !== undefined) return artifact.content;
   if (artifact?.uri !== undefined) return `Artifact: ${artifact.uri}`;
   return findLatestText(events, ["diff", "patch", "unifiedDiff"]);
-}
-
-export function reviewText(detail: RunDetail, events: readonly AgentEvent[]): string | undefined {
-  const artifact = [...detail.artifacts]
-    .reverse()
-    .find((candidate) => candidate.kind === "REVIEW_REPORT");
-  if (artifact?.content !== undefined) return artifact.content;
-  if (artifact?.metadata !== undefined) return formatJson(artifact.metadata);
-  if (artifact?.uri !== undefined) return `Artifact: ${artifact.uri}`;
-  return findLatestText(events, ["review", "reviewReport", "findings"]);
 }
 
 /** Normalizes the persisted review artifact/event into a structured presentation model. */

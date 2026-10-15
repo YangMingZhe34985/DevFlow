@@ -2,6 +2,16 @@
 
 方案见 [DevFlow_v4.0_Autonomous_Refactor_Plan.md](../../DevFlow_v4.0_Autonomous_Refactor_Plan.md)。本文只记录**已验证的状态**和下一步，最新条目在上方。
 
+## 2026-10-15：分层审查已完成
+
+- **实现**：提交 `caca07d`、`31d6c2d`，加入无工具初审、具体疑点的有界工具核查及独立审查预算封顶。
+- **复测**：E06、E07、E10 的补丁与第 1 层 Review 均通过；与原 Phase 2 同题相比，审查费用下降 **95.6%**。E01、E04 因批次预算预留为 NOT_RUN；第 2 层与负例检出仍未验证。
+- 报告：`.devflow/v4-research/tiered-review-eval-r2-report.md`。
+
+## 2026-10-15：Phase 3 启动
+
+- 外部留出集正在构建，旧代码清理批次 B、C、D 正在进行；尚未形成外部留出集评测结果。
+
 ## 2026-10-15：Phase 2 真实评测（Codex 执行，每题 1 次）
 
 - **结果**：补丁严格 10/10，所有题目均在第 1 次尝试内完成，没有触发修订。审查结论为 PASS 7 次、FAIL 0 次、NEEDS_EVIDENCE 3 次（E06、E07、E10，都是费用耗尽时还没给出结论）。

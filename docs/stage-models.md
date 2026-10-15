@@ -1,5 +1,7 @@
 # Stage model configuration
 
+Most stage-budget descriptions below apply to the legacy `workflow` path; see [autonomous mode configuration](v4/autonomous-mode.md) for the autonomous path.
+
 Copy `.env.example` to `.env`, set the platform credential and restart the Worker after changes. `.env` is ignored by Git. DevFlow supports model capabilities rather than requiring a particular vendor.
 
 | Stage                   | Responsibility                                                                                      | Example default in `.env.example`   |

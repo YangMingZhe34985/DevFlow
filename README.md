@@ -1,14 +1,16 @@
 # DevFlow 2.4.0
 
-The package remains **2.4.0**. PRG localization is opt-in; legacy remains the default. Dynamic teams are experimental, disabled by default and have not met the v3.0 release gate.
+The package remains **2.4.0**. `workflow` remains the default execution mode. PRG localization is opt-in; legacy localization remains the default. Dynamic teams are experimental, disabled by default and have not met the v3.0 release gate.
 
-Read the [version history, implementation and current issues](docs/devflow-history-and-architecture.md) (Chinese) or the [documentation index](docs/README.md). The latest full ten-case frozen batch passed 5/10 strictly. Subsequent directed repairs passed E07; E01 passed independent patch acceptance but could not issue Review under its cost preflight. The other directed cases did not strictly pass. These separate versions must not be combined into a current success rate. Real accepted AgentMessage count remains zero; explicit communication is not yet validated in real runs.
+Read the [version history, implementation and current issues](docs/devflow-history-and-architecture.md) (Chinese) or the [documentation index](docs/README.md). The older workflow ten-case frozen batch passed 5/10 strictly. Its subsequent directed repairs passed E07; E01 passed independent patch acceptance but could not issue Review under its cost preflight. The other directed cases did not strictly pass. Separately, the v4 autonomous Phase 2 batch passed patch acceptance on 10/10 cases, with Review PASS on 7/10. The later tiered-review retest passed patches and Review on all three completed cases; two cases were NOT_RUN. See [v4 progress and evaluation scopes](docs/v4/PROGRESS.md). These batches must not be combined into one success rate. Real accepted AgentMessage count remains zero; explicit communication is not yet validated in real runs.
 
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow turns repository tasks and GitHub Issues into observable, approval-based AI engineering runs: localization, approved planning, an iterative Coding Loop, deterministic final validation and independent review.
 
 The API persists intent and queues work. The Worker owns execution; agents access repository code through policy-controlled tools in Docker sandboxes. Tasks pin an immutable base commit, and runs retain events, source references, diff artifacts and budgets.
+
+Use [`autonomous` mode](docs/v4/autonomous-mode.md) for a single Agent that chooses how to explore, edit and submit a solution. The host independently verifies public checks and protected paths, then performs tiered review: one tool-free assessment followed by bounded investigation of concrete concerns when needed. Verification failures and blocking review findings return to the same solver session within its limits. `workflow` remains the default; the staged capabilities and workflow below describe that path.
 
 ## Current capabilities
 

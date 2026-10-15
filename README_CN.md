@@ -1,14 +1,16 @@
 # DevFlow 2.4.0
 
-当前包版本为 **2.4.0**。PRG 为可选定位模式，默认仍为 legacy；动态多 Agent 为默认关闭的实验功能，尚未达到 v3.0 发布门槛。
+当前包版本为 **2.4.0**。执行模式默认仍为 `workflow`。PRG 为可选定位模式，定位默认仍为 legacy；动态多 Agent 为默认关闭的实验功能，尚未达到 v3.0 发布门槛。
 
-项目复习与历史追溯请阅读[版本变更、架构与当前问题](docs/devflow-history-and-architecture.md)，操作文档见[文档入口](docs/README.md)。最近完整十题冻结批次严格通过 5/10；后续五题定向修复中 E07 严格通过，E01 补丁独立验收通过但 Review 被费用预检阻断，其余未严格通过。这些是不同版本的实验，不能合并为当前成功率。真实有效 AgentMessage 仍为 0，显式通信闭环尚未获得真实验证。
+项目复习与历史追溯请阅读[版本变更、架构与当前问题](docs/devflow-history-and-architecture.md)，操作文档见[文档入口](docs/README.md)。旧 workflow 十题冻结批次严格通过 5/10；其后五题定向修复中 E07 严格通过，E01 补丁独立验收通过但 Review 被费用预检阻断，其余未严格通过。另行进行的 v4 autonomous Phase 2 十题补丁验收通过 10/10，Review PASS 为 7/10；后续分层审查复测已运行的三题补丁与 Review 均通过，另外两题为 NOT_RUN。各批次口径与结果见 [v4 进度](docs/v4/PROGRESS.md)，不能合并为一个成功率。真实有效 AgentMessage 仍为 0，显式通信闭环尚未获得真实验证。
 
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。
 
 API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略约束的工具操作 Docker 沙箱中的代码。Task 锁定不可变基准 commit，Run 保存事件、源码引用、补丁、指标和预算。
+
+可选择 [`autonomous` 模式](docs/v4/autonomous-mode.md)：单个 Agent 自主决定探索、编辑和提交，宿主独立执行公开检查与保护路径验证，再进行分层审查。第 1 层为无工具初审，只有出现具体疑点才启动有界工具核查；验证失败或阻断性审查问题在剩余额度内返回同一求解会话。默认仍为 `workflow`；下方阶段式能力和工作流描述适用于该路径。
 
 ## 当前能力
 

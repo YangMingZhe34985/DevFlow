@@ -203,13 +203,6 @@ export function syncBudgetStageSteps(metrics: RunMetrics): void {
   metrics.budget.unusedSteps = Math.max(0, metrics.budget.activeLimit - metrics.steps);
 }
 
-export function stageStepTotal(metrics: RunMetrics): number {
-  return Object.values(metrics.stages ?? {}).reduce(
-    (total, stage) => total + (stage?.steps ?? 0),
-    0,
-  );
-}
-
 function controlMetrics(metrics: RunMetrics): RunControlMetrics {
   return (metrics.control ??= emptyControlMetrics());
 }

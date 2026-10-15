@@ -89,10 +89,6 @@ export interface ActivityView {
   summary: string;
 }
 
-export interface StepActivityView extends ActivityView {
-  step: StepRecord;
-}
-
 export interface ToolActivityView extends ActivityView {
   toolCall: ToolCallRecord;
 }
@@ -363,24 +359,6 @@ export function toolActivities(
       ...(toolCall.durationMs === undefined ? {} : { durationMs: toolCall.durationMs }),
       summary,
       toolCall,
-    };
-  });
-}
-
-export function stepActivities(steps: readonly StepRecord[]): readonly StepActivityView[] {
-  return steps.map((step) => {
-    const status = activityStatusFromStep(step.status);
-    const summary = [step.stage, status, formatDuration(step.durationMs)]
-      .filter((value) => value !== "—")
-      .join(" · ");
-    return {
-      id: step.id,
-      title: step.title ?? `Agent step ${String(step.sequence)}`,
-      status,
-      stage: step.stage,
-      ...(step.durationMs === undefined ? {} : { durationMs: step.durationMs }),
-      summary,
-      step,
     };
   });
 }
@@ -1024,23 +1002,6 @@ function activityStatusFromTool(status: ToolCallRecord["status"]): ActivityStatu
     case "DENIED":
     case "TIMED_OUT":
       return "FAILED";
-    case "CANCELLED":
-      return "CANCELLED";
-    case "RUNNING":
-      return "RUNNING";
-    default:
-      return "PENDING";
-  }
-}
-
-function activityStatusFromStep(status: StepRecord["status"]): ActivityStatus {
-  switch (status) {
-    case "SUCCEEDED":
-      return "SUCCEEDED";
-    case "FAILED":
-      return "FAILED";
-    case "SKIPPED":
-      return "SKIPPED";
     case "CANCELLED":
       return "CANCELLED";
     case "RUNNING":

@@ -13,7 +13,6 @@ import type { WorkingCode } from "@devflow/agent";
 import { DevflowError } from "@devflow/shared";
 
 import type { SandboxGitService } from "@devflow/git";
-import { parseGitHubRepositoryUri, type GitHubProvider } from "@devflow/github";
 import {
   readFileContent,
   validateReadFileRequest,
@@ -150,50 +149,6 @@ export function buildRepositoryComplexityProfile(
     testAvailability: tests.length === 0 ? "NOT_DETECTED" : "AVAILABLE",
     testIndicators: tests,
   };
-}
-
-export function unavailableRepositoryComplexityProfile(): RepositoryComplexityProfile {
-  return {
-    availability: "UNAVAILABLE",
-    languageIndicators: [],
-    frameworkIndicators: [],
-    manifestFiles: [],
-    testAvailability: "UNKNOWN",
-    testIndicators: [],
-  };
-}
-
-export async function buildGitHubRepositoryComplexityProfile(input: {
-  provider: Pick<GitHubProvider, "readRepositoryTree">;
-  sourceUri: string;
-  baseCommitSha?: string;
-  task: RepositoryProfileTask;
-  signal?: AbortSignal;
-}): Promise<RepositoryComplexityProfile> {
-  if (input.baseCommitSha === undefined || !/^[0-9a-f]{40}$/iu.test(input.baseCommitSha)) {
-    return unavailableRepositoryComplexityProfile();
-  }
-  try {
-    const tree = await input.provider.readRepositoryTree(
-      {
-        repository: parseGitHubRepositoryUri(input.sourceUri),
-        baseCommitSha: input.baseCommitSha.toLowerCase(),
-      },
-      input.signal,
-    );
-    const entries = tree.entries.map((entry) => ({
-      path: entry.path,
-      kind: entry.kind,
-      ...(entry.sizeBytes === undefined ? {} : { sizeBytes: entry.sizeBytes }),
-    }));
-    return buildRepositoryComplexityProfile(entries, {
-      availability: tree.truncated ? "TRUNCATED" : "COMPLETE",
-      task: input.task,
-    });
-  } catch (error) {
-    if (input.signal?.aborted === true) throw input.signal.reason ?? error;
-    return unavailableRepositoryComplexityProfile();
-  }
 }
 
 export async function buildRepairContext(

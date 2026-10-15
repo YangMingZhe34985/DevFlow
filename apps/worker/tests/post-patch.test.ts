@@ -15,7 +15,6 @@ import {
   normalizeMutation,
   observePostPatchTool,
   requestPaths,
-  plannedTargets,
   plannedTargetScope,
   verificationContract,
 } from "../src/runs/post-patch.js";
@@ -197,31 +196,6 @@ it("does not infer issue verification from passing regression tests, review, or 
     reason: "ISSUE_REPRODUCTION_NOT_ESTABLISHED",
   });
   expect(verificationContract("PATCH_READY", "SKIPPED", "REVIEW_PASSED").test).toBe("SKIPPED");
-  expect(plannedTargets({ summary: "Edit a.ts and b.ts", steps: [] }, ["a.ts"])).toEqual([
-    "a.ts",
-    "b.ts",
-  ]);
-});
-
-it("keeps inspect/test/preserve references distinct from explicit edit targets without test-file exceptions", () => {
-  const plan = {
-    summary: "Fix arithmetic and preserve regression tests",
-    steps: [
-      { id: "read", title: "Inspect", description: "Read a.ts and tests/regression.ts" },
-      { id: "fix", title: "Correct behavior", description: "Update a.ts" },
-      { id: "test", title: "Run tests", description: "Run tests/regression.ts" },
-    ],
-  };
-  expect(plannedTargets(plan, ["a.ts"])).toEqual(["a.ts"]);
-  expect(plannedTargets({ summary: "Edit tests/regression.ts", steps: [] }, ["a.ts"])).toEqual([
-    "tests/regression.ts",
-  ]);
-  expect(
-    plannedTargets({ summary: "Fix a.ts and preserve tests/regression.ts", steps: [] }, []),
-  ).toEqual(["a.ts"]);
-  expect(plannedTargets({ summary: "Edit a.ts and preserve a.ts", steps: [] }, ["a.ts"])).toEqual(
-    [],
-  );
 });
 
 it("observed writes use CAS even without a WorkingSet", async () => {

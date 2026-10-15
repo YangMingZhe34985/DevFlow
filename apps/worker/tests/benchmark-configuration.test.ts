@@ -21,11 +21,7 @@ import {
   evaluateBenchmarkInSandbox,
   prepareBenchmarkEvaluation,
 } from "../src/runs/benchmark-evaluation.js";
-import {
-  createTools,
-  initialWorkflowMetrics,
-  mergeModelResponseMetrics,
-} from "../src/runs/approval-workflow-run-executor.js";
+import { createTools, initialWorkflowMetrics } from "../src/runs/approval-workflow-run-executor.js";
 
 const CASE_EXECUTION_ID = "00000000-0000-4000-8000-000000000001";
 const RUN_ID = "00000000-0000-4000-8000-000000000002";
@@ -378,23 +374,6 @@ describe("workflow metric accounting", () => {
       modelLatencyMs: 124,
       toolLatencyMs: 7,
       tokenUsage: { inputTokens: 110, outputTokens: 103, totalTokens: 213 },
-    });
-  });
-
-  it("adds Review model usage and latency to final metrics", () => {
-    const metrics = emptyMetrics();
-    mergeModelResponseMetrics(metrics, {
-      text: "review",
-      toolCalls: [],
-      finishReason: "STOP",
-      latencyMs: 31,
-      usage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 },
-    });
-
-    expect(metrics).toMatchObject({
-      modelCalls: 1,
-      modelLatencyMs: 31,
-      tokenUsage: { inputTokens: 20, outputTokens: 5, totalTokens: 25 },
     });
   });
 });

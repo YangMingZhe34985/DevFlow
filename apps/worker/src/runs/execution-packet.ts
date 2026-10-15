@@ -2,13 +2,11 @@ import { posix } from "node:path";
 import { contentHash, type WorkingSet } from "@devflow/agent";
 import {
   DevflowError,
-  ExecutionContractSchema,
   ExecutionPacketSchema,
   type AgentPlan,
-  type ExecutionContract,
   type ExecutionPacket,
 } from "@devflow/shared";
-import { exclusionReason, type IndexSource } from "../localization/contracts.js";
+import { exclusionReason } from "../localization/contracts.js";
 import { parseCandidate } from "../localization/parser.js";
 
 export const PACKET_PROMPT =
@@ -36,7 +34,6 @@ export function normalizeTargetPath(input: string): string {
   return normalized;
 }
 
-/** No Sandbox before approval. Only the immutable, permission-checked snapshot is consulted. */
 // TypeScript permits a type and a runtime value to share one name. Keep genuine
 // duplicate runtime declarations ambiguous, but slice the unique implementation.
 function runtimeSymbols<T extends { signature: string }>(matches: readonly T[]): readonly T[] {
@@ -44,93 +41,6 @@ function runtimeSymbols<T extends { signature: string }>(matches: readonly T[]):
     (match) => !/^(?:export\s+)?(?:declare\s+)?(?:interface|type)\b/u.test(match.signature),
   );
   return matches.length > 1 && values.length === 1 ? values : matches;
-}
-
-export async function validateExecutionContract(
-  contract: ExecutionContract,
-  source: IndexSource,
-  signal: AbortSignal,
-): Promise<ExecutionContract> {
-  const validated = ExecutionContractSchema.parse(contract);
-  if (!validated.editTargets.length)
-    throw new DevflowError({
-      code: "PLAN_TARGET_AMBIGUOUS",
-      message:
-        "No explicit edit obligation; inspection/test references cannot be promoted to edits.",
-    });
-  const operations = new Map<string, string>();
-  const cache = new Map<string, string>();
-  const edits: ExecutionContract["editTargets"] = [];
-  const inspect: ExecutionContract["inspectTargets"] = [];
-  for (const [list, output] of [
-    [validated.editTargets, edits],
-    [validated.inspectTargets, inspect],
-  ] as const) {
-    for (const target of list) {
-      signal.throwIfAborted();
-      const path = normalizeTargetPath(target.path);
-      const operation = "operation" in target ? target.operation : "INSPECT";
-      const previous = operations.get(path);
-      if (operation !== "INSPECT" && previous && previous !== operation)
-        throw new DevflowError({
-          code: "PLAN_TARGET_AMBIGUOUS",
-          message: "Conflicting operations for one path.",
-          details: { path, previous, operation },
-        });
-      if (operation !== "INSPECT") operations.set(path, operation);
-      for (let parent = posix.dirname(path); parent !== "."; parent = posix.dirname(parent)) {
-        if ((await source.lookup?.(parent, signal))?.kind === "SYMLINK")
-          throw new DevflowError({
-            code: "PLAN_TARGET_INVALID",
-            message: "Target parent is a symbolic link.",
-            details: { path },
-          });
-      }
-      const entry = await source.lookup?.(path, signal);
-      if (
-        (operation === "CREATE" && entry) ||
-        (operation !== "CREATE" && (!entry || entry.kind !== "FILE"))
-      )
-        throw new DevflowError({
-          code: "PLAN_TARGET_INVALID",
-          message: "Target operation does not match immutable snapshot existence/type.",
-          details: { path, operation },
-        });
-      if (target.symbol && entry) {
-        let content = cache.get(path);
-        if (content === undefined) {
-          const read = await source.read(path, signal);
-          if (read.truncated)
-            throw new DevflowError({
-              code: "TARGET_READ_FAILED",
-              message: "Truncated target cannot be validated.",
-            });
-          content = read.content;
-          cache.set(path, content);
-        }
-        // Share execution's exact-name resolver, including its large-file fallback.
-        await sourceSlice(
-          path,
-          target.symbol,
-          content,
-          0,
-          operation === "INSPECT" ? "INSPECT" : "EDIT",
-          signal,
-        );
-      }
-      if (!output.some((t) => t.path === path && t.symbol === target.symbol))
-        (output as (typeof target)[]).push({ ...target, path });
-    }
-  }
-  return {
-    ...validated,
-    editTargets: edits,
-    inspectTargets: inspect,
-    verificationHints: validated.verificationHints.map((h) => ({
-      ...h,
-      path: h.path === null ? null : normalizeTargetPath(h.path),
-    })),
-  };
 }
 
 export interface SourceRange {

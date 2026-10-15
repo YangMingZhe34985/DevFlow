@@ -75,20 +75,6 @@ export interface RestoredAdaptiveBudgetState {
   discoveryExtensionUsed: boolean;
 }
 
-export interface ExecuteBudgetLeaseInput {
-  budget: AdaptiveBudgetPlan;
-  consumedSteps: number;
-  /** Remaining test- or review-repair opportunities after implementation. */
-  remainingRepairAttempts: number;
-}
-
-export interface RepairBudgetLeaseInput {
-  budget: AdaptiveBudgetPlan;
-  consumedSteps: number;
-  /** Includes the repair phase about to start. */
-  remainingRepairAttempts: number;
-}
-
 export interface ReviewBudgetLeaseInput {
   budget: AdaptiveBudgetPlan;
   consumedSteps: number;
@@ -152,18 +138,6 @@ const BASE_MARGIN: Readonly<Record<Complexity, number>> = {
   SIMPLE: 4,
   MEDIUM: 8,
   COMPLEX: 15,
-};
-
-const REPAIR_RATIO: Readonly<Record<Complexity, number>> = {
-  SIMPLE: 0.2,
-  MEDIUM: 0.3,
-  COMPLEX: 0.4,
-};
-
-const EXPECTED_REPAIR_CYCLES: Readonly<Record<Complexity, number>> = {
-  SIMPLE: 1,
-  MEDIUM: 2,
-  COMPLEX: 3,
 };
 
 /**
@@ -309,81 +283,6 @@ export function allocateCodingBudget(input: CodingBudgetLeaseInput): StageBudget
     remainingActiveSteps,
     reviewReserve,
     repairReserve: 0,
-    mandatoryDownstreamSteps,
-  };
-}
-
-/** Legacy allocation retained for saved workflows that predate unified coding. */
-export function allocateExecuteBudget(input: ExecuteBudgetLeaseInput): StageBudgetLease {
-  const consumedSteps = assertBudgetPosition(input.budget, input.consumedSteps);
-  const remainingRepairAttempts = nonnegativeIntegerStrict(
-    input.remainingRepairAttempts,
-    "remainingRepairAttempts",
-  );
-  const remainingActiveSteps = Math.max(0, input.budget.activeLimit - consumedSteps);
-  // A very small Run must still be able to enter the current phase. Reserve
-  // downstream work from the capacity left after one current-stage decision.
-  const reviewReserve = Math.min(2, Math.max(0, remainingActiveSteps - 1));
-  const afterReview = Math.max(0, remainingActiveSteps - reviewReserve);
-  const repairReserve =
-    remainingRepairAttempts === 0
-      ? 0
-      : Math.min(
-          Math.max(0, afterReview - 1),
-          Math.ceil(afterReview * REPAIR_RATIO[input.budget.complexity]),
-        );
-  const preferredInitialSteps = Math.max(0, afterReview - repairReserve);
-
-  const hardRemaining = Math.max(0, input.budget.hardLimit - consumedSteps);
-  const mandatoryReview = Math.min(2, Math.max(0, hardRemaining - 1));
-  // Keep one hard Repair decision available when retries remain. The rest of
-  // the complexity-shaped Repair pool is only a soft reservation and may be
-  // reallocated after genuine Execute progress.
-  const mandatoryRepair =
-    remainingRepairAttempts > 0 && hardRemaining - 1 > mandatoryReview ? 1 : 0;
-  const mandatoryDownstreamSteps = mandatoryReview + mandatoryRepair;
-  const maximumSteps = Math.max(0, hardRemaining - mandatoryDownstreamSteps);
-
-  return {
-    stage: "EXECUTE",
-    initialSteps: Math.min(preferredInitialSteps, maximumSteps),
-    maximumSteps,
-    remainingActiveSteps,
-    reviewReserve,
-    repairReserve,
-    mandatoryDownstreamSteps,
-  };
-}
-
-/** Allocates one repair lease without permanently locking future repair attempts. */
-export function allocateRepairBudget(input: RepairBudgetLeaseInput): StageBudgetLease {
-  const consumedSteps = assertBudgetPosition(input.budget, input.consumedSteps);
-  const remainingRepairAttempts = nonnegativeIntegerStrict(
-    input.remainingRepairAttempts,
-    "remainingRepairAttempts",
-  );
-  const remainingActiveSteps = Math.max(0, input.budget.activeLimit - consumedSteps);
-  const reviewReserve = Math.min(2, Math.max(0, remainingActiveSteps - 1));
-  const availableRepairSteps = Math.max(0, remainingActiveSteps - reviewReserve);
-  const expectedCycles = Math.min(
-    EXPECTED_REPAIR_CYCLES[input.budget.complexity],
-    remainingRepairAttempts,
-  );
-  const preferredInitialSteps =
-    expectedCycles === 0 ? 0 : Math.ceil(availableRepairSteps / expectedCycles);
-
-  const hardRemaining = Math.max(0, input.budget.hardLimit - consumedSteps);
-  const mandatoryDownstreamSteps = Math.min(2, Math.max(0, hardRemaining - 1));
-  const maximumSteps = Math.max(0, hardRemaining - mandatoryDownstreamSteps);
-  const initialSteps = Math.min(preferredInitialSteps, maximumSteps);
-
-  return {
-    stage: "REPAIR",
-    initialSteps,
-    maximumSteps,
-    remainingActiveSteps,
-    reviewReserve,
-    repairReserve: Math.max(0, availableRepairSteps - initialSteps),
     mandatoryDownstreamSteps,
   };
 }

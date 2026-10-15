@@ -124,7 +124,6 @@ import {
   type LanguageModelPort,
   type ModelGenerationSettings,
   type ModelMessage,
-  type ModelResponse,
   type ModelToolDescriptor,
   type WorkingSet,
   type WorkingCode,
@@ -7775,11 +7774,6 @@ async function initialWorkflowTiming(
     afterSequence = events[events.length - 1]!.sequence;
   }
   return restoredWorkflowTiming(checkpoints, Date.now(), elapsedMs, timeoutMs, explicitTimeoutMs);
-}
-
-/** @deprecated Kept for benchmark-test compatibility; new code records a named stage. */
-export function mergeModelResponseMetrics(metrics: RunMetrics, response: ModelResponse): void {
-  recordModelResponse(metrics, "REVIEW", response);
 }
 
 function emptyMetrics(retries = 0): RunMetrics {

@@ -13,9 +13,8 @@ import {
   buildExecutionPacket,
   normalizeTargetPath,
   sourceSlice,
-  validateExecutionContract,
 } from "../src/runs/execution-packet.js";
-import { hash, type IndexSource } from "../src/localization/contracts.js";
+import { hash } from "../src/localization/contracts.js";
 
 const signal = new AbortController().signal;
 const code = "export function fix(value: number) { return value - 1; }\n";
@@ -30,14 +29,6 @@ const contract = (): ExecutionContract => ({
   ],
   unresolvedQuestions: [],
 });
-const source: IndexSource = {
-  lookup: async (p) =>
-    ["src/a.ts", "test/a.ts"].includes(p)
-      ? { path: p, sizeBytes: Buffer.byteLength(code), kind: "FILE", contentHash: hash(code) }
-      : undefined,
-  manifest: async () => ({ entries: [], incomplete: false }),
-  read: async () => ({ content: code, truncated: false }),
-};
 const plan = {
   summary: "Correct fix while preserving unrelated behavior",
   steps: [{ id: "a", title: "Fix", description: "Apply a minimal edit" }],
@@ -46,77 +37,12 @@ const plan = {
   confidence: 0.9,
 };
 describe("structured edit obligations, not natural-language path promotion", () => {
-  it("validates MODIFY and merges exact duplicate targets", async () => {
-    const c = contract();
-    c.editTargets.push({ ...c.editTargets[0]! });
-    const actual = await validateExecutionContract(c, source, signal);
-    expect(actual.editTargets).toHaveLength(1);
-    expect(actual.inspectTargets[0]?.path).toBe("test/a.ts");
-  });
-  it("supports CREATE without requiring an existing file", async () => {
-    const c = contract();
-    c.editTargets = [
-      { path: "src/new.ts", symbol: null, operation: "CREATE", rationale: "new required behavior" },
-    ];
-    expect((await validateExecutionContract(c, source, signal)).editTargets[0]?.operation).toBe(
-      "CREATE",
-    );
-  });
-  it("supports DELETE of an existing target", async () => {
-    const c = contract();
-    c.editTargets[0]!.operation = "DELETE";
-    expect((await validateExecutionContract(c, source, signal)).editTargets[0]?.operation).toBe(
-      "DELETE",
-    );
-  });
-  it.each(["inspect-only", "test-only", "preserve-only"])(
-    "does not turn %s into edit obligations",
-    async () => {
-      const c = contract();
-      c.editTargets = [];
-      await expect(validateExecutionContract(c, source, signal)).rejects.toMatchObject({
-        code: "PLAN_TARGET_AMBIGUOUS",
-      });
-    },
-  );
-  it("rejects conflicting operations", async () => {
-    const c = contract();
-    c.editTargets.push({ ...c.editTargets[0]!, operation: "DELETE" });
-    await expect(validateExecutionContract(c, source, signal)).rejects.toMatchObject({
-      code: "PLAN_TARGET_AMBIGUOUS",
-    });
-  });
   it.each(["../x.ts", "/etc/passwd", "C:\\secret.ts", ".env", "src/../../x.ts", ".git/config"])(
     "rejects unsafe path %s",
     (path) => expect(() => normalizeTargetPath(path)).toThrow(),
   );
   it("normalizes current safe paths", () =>
     expect(normalizeTargetPath("./src\\a.ts")).toBe("src/a.ts"));
-  it("rejects missing MODIFY and missing symbol", async () => {
-    const c = contract();
-    c.editTargets[0]!.path = "missing.ts";
-    await expect(validateExecutionContract(c, source, signal)).rejects.toMatchObject({
-      code: "PLAN_TARGET_INVALID",
-    });
-    c.editTargets[0]!.path = "src/a.ts";
-    c.editTargets[0]!.symbol = "unknown";
-    await expect(validateExecutionContract(c, source, signal)).rejects.toMatchObject({
-      code: "TARGET_SYMBOL_NOT_FOUND",
-    });
-  });
-  it("rejects duplicate declarations as ambiguous, not confidence", async () => {
-    const c = contract();
-    await expect(
-      validateExecutionContract(
-        c,
-        {
-          ...source,
-          read: async () => ({ content: "function fix() {}\nfunction fix() {}", truncated: false }),
-        },
-        signal,
-      ),
-    ).rejects.toMatchObject({ code: "PLAN_TARGET_AMBIGUOUS" });
-  });
   it("retains persisted plans and requires the contract for fresh Agent plans", () => {
     expect(AgentPlanSchema.parse(plan)).not.toHaveProperty("executionContract");
     expect(FreshAgentPlanOutputSchema.parse(plan)).toEqual(plan);

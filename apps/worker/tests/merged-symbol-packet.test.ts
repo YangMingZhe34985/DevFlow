@@ -1,38 +1,11 @@
 import { expect, it } from "vitest";
-import { sourceSlice, validateExecutionContract } from "../src/runs/execution-packet.js";
+import { sourceSlice } from "../src/runs/execution-packet.js";
 import { hash } from "../src/localization/contracts.js";
 
 const signal = new AbortController().signal;
 it("uses the implementation when a valid TypeScript type and value share the target name", async () => {
   const content =
     "export interface $Thing {value:number}\nexport const $Thing = (value:number) => value + 1;\n";
-  const source = {
-    manifest: async () => ({ entries: [], incomplete: false }),
-    lookup: async () => ({
-      path: "src/a.ts",
-      kind: "FILE" as const,
-      sizeBytes: Buffer.byteLength(content),
-      contentHash: hash(content),
-    }),
-    read: async () => ({ content, truncated: false }),
-  };
-  const contract = {
-    version: "execution-contract-v1" as const,
-    editTargets: [
-      {
-        path: "src/a.ts",
-        symbol: "$Thing",
-        operation: "MODIFY" as const,
-        rationale: "Fix runtime behavior",
-      },
-    ],
-    inspectTargets: [],
-    verificationHints: [],
-    unresolvedQuestions: [],
-  };
-  await expect(validateExecutionContract(contract, source, signal)).resolves.toMatchObject({
-    editTargets: [{ symbol: "$Thing" }],
-  });
   const slice = await sourceSlice("src/a.ts", "$Thing", content, 0, "EDIT", signal);
   expect(slice.startLine).toBe(2);
   expect(slice.code).toContain("value + 1");
@@ -55,4 +28,10 @@ it("keeps two runtime declarations ambiguous even when a type also shares the na
   await expect(sourceSlice("src/a.ts", "same", content, 0, "EDIT", signal)).rejects.toMatchObject({
     code: "PLAN_TARGET_AMBIGUOUS",
   });
+});
+it("rejects a target symbol that the source does not declare", async () => {
+  const content = "export const present = 1;\n";
+  await expect(
+    sourceSlice("src/a.ts", "missing", content, 0, "EDIT", signal),
+  ).rejects.toMatchObject({ code: "TARGET_SYMBOL_NOT_FOUND" });
 });

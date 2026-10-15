@@ -4,8 +4,6 @@ import { DevflowError, type AgentPlan } from "@devflow/shared";
 import type { SandboxSession } from "@devflow/sandbox";
 import { z } from "zod";
 import { graphPathAllowed } from "../localization/relation-graph.js";
-import { extractRepairDiagnostics } from "./workflow-context.js";
-import { resolveRepairDiagnostics } from "./repair-diagnostics.js";
 import type { CurrentSourceCache } from "./current-source-cache.js";
 
 const Identity = z.union([z.string().regex(/^[a-f0-9]{64}$/u), z.literal("ABSENT")]);
@@ -112,29 +110,6 @@ export const ScopeReplanStateSchema = z.object({
 });
 export type ScopeReplanState = z.infer<typeof ScopeReplanStateSchema>;
 export const approvedPlanIdentity = (plan: AgentPlan) => sha256(canonicalJson(plan));
-
-/** Model requests are hints. A real public diagnostic and current host source are required. */
-export function verifiedReplanPaths(
-  requested: readonly string[],
-  diagnostic: string,
-  approved: readonly string[],
-  allowed: (path: string) => boolean,
-  repositoryPaths: readonly string[] = extractRepairDiagnostics(diagnostic).map((d) => d.path),
-  manifestComplete = true,
-) {
-  const locations = new Set(
-    resolveRepairDiagnostics(diagnostic, repositoryPaths, manifestComplete).resolved.map(
-      (d) => d.path,
-    ),
-  );
-  const candidates = requested.length ? requested : [...locations];
-  return [...new Set(candidates)]
-    .filter(
-      (path) =>
-        graphPathAllowed(path) && allowed(path) && !approved.includes(path) && locations.has(path),
-    )
-    .slice(0, 8);
-}
 
 export async function captureReplanCandidate(input: {
   sandbox: SandboxSession;

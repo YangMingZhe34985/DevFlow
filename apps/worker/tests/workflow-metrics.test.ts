@@ -10,7 +10,6 @@ import {
   recordStageStep,
   recordStructuredFailure,
   recordToolWork,
-  stageStepTotal,
 } from "../src/runs/workflow-metrics.js";
 
 describe("workflow stage metrics", () => {
@@ -51,7 +50,6 @@ describe("workflow stage metrics", () => {
       (stage): stage is NonNullable<typeof stage> => stage !== undefined,
     );
     expect(sum(stages, "modelCalls")).toBe(metrics.modelCalls);
-    expect(stageStepTotal(metrics)).toBe(metrics.steps);
     expect(sum(stages, "toolCalls")).toBe(metrics.toolCalls);
     expect(sum(stages, "toolExecutions")).toBe(metrics.toolExecutions);
     expect(stages.reduce((total, stage) => total + stage.tokenUsage.totalTokens, 0)).toBe(

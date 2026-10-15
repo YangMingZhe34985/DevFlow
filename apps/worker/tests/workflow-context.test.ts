@@ -1,10 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
-import { FakeGitHubProvider } from "@devflow/github";
 import type { CommandResult } from "@devflow/sandbox";
 
 import {
-  buildGitHubRepositoryComplexityProfile,
   buildRepositoryComplexityProfile,
   buildReviewContext,
   testResultFingerprint,
@@ -63,70 +61,6 @@ describe("workflow context bounds and fingerprints", () => {
     });
     expect(profile.languageIndicators).toContain("TypeScript/React");
     expect(profile.frameworkIndicators).toEqual(expect.arrayContaining(["Next.js", "Prisma"]));
-  });
-
-  it("profiles a GitHub repository for PLAN from the Task's pinned commit SHA", async () => {
-    const baseCommitSha = "b".repeat(40);
-    const provider = new FakeGitHubProvider({
-      repositoryTree: {
-        entries: [
-          { path: "apps/web/next.config.ts", kind: "FILE", sizeBytes: 100 },
-          { path: "apps/web/src/login-form.tsx", kind: "FILE", sizeBytes: 2_000 },
-          { path: "apps/web/tests/login-form.test.tsx", kind: "FILE", sizeBytes: 3_000 },
-          { path: "packages/database/prisma/schema.prisma", kind: "FILE", sizeBytes: 1_000 },
-        ],
-        truncated: true,
-      },
-    });
-
-    const profile = await buildGitHubRepositoryComplexityProfile({
-      provider,
-      sourceUri: "https://github.com/devflow/fixture.git",
-      baseCommitSha,
-      task: { title: "Fix login form", description: "Repair login validation" },
-    });
-
-    expect(provider.repositoryTreeCalls).toEqual([
-      { repository: { owner: "devflow", name: "fixture" }, baseCommitSha },
-    ]);
-    expect(profile).toMatchObject({
-      availability: "TRUNCATED",
-      fileCount: 4,
-      totalBytes: 6_100,
-      relevantFileCount: 2,
-      testAvailability: "AVAILABLE",
-      moduleCount: 2,
-    });
-    expect(profile.languageIndicators).toContain("TypeScript/React");
-    expect(profile.frameworkIndicators).toEqual(expect.arrayContaining(["Next.js", "Prisma"]));
-    const planContext = JSON.stringify({ repositoryProfile: profile }, null, 2);
-    expect(planContext).toContain('"availability": "TRUNCATED"');
-    expect(planContext).toContain('"fileCount": 4');
-  });
-
-  it("degrades GitHub profile failures without leaking provider details into PLAN", async () => {
-    const secret = "github_pat_platform_only_secret_1234567890";
-    const readRepositoryTree = vi.fn(async () => {
-      throw new Error(`upstream echoed ${secret}`);
-    });
-
-    const profile = await buildGitHubRepositoryComplexityProfile({
-      provider: { readRepositoryTree },
-      sourceUri: "https://github.com/devflow/fixture.git",
-      baseCommitSha: "c".repeat(40),
-      task: { title: "Fix login", description: "Repair login validation" },
-    });
-
-    expect(readRepositoryTree).toHaveBeenCalledOnce();
-    expect(profile).toEqual({
-      availability: "UNAVAILABLE",
-      languageIndicators: [],
-      frameworkIndicators: [],
-      manifestFiles: [],
-      testAvailability: "UNKNOWN",
-      testIndicators: [],
-    });
-    expect(JSON.stringify(profile)).not.toContain(secret);
   });
 });
 

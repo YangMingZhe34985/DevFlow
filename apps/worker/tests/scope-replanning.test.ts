@@ -10,7 +10,6 @@ import {
   projectCandidateChange,
   restoreReplanCandidate,
   ScopeReplanStateSchema,
-  verifiedReplanPaths,
 } from "../src/runs/scope-replanning.js";
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 function fixture(current: Record<string, string>, baseline: Record<string, string>) {
@@ -157,25 +156,6 @@ describe("scope replanning authority and recoverable candidate", () => {
     });
     expect(projectCandidateChange("", "new\r\n").after).toBe("new\r\n");
     expect(projectCandidateChange("old\r\n", "").before).toBe("old\r\n");
-  });
-  it("requires a new implementation path independently confirmed by public diagnostics", () => {
-    const log = "src/wrapper.py:12: in run\nsrc/registry.py:115: in lookup_execution";
-    expect(
-      verifiedReplanPaths(
-        ["src/registry.py", "src/invented.py"],
-        log,
-        ["src/wrapper.py"],
-        () => true,
-      ),
-    ).toEqual(["src/registry.py"]);
-    expect(
-      verifiedReplanPaths(
-        ["tests/test_registry.py"],
-        "tests/test_registry.py:4: error",
-        [],
-        () => false,
-      ),
-    ).toEqual([]);
   });
   it("round trips modified, new and deleted files with exact CRLF bytes", async () => {
     const baseline = { "old.ts": "old\r\n", "deleted.ts": "remove\n" };

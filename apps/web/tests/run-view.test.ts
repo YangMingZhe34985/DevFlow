@@ -6,7 +6,6 @@ import {
   metricGroups,
   projectTerminalRun,
   reviewView,
-  stepActivities,
   toolActivities,
   workflowItems,
 } from "../src/lib/run-view.js";
@@ -324,17 +323,6 @@ describe("grouped metrics", () => {
 });
 
 describe("activity summaries", () => {
-  it("creates compact step summaries", () => {
-    const [activity] = stepActivities([stepRecord("EXECUTE")]);
-
-    expect(activity).toMatchObject({
-      title: "Review diff",
-      status: "SUCCEEDED",
-      stage: "EXECUTE",
-      summary: "EXECUTE · SUCCEEDED · 2.0 s",
-    });
-  });
-
   it("joins tool calls to their step stage", () => {
     const step = stepRecord("REVIEW");
     const tool = toolCallRecord(step.id);

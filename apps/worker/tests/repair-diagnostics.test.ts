@@ -3,7 +3,6 @@ import {
   resolveRepairDiagnostics,
   repairModeInstructions,
 } from "../src/runs/repair-diagnostics.js";
-import { verifiedReplanPaths } from "../src/runs/scope-replanning.js";
 
 describe("shared repository diagnostic identities", () => {
   it("maps a Mockito Java frame to the package-qualified repository implementation", () => {
@@ -16,7 +15,6 @@ describe("shared repository diagnostic identities", () => {
     expect(resolution.resolved).toEqual([
       expect.objectContaining({ path, line: 40, resolution: "JAVA_CLASS" }),
     ]);
-    expect(verifiedReplanPaths([path], output, [], () => true, paths)).toEqual([path]);
   });
   it("filters unrelated framework frames before selecting project files", () => {
     const output =

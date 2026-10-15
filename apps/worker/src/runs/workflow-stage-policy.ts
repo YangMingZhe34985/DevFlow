@@ -98,29 +98,10 @@ export function codingSystemPrompt(purpose: AgentPhasePurpose): string {
   return `${COMMON_PROMPT} You are the single Coding Agent for this task. Observe, edit, submit a candidate for public validation, analyze the host's failure feedback, and revise in the same session. Your original task and approved behavioral requirements remain active after every edit and test. Check remaining requirements, but do not edit a file merely because it is approved. Choose your next action from evidence: continue a precise edit, use locateIssue for a focused read-only investigation when available, or request an optional runDiagnostic using only its host-listed checkId. Diagnostics run in a disposable copy, provide observations only, and never replace the complete final profile or Review. A failed diagnostic can motivate a read, a local edit or a justified scope request; it grants no new write permission or budget. These actions are optional, not a required sequence. Use finishPhase to yield the current candidate to the workflow; put it after edits in the same response when ready. Workflow always performs Final Validation and Independent Review; a failed check returns to this session while resources remain. A successful submission requires no extra confirmation call. Never invent test results, repeat an unchanged failed candidate, or ignore unfinishedWork. When blocked by scope, cite the current public failure and candidate implementation using SCOPE_CONFLICT; only a new PLAN approval authorizes expanded writes. Current feedback reason: ${purpose}.`;
 }
 
-/**
- * Clamps a lease selected by the adaptive budget planner. Stage policy must not
- * impose a second fixed 12/4 ceiling: the shared ledger owns allocation.
- */
-export function stageStepLimit(
-  _purpose: AgentPhasePurpose,
-  remainingSteps: number,
-  allocatedSteps = remainingSteps,
-): number {
-  return Math.max(
-    0,
-    Math.min(nonnegativeInteger(allocatedSteps), nonnegativeInteger(remainingSteps)),
-  );
-}
-
 export function stageReasoningEffort(
   purpose: AgentPhasePurpose,
   profile: "efficient" | "provider-default",
 ): "low" | "medium" | undefined {
   if (profile === "provider-default") return undefined;
   return purpose === "IMPLEMENTATION" ? "low" : "medium";
-}
-
-function nonnegativeInteger(value: number): number {
-  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }

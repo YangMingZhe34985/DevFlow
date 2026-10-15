@@ -26,15 +26,6 @@ export function requestPaths(request: ToolExecutionRequest): string[] {
   return [...new Set(paths.map((p) => p.replaceAll("\\", "/").replace(/^(\.\/)+/u, "")))];
 }
 
-export function plannedTargets(plan: AgentPlan, known: readonly string[]): string[] {
-  const scope = plannedTargetScope(plan, known);
-  return scope.blockers.length
-    ? []
-    : scope.requiredTargets.length
-      ? scope.requiredTargets
-      : scope.targets;
-}
-
 export function plannedTargetScope(
   plan: AgentPlan,
   known: readonly string[],

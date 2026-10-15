@@ -3,8 +3,6 @@ import { describe, expect, it } from "vitest";
 
 import {
   WorkflowBudgetLedger,
-  allocateExecuteBudget,
-  allocateRepairBudget,
   allocateReviewBudget,
   buildAdaptiveBudgetMetrics,
   evaluateBudgetExtension,
@@ -178,82 +176,6 @@ describe("adaptive budget planning", () => {
 });
 
 describe("dynamic stage leases", () => {
-  it("gives a maxSteps=100 complex implementation more than twelve steps", () => {
-    const lease = allocateExecuteBudget({
-      budget: adaptive("COMPLEX", 55, 100),
-      consumedSteps: 1,
-      remainingRepairAttempts: 4,
-    });
-    expect(lease).toMatchObject({
-      initialSteps: 40,
-      reviewReserve: 2,
-      repairReserve: 27,
-      mandatoryDownstreamSteps: 3,
-    });
-    expect(lease.initialSteps).toBeGreaterThan(12);
-    expect(lease.maximumSteps).toBe(96);
-  });
-
-  it("keeps the simple fast path small while reserving repair and review", () => {
-    expect(
-      allocateExecuteBudget({
-        budget: adaptive("SIMPLE", 8, 25),
-        consumedSteps: 1,
-        remainingRepairAttempts: 2,
-      }),
-    ).toMatchObject({
-      initialSteps: 7,
-      reviewReserve: 2,
-      repairReserve: 2,
-      mandatoryDownstreamSteps: 3,
-    });
-  });
-
-  it("lets tiny Runs enter Execute before degrading downstream reserves", () => {
-    expect(
-      allocateExecuteBudget({
-        budget: adaptive("SIMPLE", 8, 3),
-        consumedSteps: 1,
-        remainingRepairAttempts: 1,
-      }),
-    ).toMatchObject({
-      initialSteps: 1,
-      maximumSteps: 1,
-      reviewReserve: 1,
-      repairReserve: 0,
-    });
-  });
-
-  it("divides the current repair pool by complexity-aware remaining cycles", () => {
-    expect(
-      allocateRepairBudget({
-        budget: adaptive("COMPLEX", 55, 100),
-        consumedSteps: 41,
-        remainingRepairAttempts: 3,
-      }),
-    ).toMatchObject({
-      initialSteps: 9,
-      reviewReserve: 2,
-      repairReserve: 18,
-      mandatoryDownstreamSteps: 2,
-    });
-  });
-
-  it("lets a final repair consume the last step when tests already failed", () => {
-    expect(
-      allocateRepairBudget({
-        budget: adaptive("SIMPLE", 8, 3),
-        consumedSteps: 2,
-        remainingRepairAttempts: 1,
-      }),
-    ).toMatchObject({
-      initialSteps: 1,
-      maximumSteps: 1,
-      reviewReserve: 0,
-      mandatoryDownstreamSteps: 0,
-    });
-  });
-
   it("reserves one normal Review and its single format repair", () => {
     expect(
       allocateReviewBudget({ budget: adaptive("SIMPLE", 8, 25), consumedSteps: 10 }),

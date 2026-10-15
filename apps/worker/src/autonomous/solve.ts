@@ -62,6 +62,8 @@ export interface SolveInput {
   review?: {
     model: LanguageModelPort;
     settings?: ModelGenerationSettings;
+    /** Tier-1 (single verdict) settings; tier 2 keeps settings. */
+    triageSettings?: ModelGenerationSettings | undefined;
     price?: KernelPrice | undefined;
     maxTurns?: number;
     reserve?: number;
@@ -241,7 +243,18 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
           ...(review ? { concerns: review.concerns } : {}),
           verification,
           model: input.review.model,
-          ...(input.review.settings ? { settings: input.review.settings } : {}),
+          ...((
+            tier === 1
+              ? (input.review.triageSettings ?? input.review.settings)
+              : input.review.settings
+          )
+            ? {
+                settings:
+                  tier === 1
+                    ? (input.review.triageSettings ?? input.review.settings)
+                    : input.review.settings,
+              }
+            : {}),
           ...(input.review.price ? { price: input.review.price } : {}),
           limits: {
             ...input.limits,

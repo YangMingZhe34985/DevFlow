@@ -215,6 +215,16 @@ describe("structured output and review settings", () => {
     expect(result.summary).toContain("after 2 attempt(s)");
     expect(model.requests).toHaveLength(2);
   });
+  it("retries a reply cut off by the output limit with twice the output room", async () => {
+    const cut = fakeModelResponse({ toolCalls: [], finishReason: "LENGTH" });
+    const model = new FakeLanguageModel([cut, triage()]);
+    const result = await runTriageReview({
+      ...reviewInput(model),
+      settings: { maxOutputTokens: 4096 },
+    });
+    expect(result.verdict).toBe("PASS");
+    expect(model.requests.map((r) => r.settings?.maxOutputTokens)).toEqual([4096, 8192]);
+  });
   it("parses a JSON text response when no adapter output object is provided", async () => {
     const model = new FakeLanguageModel([
       fakeModelResponse({ text: JSON.stringify({ ...submission(), concerns: [] }), toolCalls: [] }),
@@ -222,10 +232,12 @@ describe("structured output and review settings", () => {
     expect((await runTriageReview(reviewInput(model))).verdict).toBe("PASS");
   });
   it.each(["glm-5.3", "glm-5.3-preview", "deepseek-v4-pro-0813"])(
-    "falls back to the binding reasoning for %s",
+    "steps unsupported effort down to the nearest supported level for %s",
     (model) => {
+      // medium is unsupported: use low, never the heavier binding level (high consumed the
+      // whole 4096-token output in the tiered-review retest).
       expect(reviewSettings(model, { reasoningEffort: "high", maxOutputTokens: 16384 })).toEqual({
-        reasoningEffort: "high",
+        reasoningEffort: "low",
         maxOutputTokens: 4096,
       });
       expect(
@@ -234,14 +246,14 @@ describe("structured output and review settings", () => {
           { reasoningEffort: "low" },
           { reasoningEffort: "xhigh", maxOutputTokens: 2048 },
         ),
-      ).toEqual({ reasoningEffort: "low", maxOutputTokens: 2048 });
+      ).toEqual({ reasoningEffort: "high", maxOutputTokens: 2048 });
       expect(
         reviewSettings(model, { reasoningEffort: "low" }, { reasoningEffort: "max" })
           .reasoningEffort,
       ).toBe("max");
     },
   );
-  it("supports medium for other bindings and none only for DeepSeek", () => {
+  it("keeps medium for unrestricted models and none only where supported", () => {
     expect(reviewSettings("other", {}).reasoningEffort).toBe("medium");
     expect(
       reviewSettings("deepseek-v4-flash", { reasoningEffort: "high" }, { reasoningEffort: "none" })
@@ -250,7 +262,7 @@ describe("structured output and review settings", () => {
     expect(
       reviewSettings("glm-5.3", { reasoningEffort: "high" }, { reasoningEffort: "none" })
         .reasoningEffort,
-    ).toBe("high");
+    ).toBe("low");
   });
 });
 

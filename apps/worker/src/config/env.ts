@@ -178,6 +178,11 @@ const WorkerEnvironmentSchema = z.object({
   DEVFLOW_AUTONOMOUS_REVIEW_REASONING: z
     .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
     .default("medium"),
+  // Tier 1 is one structured verdict: thinking off where the model allows it. A real call
+  // with reasoning on spent ~6.4K output tokens on reasoning for a 4K-token review input.
+  DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .default("none"),
   DEVFLOW_AUTONOMOUS_REVIEW_RESERVE: z.coerce.number().min(0).max(1).default(0.15),
   DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
 });

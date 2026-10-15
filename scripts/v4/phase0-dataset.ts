@@ -222,6 +222,14 @@ async function runCase(caseId: string, repeat: number): Promise<Record<string, u
                   reasoningEffort: environment.DEVFLOW_AUTONOMOUS_REVIEW_REASONING,
                 },
               ),
+              triageSettings: reviewSettings(
+                "fake",
+                {},
+                {
+                  maxOutputTokens: environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT,
+                  reasoningEffort: environment.DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING,
+                },
+              ),
               price: PRICE,
             }
         : undefined;
@@ -367,6 +375,14 @@ function liveModel(stage: "EXECUTE" | "REVIEW" = "EXECUTE"): {
   return {
     model: createConfiguredLanguageModel(config),
     ...(price ? { price } : {}),
+    ...(stage === "REVIEW"
+      ? {
+          triageSettings: reviewSettings(config.model, binding.settings, {
+            maxOutputTokens: environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT,
+            reasoningEffort: environment.DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING,
+          }),
+        }
+      : {}),
     settings:
       stage === "REVIEW"
         ? reviewSettings(config.model, binding.settings, {

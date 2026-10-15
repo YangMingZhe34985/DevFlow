@@ -47,6 +47,8 @@ const DEFAULT_PROTECTED_PATHS = [".git/", ".github/workflows/"];
 export interface AutonomousModel {
   model: LanguageModelPort;
   settings: ModelGenerationSettings;
+  /** Review only: tier-1 settings (thinking off where supported). */
+  triageSettings?: ModelGenerationSettings | undefined;
   price?: KernelPrice | undefined;
   bindingHash: string;
 }
@@ -623,9 +625,22 @@ export class AutonomousRunExecutor implements RunExecutionPort {
             reasoningEffort: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_REASONING,
           })
         : original;
+    const triage = (name: string, original: ModelGenerationSettings) =>
+      stage === "REVIEW"
+        ? {
+            triageSettings: reviewSettings(name, original, {
+              maxOutputTokens: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT,
+              reasoningEffort: this.environment.DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING,
+            }),
+          }
+        : {};
     if (factory) {
       const result = factory(run);
-      return { ...result, settings: settings("fake", result.settings) };
+      return {
+        ...result,
+        settings: settings("fake", result.settings),
+        ...triage("fake", result.settings),
+      };
     }
     const binding = resolveStageModel(stage, this.environment, run);
     const { contextMaxBytes: _contextMaxBytes, ...config } = binding.config;
@@ -642,6 +657,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
     return {
       model: createConfiguredLanguageModel(config),
       settings: settings(config.model, binding.settings),
+      ...triage(config.model, binding.settings),
       price,
       bindingHash:
         binding.provenance.configurationHash +

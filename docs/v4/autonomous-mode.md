@@ -50,23 +50,24 @@ Web 端在创建 Run 的表单中选择 “Execution mode → autonomous”。
 
 以下为 Worker 环境变量，示例见 `.env.example`。
 
-| 变量                                   | 默认值   | 作用                                                                 |
-| -------------------------------------- | -------- | -------------------------------------------------------------------- |
-| `LLM_EXECUTE_*`                        | —        | 求解模型绑定（与 workflow 模式的 Coding 阶段共用）                   |
-| `LLM_REVIEW_*`                         | 现有配置 | 独立 Reviewer 模型，可与求解模型分别配置                             |
-| `DEVFLOW_TIMEOUT_MS`                   | 1500000  | 整个 Run 的绝对期限；恢复后不会重置                                  |
-| `DEVFLOW_MAX_COST_MICROS`              | 未设置   | Run 费用硬上限；设置时必须为该模型配置价格                           |
-| `DEVFLOW_MODEL_PRICES_JSON`            | 未设置   | 模型价格，可含 `cachedInputMicrosPerMillionTokens`（缓存命中价）     |
-| `DEVFLOW_AUTONOMOUS_MAX_TURNS`         | 100      | 整个 Run 的轮数上限（所有尝试、Review、修订和恢复累计）              |
-| `DEVFLOW_AUTONOMOUS_CONTEXT_TOKENS`    | 100000   | 估算提示超过该值的 80% 时，较早的工具输出会被省略                    |
-| `DEVFLOW_AUTONOMOUS_MAX_REVISIONS`     | 2        | 宿主验证失败后，最多回到同一会话修订的次数                           |
-| `DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS`  | 5        | 每隔多少轮保存一次检查点（工作区 diff + 对话）                       |
-| `DEVFLOW_AUTONOMOUS_REVIEW`            | 1        | 1 开启独立审查；0 关闭                                               |
-| `DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS` | 8        | 第 2 层轮数上限，范围 1–8，同时受 Run 剩余轮数限制；替代旧 MAX_TURNS |
-| `DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT` | 4096     | 两层审查的输出上限，覆盖 REVIEW 绑定                                 |
-| `DEVFLOW_AUTONOMOUS_REVIEW_REASONING`  | medium   | 两层审查的思考强度，覆盖 REVIEW 绑定；模型不支持时回退原绑定档位     |
-| `DEVFLOW_AUTONOMOUS_REVIEW_RESERVE`    | 0.15     | Review 累计最多使用总费用上限的此比例；求解独享其余比例              |
-| `DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS`      | 2        | 失败时可追加的尝试总数（含首次）；设为 1 禁用追加                    |
+| 变量                                         | 默认值   | 作用                                                                      |
+| -------------------------------------------- | -------- | ------------------------------------------------------------------------- |
+| `LLM_EXECUTE_*`                              | —        | 求解模型绑定（与 workflow 模式的 Coding 阶段共用）                        |
+| `LLM_REVIEW_*`                               | 现有配置 | 独立 Reviewer 模型，可与求解模型分别配置                                  |
+| `DEVFLOW_TIMEOUT_MS`                         | 1500000  | 整个 Run 的绝对期限；恢复后不会重置                                       |
+| `DEVFLOW_MAX_COST_MICROS`                    | 未设置   | Run 费用硬上限；设置时必须为该模型配置价格                                |
+| `DEVFLOW_MODEL_PRICES_JSON`                  | 未设置   | 模型价格，可含 `cachedInputMicrosPerMillionTokens`（缓存命中价）          |
+| `DEVFLOW_AUTONOMOUS_MAX_TURNS`               | 100      | 整个 Run 的轮数上限（所有尝试、Review、修订和恢复累计）                   |
+| `DEVFLOW_AUTONOMOUS_CONTEXT_TOKENS`          | 100000   | 估算提示超过该值的 80% 时，较早的工具输出会被省略                         |
+| `DEVFLOW_AUTONOMOUS_MAX_REVISIONS`           | 2        | 宿主验证失败后，最多回到同一会话修订的次数                                |
+| `DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS`        | 5        | 每隔多少轮保存一次检查点（工作区 diff + 对话）                            |
+| `DEVFLOW_AUTONOMOUS_REVIEW`                  | 1        | 1 开启独立审查；0 关闭                                                    |
+| `DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS`       | 8        | 第 2 层轮数上限，范围 1–8，同时受 Run 剩余轮数限制；替代旧 MAX_TURNS      |
+| `DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT`       | 4096     | 两层审查的输出上限，覆盖 REVIEW 绑定                                      |
+| `DEVFLOW_AUTONOMOUS_REVIEW_REASONING`        | medium   | 第 2 层（工具核查）的思考强度；模型不支持时降到最接近的较低档位           |
+| `DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING` | none     | 第 1 层（单次结论）的思考强度，默认关闭思考；不支持 none 的模型降到最低档 |
+| `DEVFLOW_AUTONOMOUS_REVIEW_RESERVE`          | 0.15     | Review 累计最多使用总费用上限的此比例；求解独享其余比例                   |
+| `DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS`            | 2        | 失败时可追加的尝试总数（含首次）；设为 1 禁用追加                         |
 
 关于百炼计费：隐式缓存命中部分按输入单价的 20% 计费（[官方说明](https://help.aliyun.com/zh/model-studio/context-cache)）。配置价格时应同时填写缓存命中价，否则费用上限会按全价计算，比实际账单保守得多。
 

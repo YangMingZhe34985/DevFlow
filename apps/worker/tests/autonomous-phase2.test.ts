@@ -175,6 +175,23 @@ describe("adaptive attempts", () => {
       expect(seen[0]).not.toBe(seen[1]);
     },
   );
+  it("appends after an attempt that produced no change at all", async () => {
+    const solve = vi.fn(async (input: SolveInput) => {
+      if (input.failureSummary === undefined) {
+        const empty = candidate(false);
+        delete empty.verification;
+        return { ...empty, patch: "", changedFiles: [] };
+      }
+      return candidate(true, "PASS");
+    });
+    const result = await runAttempts({
+      ...attemptInput(),
+      sandboxFactory: async () => fakeSandbox().sandbox,
+      solve,
+    });
+    expect(solve).toHaveBeenCalledTimes(2);
+    expect(result.selectedAttempt).toBe(2);
+  });
   it.each(["cost", "turns", "deadline"])(
     "does not append when the global %s limit is reached",
     async (limit) => {

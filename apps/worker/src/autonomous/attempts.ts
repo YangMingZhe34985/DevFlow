@@ -104,7 +104,9 @@ export async function runAttempts(input: AttemptsInput): Promise<AttemptsResult>
   ) {
     input.signal.throwIfAborted();
     const previous = attempts.at(-1)?.solve;
-    if (previous && previous.verification?.passed !== false && previous.review?.verdict !== "FAIL")
+    // Only a verified candidate that review did not reject ends the search; an attempt that
+    // produced no change at all (no verification) is a failure too.
+    if (previous && previous.verification?.passed === true && previous.review?.verdict !== "FAIL")
       break;
     await input.onAttemptStarted?.(attempt, resume ?? { messages: [], usage, turns });
     const sandbox = await input.sandboxFactory(attempt);

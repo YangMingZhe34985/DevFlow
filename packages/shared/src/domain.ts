@@ -3,8 +3,6 @@ import { ExecuteCompletionSchema, VerificationContractSchema } from "./completio
 
 import { DevflowErrorShapeSchema } from "./errors.js";
 import { EntityIdSchema } from "./ids.js";
-import { ExecutionContractSchema } from "./execution.js";
-import { PlanProposalSchema, PlanApprovalScopeSchema } from "./proposal.js";
 
 export const TaskStatusSchema = z.enum(["OPEN", "COMPLETED", "CANCELLED", "ARCHIVED"]);
 export type TaskStatus = z.infer<typeof TaskStatusSchema>;
@@ -40,165 +38,6 @@ export const WorkflowStageSchema = z.enum([
   "CANCELLED",
 ]);
 export type WorkflowStage = z.infer<typeof WorkflowStageSchema>;
-
-export const TaskSpecSchema = z.object({
-  taskId: EntityIdSchema,
-  repositoryId: EntityIdSchema,
-  title: z.string().min(1),
-  description: z.string().min(1),
-  baseCommitSha: z.string().min(1).optional(),
-});
-export type TaskSpec = z.infer<typeof TaskSpecSchema>;
-
-export const PlanStepSchema = z.object({
-  id: z.string().min(1),
-  title: z.string().min(1),
-  description: z.string().min(1),
-});
-
-export const ComplexitySchema = z.enum(["SIMPLE", "MEDIUM", "COMPLEX"]);
-export type Complexity = z.infer<typeof ComplexitySchema>;
-
-export const AgentPlanSchema = z.object({
-  summary: z.string().min(1),
-  steps: z.array(PlanStepSchema).min(1),
-  // Optional here so plans persisted before adaptive budgeting remain readable.
-  // Fresh PLAN generations use FreshAgentPlanOutputSchema below.
-  complexity: ComplexitySchema.optional(),
-  estimatedSteps: z.number().int().positive().optional(),
-  confidence: z.number().min(0).max(1).optional(),
-  executionContract: ExecutionContractSchema.optional(),
-  proposalVersion: z.literal("plan-proposal-v1").optional(),
-  proposal: PlanProposalSchema.optional(),
-  approvalScope: PlanApprovalScopeSchema.optional(),
-  warnings: z.array(z.string()).optional(),
-});
-export type AgentPlan = z.infer<typeof AgentPlanSchema>;
-
-export const FreshAgentPlanOutputSchema = z
-  .object({
-    summary: z.string().min(1),
-    steps: z.array(PlanStepSchema).min(1),
-    complexity: ComplexitySchema,
-    estimatedSteps: z.number().int().positive(),
-    confidence: z.number().min(0).max(1),
-  })
-  .strict();
-export type FreshAgentPlanOutput = z.infer<typeof FreshAgentPlanOutputSchema>;
-export const FreshAgentPlanWithContractSchema = FreshAgentPlanOutputSchema.extend({
-  executionContract: ExecutionContractSchema,
-});
-
-export const ReviewBehaviorSchema = z.object({
-  scenario: z.string().min(1).max(2000),
-  expected: z.string().min(1).max(2000),
-  actual: z.string().min(1).max(2000),
-  requirementBasis: z.enum(["ISSUE", "PUBLIC_API", "REGRESSION"]),
-  requirement: z.string().min(1).max(2000),
-  evidenceBasis: z.enum(["STATIC_DERIVATION", "PUBLIC_PROBE"]).optional(),
-});
-
-export const ReviewScopeAssessmentSchema = z.object({
-  category: z.enum([
-    "ISSUE_UNRESOLVED",
-    "PATCH_REGRESSION",
-    "PREEXISTING_UNRELATED",
-    "UNDETERMINED",
-  ]),
-  explanation: z.string().min(1).max(2000),
-  taskQuote: z.string().min(1).max(2000).optional(),
-  baselineEvidence: z
-    .object({ path: z.string().min(1), quote: z.string().min(1).max(4000) })
-    .optional(),
-});
-
-export const ReviewFindingSchema = z.object({
-  findingId: z.string().min(1).optional(),
-  kind: z.enum(["DEFECT", "EVIDENCE_GAP", "SUGGESTION"]).optional(),
-  severity: z.enum(["INFO", "WARNING", "ERROR"]),
-  message: z.string().min(1),
-  behavior: ReviewBehaviorSchema.optional(),
-  scopeAssessment: ReviewScopeAssessmentSchema.optional(),
-  blocking: z.boolean().optional(),
-  blockingReason: z
-    .enum([
-      "NONE",
-      "ISSUE_UNRESOLVED",
-      "PATCH_REGRESSION",
-      "ESSENTIAL_EVIDENCE_MISSING",
-      "SCOPE_UNDETERMINED",
-      "UNVERIFIED_BEHAVIOR",
-    ])
-    .optional(),
-  probeIds: z.array(z.string().min(1)).max(2).optional(),
-  probeAssessment: z
-    .object({
-      probeId: z.string().min(1),
-      conclusion: z.enum(["CONFIRMED", "CONTRADICTED", "INCONCLUSIVE"]),
-      explanation: z.string().min(1).max(2000),
-    })
-    .optional(),
-  disposition: z.enum(["OPEN", "CONFIRMED", "RESOLVED", "CONTRADICTED", "DEFERRED"]).optional(),
-  path: z.string().min(1).optional(),
-  evidenceStatus: z.enum(["SOURCE_LINKED", "UNVERIFIED"]).optional(),
-  evidence: z
-    .object({
-      quote: z.string().min(1),
-      fileSha256: z.string().regex(/^[a-f0-9]{64}$/u),
-      workspaceRevision: z.number().int().nonnegative(),
-    })
-    .optional(),
-});
-
-export const ReviewProbeRequestSchema = z
-  .object({
-    probeId: z.string().min(1).optional(),
-    findingId: z.string().min(1),
-    publicEntrypoint: z.string().min(1).max(1024),
-    language: z.enum(["JS", "TS"]),
-    code: z
-      .string()
-      .min(1)
-      .max(16 * 1024),
-    expectedObservation: z.string().min(1).max(2000),
-    taskBasis: z.string().min(1).max(2000),
-  })
-  .strict();
-
-export const ReviewHostFeedbackSchema = z.object({
-  findingId: z.string().min(1).optional(),
-  category: z.enum(["SOURCE", "BEHAVIOR", "TASK_SCOPE", "REQUEST_FORMAT"]),
-  code: z.string().min(1),
-  field: z.string().optional(),
-  value: z.string().optional(),
-  message: z.string().min(1),
-});
-
-export const ReviewResultSchema = z.object({
-  hostFeedback: z.array(ReviewHostFeedbackSchema).optional(),
-  probeRequests: z.array(ReviewProbeRequestSchema).max(2).optional(),
-  decision: z.enum(["PASS", "FAIL", "NEEDS_EVIDENCE"]).optional(),
-  decisionReason: z
-    .enum(["NO_BLOCKING_FINDINGS", "BLOCKING_FINDINGS", "MISSING_EVIDENCE"])
-    .optional(),
-  evidenceRequests: z
-    .array(
-      z
-        .object({
-          path: z.string().min(1).max(1024).optional(),
-          symbol: z.string().min(1).max(256).optional(),
-          view: z.enum(["CURRENT", "BASELINE"]).optional(),
-          question: z.string().min(1).max(2000),
-        })
-        .strict(),
-    )
-    .max(3)
-    .optional(),
-  approved: z.boolean(),
-  summary: z.string().min(1),
-  findings: z.array(ReviewFindingSchema).default([]),
-});
-export type ReviewResult = z.infer<typeof ReviewResultSchema>;
 
 export const TokenUsageSchema = z.object({
   inputTokens: z.number().int().nonnegative(),
@@ -248,6 +87,9 @@ export const RunControlMetricsSchema = z.object({
 });
 export type RunControlMetrics = z.infer<typeof RunControlMetricsSchema>;
 
+export const ComplexitySchema = z.enum(["SIMPLE", "MEDIUM", "COMPLEX"]);
+
+/** Adaptive step budgets of retired workflow Runs; kept so their metrics stay readable. */
 export const AdaptiveBudgetMetricsSchema = z.object({
   complexity: ComplexitySchema,
   estimatedSteps: z.number().int().positive(),

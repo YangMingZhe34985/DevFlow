@@ -1,48 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  AgentPlanSchema,
-  FreshAgentPlanOutputSchema,
   DevflowErrorCodeSchema,
   RunMetricsSchema,
-  TaskSpecSchema,
   type RunMetrics,
   type StageMetrics,
 } from "../src/index.js";
 
 describe("runtime metrics contracts", () => {
-  it("preserves the canonical Task baseCommitSha field", () => {
-    const task = TaskSpecSchema.parse({
-      taskId: crypto.randomUUID(),
-      repositoryId: crypto.randomUUID(),
-      title: "Fix",
-      description: "Fix the target.",
-      baseCommitSha: "a".repeat(40),
-    });
-
-    expect(task.baseCommitSha).toBe("a".repeat(40));
-    expect(task).not.toHaveProperty("baseCommit");
-  });
-
   it("continues to accept the legacy flat Run metrics shape", () => {
     expect(RunMetricsSchema.parse(legacyMetrics())).toEqual(legacyMetrics());
-  });
-
-  it("keeps historical plans readable while requiring estimates for fresh output", () => {
-    const historical = {
-      summary: "Apply one targeted fix.",
-      steps: [{ id: "one", title: "Fix", description: "Patch the target." }],
-    };
-    expect(AgentPlanSchema.parse(historical)).toEqual(historical);
-    expect(FreshAgentPlanOutputSchema.safeParse(historical).success).toBe(false);
-    expect(
-      FreshAgentPlanOutputSchema.parse({
-        ...historical,
-        complexity: "SIMPLE",
-        estimatedSteps: 6,
-        confidence: 0.9,
-      }),
-    ).toMatchObject({ complexity: "SIMPLE", estimatedSteps: 6, confidence: 0.9 });
   });
 
   it("accepts stage, control, cache, execution, and reasoning metrics", () => {

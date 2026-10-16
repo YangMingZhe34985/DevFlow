@@ -11,7 +11,6 @@ import {
   benchmarkDefinitionDigest,
   sha256,
 } from "@devflow/eval";
-import { SandboxGitService } from "@devflow/git";
 import type { SandboxSession } from "@devflow/sandbox";
 import { DevflowError, type RunMetrics, type RunResult } from "@devflow/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,7 +20,6 @@ import {
   evaluateBenchmarkInSandbox,
   prepareBenchmarkEvaluation,
 } from "../src/runs/benchmark-evaluation.js";
-import { createTools, initialWorkflowMetrics } from "../src/runs/approval-workflow-run-executor.js";
 
 const CASE_EXECUTION_ID = "00000000-0000-4000-8000-000000000001";
 const RUN_ID = "00000000-0000-4000-8000-000000000002";
@@ -262,119 +260,6 @@ describe("benchmark execution configuration", () => {
         RUN_ID,
       ),
     ).rejects.toMatchObject({ message: expectedMessage });
-  });
-
-  it("accepts the precise editor in a benchmark profile and advertises only the approved tools", async () => {
-    const configuration = await benchmarkExecutionConfiguration(
-      databaseFor(
-        benchmarkExecution({ profile: profile({ enabled: ["readFile", "replaceText"] }) }),
-      ),
-      RUN_ID,
-    );
-    expect(configuration?.tools.enabled).toEqual(["readFile", "replaceText"]);
-    const { tools } = createTools(new SandboxGitService(), configuration!.tools);
-    expect(tools.map((tool) => tool.name).sort()).toEqual(["readFile", "replaceText"]);
-    expect(tools.find((tool) => tool.name === "replaceText")).toMatchObject({
-      mutatesWorkspace: true,
-      readOnly: false,
-    });
-  });
-  it("accepts public evidence recovery in configuration and registers the matching read-only capability", async () => {
-    const configuration = await benchmarkExecutionConfiguration(
-      databaseFor(benchmarkExecution({ profile: profile({ enabled: ["readEvidenceArtifact"] }) })),
-      RUN_ID,
-    );
-    const { tools } = createTools(
-      new SandboxGitService(),
-      configuration!.tools,
-      undefined,
-      async () => ({ historical: true }),
-    );
-    expect(tools.map((t) => t.name)).toEqual(["readEvidenceArtifact"]);
-    expect(tools[0]).toMatchObject({ readOnly: true, mutatesWorkspace: false });
-  });
-
-  it("restricts both advertised and executable tools to tools.enabled", async () => {
-    const { executor, tools } = createTools(new SandboxGitService(), {
-      enabled: ["readFile"],
-      policy: "benchmark",
-      network: false,
-    });
-    expect(tools.map(({ name }) => name)).toEqual(["readFile"]);
-
-    const result = await executor.execute(
-      { name: "runCommand", input: { program: "echo", args: ["unsafe"] } },
-      {
-        runId: randomUUID(),
-        stepId: randomUUID(),
-        sandbox: {} as SandboxSession,
-        signal: new AbortController().signal,
-        emit: async () => undefined,
-      },
-    );
-    expect(result).toMatchObject({
-      ok: false,
-      error: {
-        code: "PERMISSION_DENIED",
-        message: "Tool 'runCommand' is not enabled by the benchmark profile.",
-      },
-    });
-  });
-});
-
-describe("workflow metric accounting", () => {
-  it("replays Plan and in-flight Execute usage without resetting the run budget", async () => {
-    const run = benchmarkRun({ retryCount: 3 });
-    const database = {
-      events: {
-        list: async () => [
-          {
-            type: "LLM_RESPONSE",
-            payload: {
-              purpose: "PLAN",
-              latencyMs: 25,
-              usage: { inputTokens: 11, outputTokens: 4, totalTokens: 15 },
-            },
-          },
-          {
-            type: "STEP_STARTED",
-            payload: { purpose: "IMPLEMENTATION", step: 1 },
-          },
-          {
-            type: "LLM_RESPONSE",
-            payload: {
-              purpose: "IMPLEMENTATION",
-              ok: true,
-              latencyMs: 99,
-              usage: { inputTokens: 99, outputTokens: 99, totalTokens: 198 },
-            },
-          },
-          {
-            type: "STEP_COMPLETED",
-            payload: {
-              purpose: "IMPLEMENTATION",
-              step: 1,
-              toolCalls: 2,
-              toolExecutions: 1,
-              cachedToolCalls: 1,
-              toolLatencyMs: 7,
-            },
-          },
-        ],
-      },
-    } as unknown as DatabaseAdapter;
-
-    await expect(initialWorkflowMetrics(database, run)).resolves.toMatchObject({
-      steps: 2,
-      modelCalls: 2,
-      toolCalls: 2,
-      toolExecutions: 1,
-      cacheHits: 1,
-      retries: 3,
-      modelLatencyMs: 124,
-      toolLatencyMs: 7,
-      tokenUsage: { inputTokens: 110, outputTokens: 103, totalTokens: 213 },
-    });
   });
 });
 

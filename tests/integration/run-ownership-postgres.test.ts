@@ -3,7 +3,7 @@ import { PrismaDatabaseAdapter } from "@devflow/database";
 import type { RunResult } from "@devflow/shared";
 import { describe, expect, it } from "vitest";
 
-describe.skipIf(process.env.DEVFLOW_RESOURCE_BUDGET_INTEGRATION !== "1")(
+describe.skipIf(process.env.DEVFLOW_POSTGRES_INTEGRATION !== "1")(
   "Run lease expiry and approval recovery",
   () => {
     it.each(["RENEW", "COMPLETE", "APPROVAL"] as const)(

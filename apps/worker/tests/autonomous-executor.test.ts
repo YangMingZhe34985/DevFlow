@@ -62,15 +62,15 @@ describe("ExecutionModeRouter", () => {
   const run = (executionMode: string, currentStage = "START") =>
     ({ executionMode, currentStage }) as unknown as RunExecutionRecord;
 
-  it("routes by mode and sends every mode's publication to the delivery executor", async () => {
-    const router = new ExecutionModeRouter(port("legacy"), port("autonomous"), port("delivery"));
+  it("runs autonomous Runs, publishes every mode's approved changes and refuses retired modes", async () => {
+    const router = new ExecutionModeRouter(port("autonomous"), port("delivery"));
     const signal = new AbortController().signal;
     expect(await router.execute(run("autonomous"), signal)).toEqual({ name: "autonomous" });
-    expect(await router.execute(run("workflow"), signal)).toEqual({ name: "legacy" });
-    expect(await router.execute(run("team"), signal)).toEqual({ name: "legacy" });
     for (const mode of ["autonomous", "workflow", "team"])
       for (const stage of ["PUSH", "CREATE_PR"])
         expect(await router.execute(run(mode, stage), signal)).toEqual({ name: "delivery" });
+    for (const mode of ["workflow", "team", "single"])
+      await expect(router.execute(run(mode), signal)).rejects.toMatchObject({ code: "CONFLICT" });
   });
 });
 

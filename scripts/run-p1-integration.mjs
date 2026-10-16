@@ -48,7 +48,7 @@ run(
   [
     path.resolve("node_modules/vitest/vitest.mjs"),
     "run",
-    "tests/integration/p1-fixture-repair.test.ts",
+    "tests/integration/autonomous-executor-docker.test.ts",
   ],
-  { ...process.env, DEVFLOW_DOCKER_INTEGRATION: "1" },
+  { ...process.env, DEVFLOW_AUTONOMOUS_DOCKER: "1" },
 );

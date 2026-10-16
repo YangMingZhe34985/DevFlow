@@ -1,16 +1,15 @@
 import type { RunExecutionRecord } from "@devflow/database";
-import type { RunResult } from "@devflow/shared";
+import { DevflowError, type RunResult } from "@devflow/shared";
 
 import type { RunExecutionOutcome, RunExecutionPort } from "../runs/run-execution.js";
 
 /**
- * Sends executionMode=autonomous Runs to the autonomous executor and the rest to the
- * legacy executor. GitHub publication (PUSH/CREATE_PR after a human approval) does not
- * depend on how the candidate was produced, so every mode uses the delivery executor.
+ * Sends Runs to the autonomous executor. GitHub publication (PUSH/CREATE_PR after a human
+ * approval) does not depend on how the candidate was produced, so it has its own executor.
+ * Runs persisted under the retired workflow/team/single modes stay readable but cannot run.
  */
 export class ExecutionModeRouter implements RunExecutionPort {
   constructor(
-    private readonly legacy: RunExecutionPort,
     private readonly autonomous: RunExecutionPort,
     private readonly delivery: RunExecutionPort,
   ) {}
@@ -20,13 +19,22 @@ export class ExecutionModeRouter implements RunExecutionPort {
   }
 
   async observedMetrics(run: RunExecutionRecord): Promise<RunResult["metrics"]> {
-    const target = this.select(run);
-    return (await target.observedMetrics?.(run)) ?? run.result?.metrics ?? emptyMetrics();
+    const target =
+      this.publishing(run) || run.executionMode === "autonomous" ? this.select(run) : undefined;
+    return (await target?.observedMetrics?.(run)) ?? run.result?.metrics ?? emptyMetrics();
   }
 
   private select(run: RunExecutionRecord): RunExecutionPort {
-    if (run.currentStage === "PUSH" || run.currentStage === "CREATE_PR") return this.delivery;
-    return run.executionMode === "autonomous" ? this.autonomous : this.legacy;
+    if (this.publishing(run)) return this.delivery;
+    if (run.executionMode === "autonomous") return this.autonomous;
+    throw new DevflowError({
+      code: "CONFLICT",
+      message: `Execution mode ${String(run.executionMode)} was retired in DevFlow v4; create a new autonomous Run.`,
+    });
+  }
+
+  private publishing(run: RunExecutionRecord): boolean {
+    return run.currentStage === "PUSH" || run.currentStage === "CREATE_PR";
   }
 }
 

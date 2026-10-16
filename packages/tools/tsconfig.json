@@ -6,7 +6,7 @@
     "outDir": "dist",
     "tsBuildInfoFile": "dist/.tsbuildinfo"
   },
-  "references": [{ "path": "../shared" }, { "path": "../sandbox" }, { "path": "../git" }],
+  "references": [{ "path": "../shared" }, { "path": "../sandbox" }],
   "include": ["src/**/*.ts"],
   "exclude": ["dist", "tests"]
 }

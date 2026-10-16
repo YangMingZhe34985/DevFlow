@@ -1,7 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
-import os from "node:os";
 import path from "node:path";
 
 import { FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
@@ -40,7 +38,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
   let queueWorker: Worker | undefined;
   let app: Awaited<ReturnType<typeof NestFactory.create>>;
   let baseUrl: string;
-  let stateDirectory: string;
   const executionAttempts = new Map<string, number>();
   const modelCreations = new Map<string, number>();
 
@@ -60,7 +57,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     await app.listen(0, "127.0.0.1");
     const address = app.getHttpServer().address() as AddressInfo;
     baseUrl = "http://127.0.0.1:" + String(address.port) + "/api/v1";
-    stateDirectory = await mkdtemp(path.join(os.tmpdir(), "devflow-p5-state-"));
   }, 120_000);
 
   afterAll(async () => {
@@ -68,9 +64,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     await workerQueue?.close();
     await workerRedis?.quit();
     await app?.close();
-    if (stateDirectory !== undefined) {
-      await rm(stateDirectory, { recursive: true, force: true });
-    }
   }, 120_000);
 
   it("validates CRUD, transitions and queued cancellation over HTTP", async () => {
@@ -197,7 +190,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
       DATABASE_URL: databaseUrl,
       REDIS_URL: redisUrl,
       RUN_QUEUE_NAME: queueName,
-      DEVFLOW_STATE_DIR: stateDirectory,
       DEVFLOW_TIMEOUT_MS: "60000",
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
@@ -260,11 +252,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
       }),
     });
     const router = new ExecutionModeRouter(
-      {
-        execute: async () => {
-          throw new Error("P5 creates only autonomous Runs.");
-        },
-      },
       autonomousExecutor,
       new GitHubDeliveryExecutor(database, environment),
     );
@@ -336,13 +323,16 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     timeoutMs = 30_000,
   ): Promise<Record<string, unknown>> {
     const deadline = Date.now() + timeoutMs;
+    let last: Record<string, unknown> = {};
     while (Date.now() < deadline) {
-      const response = await request("GET", "/runs/" + runId);
-      if (statuses.includes(String(response.body.status))) return response.body;
+      last = (await request("GET", "/runs/" + runId)).body;
+      if (statuses.includes(String(last.status))) return last;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error(
-      "Timed out waiting for run " + runId + " to reach " + statuses.join(", ") + ".",
+      `Timed out waiting for run ${runId} to reach ${statuses.join(", ")}; last state: ${JSON.stringify(
+        { status: last.status, stage: last.currentStage, result: last.result },
+      ).slice(0, 2000)}`,
     );
   }
 

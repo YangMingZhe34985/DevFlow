@@ -108,7 +108,7 @@ try {
     [
       path.resolve("node_modules/vitest/vitest.mjs"),
       "run",
-      "tests/integration/p9-interactive-workflow.test.ts",
+      "tests/integration/p9-autonomous-browser.test.ts",
       ...process.argv.slice(2),
     ],
     integrationEnvironment,

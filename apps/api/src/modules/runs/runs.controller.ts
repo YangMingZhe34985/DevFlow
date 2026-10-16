@@ -26,15 +26,14 @@ import {
   resolveLocalFilesystemPath,
 } from "@devflow/sandbox";
 import type { RunQueuePort } from "@devflow/shared";
-import { ExecutionModeSchema, TeamConfigurationSchema, DevflowError } from "@devflow/shared";
 
 import { IdSchema, requiredRecord } from "../../common/validation.js";
 import { DATABASE, RUN_QUEUE } from "../../infrastructure/tokens.js";
 import { RunEventStreamService } from "./run-event-stream.service.js";
 
 const CreateRunSchema = z.strictObject({
-  executionMode: ExecutionModeSchema.optional(),
-  teamConfiguration: TeamConfigurationSchema.optional(),
+  // workflow/team/single were retired in v4; their persisted Runs stay readable.
+  executionMode: z.literal("autonomous").optional(),
   localizationMode: z.enum(["legacy", "legacy-dynamic", "prg"]).optional(),
   taskId: IdSchema,
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
@@ -72,14 +71,6 @@ export class RunsController {
   @Post()
   async create(@Body() body: unknown) {
     const input = CreateRunSchema.parse(body);
-    if (
-      (input.executionMode === "team" || input.executionMode === "single") &&
-      process.env.DEVFLOW_TEAM_ENABLED !== "true"
-    )
-      throw new DevflowError({
-        code: "VALIDATION_ERROR",
-        message: "Dynamic collaboration is disabled by the host.",
-      });
     const existing =
       input.idempotencyKey === undefined
         ? null

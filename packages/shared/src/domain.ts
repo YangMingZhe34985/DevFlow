@@ -385,3 +385,7 @@ export const RunResultSchema = z.object({
   phaseCompletion: PhaseCompletionSchema.optional(),
 });
 export type RunResult = z.infer<typeof RunResultSchema>;
+
+/** Modes a persisted Run may carry. Only autonomous Runs execute; the rest are history. */
+export const ExecutionModeSchema = z.enum(["workflow", "team", "single", "autonomous"]);
+export type ExecutionMode = z.infer<typeof ExecutionModeSchema>;

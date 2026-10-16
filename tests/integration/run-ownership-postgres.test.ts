@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { PrismaDatabaseAdapter } from "@devflow/database";
+import { branchNameForRun, operationKeyForRun } from "@devflow/github";
 import type { RunResult } from "@devflow/shared";
 import { describe, expect, it } from "vitest";
 
@@ -40,10 +41,10 @@ describe.skipIf(process.env.DEVFLOW_POSTGRES_INTEGRATION !== "1")(
               ? b.runs.renewLease(run.id, "waiting-owner", 60_000)
               : operation === "COMPLETE"
                 ? b.runs.complete(run.id, "waiting-owner", successful(run.id))
-                : b.runs.pauseForApproval(run.id, "waiting-owner", {
-                    summary: "No stale approval",
-                    steps: [],
-                  });
+                : pushPause(a, run.id).then(
+                    async (input) =>
+                      await b.runs.pauseForGitHubApproval(run.id, "waiting-owner", input),
+                  );
           const observed = pending.catch((error: unknown) => error);
           await holding;
           if (operation === "RENEW") expect(await observed).toBe(false);
@@ -92,12 +93,9 @@ describe.skipIf(process.env.DEVFLOW_POSTGRES_INTEGRATION !== "1")(
         await expect(database.runs.complete(run.id, "expired-owner", result)).rejects.toMatchObject(
           { code: "CONFLICT" },
         );
-        const plan = {
-          summary: "Read approved source",
-          steps: [{ id: "one", title: "Read", description: "Read approved source" }],
-        };
+        const pause = await pushPause(database, run.id);
         await expect(
-          database.runs.pauseForApproval(run.id, "expired-owner", plan),
+          database.runs.pauseForGitHubApproval(run.id, "expired-owner", pause),
         ).rejects.toMatchObject({ code: "CONFLICT" });
         const recovered = await database.runs.claim(
           run.id,
@@ -108,7 +106,7 @@ describe.skipIf(process.env.DEVFLOW_POSTGRES_INTEGRATION !== "1")(
         expect(recovered?.executionOwner).toBe("recovery-owner");
         expect(await database.runs.renewLease(run.id, "expired-owner", 60_000)).toBe(false);
         expect(await database.runs.renewLease(run.id, "recovery-owner", 60_000)).toBe(true);
-        const paused = await database.runs.pauseForApproval(run.id, "recovery-owner", plan);
+        const paused = await database.runs.pauseForGitHubApproval(run.id, "recovery-owner", pause);
         expect(paused.run.status).toBe("WAITING_APPROVAL");
         expect(await database.runs.renewLease(run.id, "recovery-owner", 60_000)).toBe(false);
         await database.approvals.resolveForWorkflow(paused.approval.id, { status: "APPROVED" });
@@ -126,6 +124,36 @@ describe.skipIf(process.env.DEVFLOW_POSTGRES_INTEGRATION !== "1")(
     });
   },
 );
+
+/** A push-approval pause with the publication metadata and change set it must reference. */
+async function pushPause(database: PrismaDatabaseAdapter, runId: string) {
+  const artifact = await database.artifacts.create({
+    runId,
+    kind: "GITHUB_CHANGESET",
+    name: "github-changeset.json",
+    content: "{}",
+  });
+  const publication = {
+    repository: { owner: "devflow", name: "fixture" },
+    baseCommit: "a".repeat(40),
+    baseBranch: "main",
+    branchName: branchNameForRun(runId),
+    pushOperationKey: operationKeyForRun(runId, "push"),
+    changesArtifactId: artifact.id,
+  };
+  return {
+    kind: "GITHUB_PUSH" as const,
+    request: {
+      operationKey: publication.pushOperationKey,
+      repository: publication.repository,
+      baseCommit: publication.baseCommit,
+      baseBranch: publication.baseBranch,
+      branchName: publication.branchName,
+      filesChanged: 1,
+    },
+    publication,
+  };
+}
 
 function successful(runId: string): RunResult {
   return {

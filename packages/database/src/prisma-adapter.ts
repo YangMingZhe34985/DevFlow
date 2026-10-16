@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { PrismaTeamStore, assertTeamLease } from "./prisma-team-store.js";
-import { currentDatabaseLease } from "./execution-lease.js";
 
 import { PrismaPg } from "@prisma/adapter-pg";
 import type {
@@ -11,12 +9,8 @@ import type {
 import {
   assertCredentialFreeRepositoryUri,
   ExecutionModeSchema,
-  TeamConfigurationSchema,
-  teamCanonicalJson,
   DevflowError,
   type AgentEvent,
-  type TeamLease,
-  type AgentPlan,
   type DevflowErrorShape,
   type NewAgentEvent,
   RunMetricsSchema,
@@ -46,8 +40,6 @@ import type {
   ApprovalStore,
   ArtifactRecord,
   ArtifactStore,
-  BudgetLedgerRecord,
-  BudgetLedgerStore,
   CreateArtifactInput,
   CreateApprovalInput,
   CreateRepositoryInput,
@@ -80,8 +72,6 @@ type RunWithTaskAndRepository = Prisma.RunGetPayload<{
 }>;
 
 export class PrismaDatabaseAdapter implements DatabaseAdapter {
-  readonly teams: PrismaTeamStore;
-  readonly budgetLedgers: BudgetLedgerStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
@@ -91,8 +81,6 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   readonly events: EventStore;
 
   constructor(readonly client: PrismaClient) {
-    this.teams = new PrismaTeamStore(client);
-    this.budgetLedgers = new PrismaBudgetLedgerStore(client);
     this.repositories = new PrismaRepositoryStore(client);
     this.tasks = new PrismaTaskStore(client);
     this.runs = new PrismaRunStore(client);
@@ -118,116 +106,6 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   async ping(): Promise<void> {
     await this.client.$queryRaw`SELECT 1`;
   }
-}
-
-/** Whole-document CAS preserves unrelated Run metadata as well as ledger revisions. */
-class PrismaBudgetLedgerStore implements BudgetLedgerStore {
-  constructor(private readonly client: PrismaClient) {}
-
-  forLease(lease: TeamLease): BudgetLedgerStore {
-    return {
-      get: this.get.bind(this),
-      compareAndSwap: async (runId, expectedRevision, value) =>
-        this.client.$transaction(async (tx) => {
-          await assertTeamLease(tx, runId, lease);
-          const run = await tx.run.findUniqueOrThrow({
-            where: { id: runId },
-            select: { metadata: true },
-          });
-          const { metadata, ledger } = readBudgetLedgerMetadata(run.metadata);
-          if ((ledger?.revision ?? null) !== expectedRevision) return false;
-          await tx.run.update({
-            where: { id: runId },
-            data: {
-              metadata: jsonInput({
-                ...metadata,
-                resourceBudgetLedger: { revision: (expectedRevision ?? -1) + 1, value },
-              }),
-            },
-          });
-          return true;
-        }),
-    };
-  }
-
-  async get(runId: string): Promise<BudgetLedgerRecord | null> {
-    return await databaseCall(async () => {
-      const run = await this.client.run.findUnique({
-        where: { id: runId },
-        select: { metadata: true },
-      });
-      if (run === null) throw notFound("Run", runId);
-      return readBudgetLedgerMetadata(run.metadata).ledger;
-    });
-  }
-
-  async compareAndSwap(
-    runId: string,
-    expectedRevision: number | null,
-    value: unknown,
-  ): Promise<boolean> {
-    if (
-      expectedRevision !== null &&
-      (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
-    ) {
-      throw new DevflowError({
-        code: "VALIDATION_ERROR",
-        message: "Invalid budget ledger revision.",
-      });
-    }
-    return await databaseCall(async () => {
-      const run = await this.client.run.findUnique({
-        where: { id: runId },
-        select: { metadata: true },
-      });
-      if (run === null) throw notFound("Run", runId);
-      const { metadata, ledger } = readBudgetLedgerMetadata(run.metadata);
-      if ((ledger?.revision ?? null) !== expectedRevision) return false;
-      const changed = await this.client.run.updateMany({
-        where: {
-          id: runId,
-          metadata: { equals: run.metadata === null ? Prisma.AnyNull : run.metadata },
-        },
-        data: {
-          metadata: jsonInput({
-            ...metadata,
-            resourceBudgetLedger: {
-              revision: expectedRevision === null ? 0 : expectedRevision + 1,
-              value,
-            },
-          }),
-        },
-      });
-      return changed.count === 1;
-    });
-  }
-}
-
-function readBudgetLedgerMetadata(value: Prisma.JsonValue | null): {
-  metadata: Record<string, unknown>;
-  ledger: BudgetLedgerRecord | null;
-} {
-  if (value !== null && (typeof value !== "object" || Array.isArray(value))) {
-    throw new DevflowError({ code: "CONFLICT", message: "Run metadata is not a JSON object." });
-  }
-  const metadata = (value ?? {}) as Record<string, unknown>;
-  const entry = metadata.resourceBudgetLedger;
-  if (entry === undefined) return { metadata, ledger: null };
-  if (
-    entry === null ||
-    typeof entry !== "object" ||
-    Array.isArray(entry) ||
-    !("revision" in entry) ||
-    !Number.isSafeInteger(entry.revision) ||
-    (entry.revision as number) < 0 ||
-    !("value" in entry)
-  ) {
-    throw new DevflowError({
-      code: "CONFLICT",
-      message: "Persisted resource budget ledger is corrupt.",
-    });
-  }
-  return { metadata, ledger: { revision: entry.revision as number, value: entry.value } };
 }
 
 class PrismaRepositoryStore implements RepositoryStore {
@@ -379,7 +257,6 @@ class PrismaRunStore implements RunRepository {
             taskId: input.taskId,
             metadata: {
               executionMode: ExecutionModeSchema.parse(input.executionMode ?? "autonomous"),
-              teamConfiguration: TeamConfigurationSchema.parse(input.teamConfiguration ?? {}),
             },
             ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
@@ -673,58 +550,6 @@ class PrismaRunStore implements RunRepository {
             terminalEventForResult(result, current.currentStage, finishedAt),
           );
           return mapRun((await transaction.run.findUnique({ where: { id: runId } })) as PrismaRun);
-        }),
-    );
-  }
-
-  async pauseForApproval(
-    runId: string,
-    owner: string,
-    plan: AgentPlan,
-  ): Promise<{ run: RunRecord; approval: ApprovalRecord }> {
-    return await databaseCall(
-      async () =>
-        await this.client.$transaction(async (transaction) => {
-          await assertLiveRunOwner(transaction, runId, owner);
-          const changed = await transaction.run.updateMany({
-            where: {
-              id: runId,
-              status: "RUNNING",
-              executionOwner: owner,
-              cancelRequestedAt: null,
-            },
-            data: {
-              status: "WAITING_APPROVAL",
-              currentStage: "WAITING_APPROVAL",
-              executionOwner: null,
-              leaseExpiresAt: null,
-            },
-          });
-          if (changed.count !== 1) {
-            throw conflict("Run execution lease is no longer owned or cancellation was requested.");
-          }
-          await transaction.artifact.create({
-            data: {
-              runId,
-              kind: "PLAN",
-              name: "plan.json",
-              mimeType: "application/json",
-              content: JSON.stringify(plan, null, 2),
-              metadata: jsonInput({ summary: plan.summary, stepCount: plan.steps.length }),
-            },
-          });
-          const approval = await transaction.approval.create({
-            data: { runId, kind: "PLAN", request: jsonInput({ plan }) },
-          });
-          await appendEvent(transaction, {
-            runId,
-            type: "APPROVAL_REQUIRED",
-            occurredAt: new Date().toISOString(),
-            payload: eventJson({ approvalId: approval.id, kind: "PLAN", plan }),
-          });
-          const run = await transaction.run.findUnique({ where: { id: runId } });
-          if (run === null) throw notFound("Run", runId);
-          return { run: mapRun(run), approval: mapApproval(approval) };
         }),
     );
   }
@@ -1037,18 +862,14 @@ class PrismaApprovalStore implements ApprovalStore {
           if (current.status !== "PENDING") throw conflict("Approval has already been resolved.");
           assertSafeGitHubApprovalResolution(current.kind, input);
 
+          // Only GitHub delivery approvals resume a Run. Plan approvals belong to the retired
+          // workflow mode; resolving a leftover one just records the decision.
           const workflowKind =
-            current.kind === "PLAN" && isWorkflowPlanRequest(current.request)
-              ? "PLAN"
-              : current.kind === "GITHUB_PUSH" || current.kind === "GITHUB_PULL_REQUEST"
-                ? current.kind
-                : undefined;
+            current.kind === "GITHUB_PUSH" || current.kind === "GITHUB_PULL_REQUEST"
+              ? current.kind
+              : undefined;
           const expectedStage =
-            workflowKind === "PLAN"
-              ? "WAITING_APPROVAL"
-              : workflowKind === "GITHUB_PUSH"
-                ? "WAITING_PUSH_APPROVAL"
-                : "WAITING_PR_APPROVAL";
+            workflowKind === "GITHUB_PUSH" ? "WAITING_PUSH_APPROVAL" : "WAITING_PR_APPROVAL";
           if (
             workflowKind !== undefined &&
             (current.run.status !== "WAITING_APPROVAL" ||
@@ -1070,16 +891,8 @@ class PrismaApprovalStore implements ApprovalStore {
             return { approval: mapApproval(approval), shouldEnqueue: false };
           }
 
-          const resume =
-            input.status === "APPROVED" || (workflowKind === "PLAN" && input.status === "REJECTED");
-          const resumeStage =
-            workflowKind === "PLAN"
-              ? input.status === "APPROVED"
-                ? "EXECUTE"
-                : "GENERATE_PLAN"
-              : workflowKind === "GITHUB_PUSH"
-                ? "PUSH"
-                : "CREATE_PR";
+          const resume = input.status === "APPROVED";
+          const resumeStage = workflowKind === "GITHUB_PUSH" ? "PUSH" : "CREATE_PR";
           const decisionAt = new Date();
           const terminalMessage =
             input.status === "CANCELLED"
@@ -1105,23 +918,15 @@ class PrismaApprovalStore implements ApprovalStore {
           });
           if (changed.count !== 1) throw conflict("Run approval state changed concurrently.");
           const decisionEvent =
-            workflowKind === "PLAN"
-              ? input.status === "APPROVED"
-                ? "PLAN_APPROVED"
-                : input.status === "REJECTED"
-                  ? "PLAN_REJECTED"
-                  : "RUN_CANCELLED"
+            input.status === "CANCELLED"
+              ? "RUN_CANCELLED"
               : workflowKind === "GITHUB_PUSH"
                 ? input.status === "APPROVED"
                   ? "PUSH_APPROVED"
-                  : input.status === "REJECTED"
-                    ? "PUSH_REJECTED"
-                    : "RUN_CANCELLED"
+                  : "PUSH_REJECTED"
                 : input.status === "APPROVED"
                   ? "PR_APPROVED"
-                  : input.status === "REJECTED"
-                    ? "PR_REJECTED"
-                    : "RUN_CANCELLED";
+                  : "PR_REJECTED";
           await appendEvent(transaction, {
             runId: current.runId,
             type: decisionEvent,
@@ -1184,7 +989,6 @@ class PrismaArtifactStore implements ArtifactStore {
         message: "Artifact requires content or uri.",
       });
     }
-    const lease = currentDatabaseLease(input.runId);
     const create = async (client: Pick<PrismaClient, "artifact">) =>
       mapArtifact(
         await client.artifact.create({
@@ -1202,14 +1006,7 @@ class PrismaArtifactStore implements ArtifactStore {
           },
         }),
       );
-    return databaseCall(() =>
-      lease
-        ? this.client.$transaction(async (tx) => {
-            await assertTeamLease(tx, input.runId, lease);
-            return create(tx);
-          })
-        : create(this.client),
-    );
+    return databaseCall(() => create(this.client));
   }
 
   async list(runId: string): Promise<readonly ArtifactRecord[]> {
@@ -1366,11 +1163,11 @@ class PrismaEventWriter implements EventStore {
     );
   }
 
-  async append(event: NewAgentEvent, lease?: TeamLease): Promise<AgentEvent> {
+  async append(event: NewAgentEvent): Promise<AgentEvent> {
     return await databaseCall(
       async () =>
         await this.client.$transaction(async (transaction) => {
-          return appendEvent(transaction, event, lease);
+          return appendEvent(transaction, event);
         }),
     );
   }
@@ -1409,10 +1206,7 @@ function assertEventQuery(afterSequence: number, limit: number): void {
 async function appendEvent(
   transaction: TransactionClient,
   event: NewAgentEvent,
-  explicitLease?: TeamLease,
 ): Promise<AgentEvent> {
-  const lease = explicitLease ?? currentDatabaseLease(event.runId);
-  if (lease) await assertTeamLease(transaction, event.runId, lease);
   const run = await transaction.run.update({
     where: { id: event.runId },
     data: { nextEventSequence: { increment: 1 } },
@@ -1584,9 +1378,6 @@ function mapRun(run: PrismaRun): RunRecord {
   const result = resultFromRun(run);
   return {
     executionMode: executionModeFromMetadata(run.metadata),
-    teamConfiguration: TeamConfigurationSchema.parse(
-      recordValue(run.metadata).teamConfiguration ?? {},
-    ),
     id: run.id,
     taskId: run.taskId,
     ...(run.idempotencyKey === null ? {} : { idempotencyKey: run.idempotencyKey }),
@@ -1822,11 +1613,6 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
     executionModeFromMetadata(existing.metadata) !== (input.executionMode ?? "autonomous")
       ? "executionMode"
       : undefined,
-    teamCanonicalJson(
-      TeamConfigurationSchema.parse(recordValue(existing.metadata).teamConfiguration ?? {}),
-    ) !== teamCanonicalJson(TeamConfigurationSchema.parse(input.teamConfiguration ?? {}))
-      ? "teamConfiguration"
-      : undefined,
     existing.modelProvider !== (input.modelProvider ?? null) ? "modelProvider" : undefined,
     existing.modelName !== (input.modelName ?? null) ? "modelName" : undefined,
     existing.maxSteps !== (input.maxSteps ?? 25) ? "maxSteps" : undefined,
@@ -1885,10 +1671,6 @@ function assertSafeGitHubApprovalResolution(
     ...(input.comment === undefined ? {} : { comment: input.comment }),
     ...(input.resolution === undefined ? {} : { resolution: input.resolution }),
   });
-}
-
-function isWorkflowPlanRequest(value: unknown): boolean {
-  return typeof value === "object" && value !== null && "plan" in value;
 }
 
 function assertSamePublication(

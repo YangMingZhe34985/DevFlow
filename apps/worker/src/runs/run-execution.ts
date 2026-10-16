@@ -1,11 +1,5 @@
 import type { PauseForGitHubApprovalInput, RunExecutionRecord } from "@devflow/database";
-import type { AgentPlan, RunResult } from "@devflow/shared";
-
-export interface WaitingApprovalResult {
-  status: "WAITING_APPROVAL";
-  approvalKind?: "PLAN";
-  plan: AgentPlan;
-}
+import type { RunResult } from "@devflow/shared";
 
 export interface WaitingGitHubApprovalResult {
   status: "WAITING_APPROVAL";
@@ -13,7 +7,7 @@ export interface WaitingGitHubApprovalResult {
   approval: PauseForGitHubApprovalInput;
 }
 
-export type RunExecutionOutcome = RunResult | WaitingApprovalResult | WaitingGitHubApprovalResult;
+export type RunExecutionOutcome = RunResult | WaitingGitHubApprovalResult;
 
 export interface RunExecutionPort {
   execute(run: RunExecutionRecord, signal: AbortSignal): Promise<RunExecutionOutcome>;

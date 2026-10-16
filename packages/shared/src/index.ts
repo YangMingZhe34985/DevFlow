@@ -7,4 +7,3 @@ export * from "./repository-uri.js";
 export * from "./completion.js";
 export * from "./execution.js";
 export * from "./proposal.js";
-export * from "./team.js";

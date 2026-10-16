@@ -152,45 +152,6 @@ export class RunsController {
     return requiredRecord(await this.database.runs.findDetail(id), "Run", id);
   }
 
-  @Get(":id/team")
-  async team(@Param("id") rawId: string) {
-    const id = IdSchema.parse(rawId);
-    await this.requireRun(id);
-    const state = await this.database.teams?.load(id);
-    if (!state) return { team: null };
-    // Private prompts/full source stay in host artifacts, not the task-board API.
-    return {
-      team: {
-        runId: id,
-        revision: state.revision,
-        status: state.status,
-        mode: state.mode,
-        stopReason: state.stopReason,
-        agents: state.agents.map(({ id, role, status, decisionCount, inboxCursor, sessionId }) => ({
-          id,
-          role,
-          status,
-          decisionCount,
-          inboxCursor,
-          sessionId,
-        })),
-        tasks: state.tasks,
-        messages: state.messages,
-        evidence: state.evidence.map(({ content, ...reference }) => ({
-          ...reference,
-          contentBytes: Buffer.byteLength(content),
-        })),
-        operations: state.operations.map(({ id, agentId, kind, status, error }) => ({
-          id,
-          agentId,
-          kind,
-          status,
-          error,
-        })),
-      },
-    };
-  }
-
   @Get(":id")
   async get(@Param("id") rawId: string) {
     const id = IdSchema.parse(rawId);

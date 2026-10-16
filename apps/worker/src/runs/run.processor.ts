@@ -122,11 +122,7 @@ export class RunProcessor {
         throw cancellation.signal.reason;
       exitReason = result.status;
       if (result.status === "WAITING_APPROVAL") {
-        if (result.approvalKind === "GITHUB") {
-          await this.runs.pauseForGitHubApproval(run.id, owner, result.approval);
-        } else {
-          await this.runs.pauseForApproval(run.id, owner, result.plan);
-        }
+        await this.runs.pauseForGitHubApproval(run.id, owner, result.approval);
         return { outcome: "COMPLETED", status: "WAITING_APPROVAL" };
       }
       if (await this.runs.isCancellationRequested(run.id)) {

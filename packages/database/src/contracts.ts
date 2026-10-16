@@ -1,5 +1,4 @@
 import type {
-  AgentPlan,
   AgentEvent,
   EventSink,
   NewAgentEvent,
@@ -8,10 +7,7 @@ import type {
   RunStatus,
   TaskStatus,
   WorkflowStage,
-  TeamConfiguration,
-  TeamLease,
 } from "@devflow/shared";
-import type { TeamStore } from "./team-store.js";
 import type {
   GitHubPublicationRecord,
   GitHubPublicationStore,
@@ -104,7 +100,6 @@ export interface TaskStore {
 
 export interface RunRecord {
   executionMode?: "workflow" | "team" | "single" | "autonomous";
-  teamConfiguration?: TeamConfiguration;
   id: RunId;
   taskId: string;
   idempotencyKey?: string;
@@ -134,7 +129,6 @@ export interface RunExecutionRecord extends RunRecord {
 
 export interface CreateRunInput {
   executionMode?: "workflow" | "team" | "single" | "autonomous" | undefined;
-  teamConfiguration?: TeamConfiguration | undefined;
   taskId: string;
   idempotencyKey?: string | undefined;
   modelProvider?: string | undefined;
@@ -178,11 +172,6 @@ export interface RunRepository {
   renewLease(runId: RunId, owner: string, leaseMs: number): Promise<boolean>;
   isCancellationRequested(runId: RunId): Promise<boolean>;
   complete(runId: RunId, owner: string, result: RunResult): Promise<RunRecord>;
-  pauseForApproval(
-    runId: RunId,
-    owner: string,
-    plan: AgentPlan,
-  ): Promise<{ run: RunRecord; approval: ApprovalRecord }>;
   pauseForGitHubApproval(
     runId: RunId,
     owner: string,
@@ -318,19 +307,6 @@ export interface ArtifactStore {
   list(runId: RunId): Promise<readonly ArtifactRecord[]>;
 }
 
-/** A run-scoped, compare-and-swap JSON record. The scheduler owns its schema. */
-export interface BudgetLedgerRecord {
-  revision: number;
-  value: unknown;
-}
-
-export interface BudgetLedgerStore {
-  forLease?(lease: TeamLease): BudgetLedgerStore;
-  get(runId: RunId): Promise<BudgetLedgerRecord | null>;
-  /** null creates revision 0; an existing revision may only advance by one. */
-  compareAndSwap(runId: RunId, expectedRevision: number | null, value: unknown): Promise<boolean>;
-}
-
 export interface DatabaseGitHubPublicationStore extends GitHubPublicationStore {
   initialize(
     runId: RunId,
@@ -351,10 +327,6 @@ export interface RunDetailRecord {
 }
 
 export interface DatabaseAdapter extends DatabaseLifecycle {
-  /** Required for team/single modes; never substitute an in-memory store in production. */
-  readonly teams?: TeamStore;
-  /** Required by the resource scheduler; optional only for legacy adapters. */
-  readonly budgetLedgers?: BudgetLedgerStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
@@ -365,7 +337,7 @@ export interface DatabaseAdapter extends DatabaseLifecycle {
 }
 
 export interface AtomicEventWriter extends EventSink {
-  append(event: NewAgentEvent, lease?: TeamLease): Promise<AgentEvent>;
+  append(event: NewAgentEvent): Promise<AgentEvent>;
 }
 
 export interface EventQuery {

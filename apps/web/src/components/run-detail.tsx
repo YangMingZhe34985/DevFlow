@@ -144,12 +144,6 @@ export function RunDetail({
             <Definition label="Created" value={formatDate(detail.run.createdAt)} />
             <Definition label="Started" value={formatDate(detail.run.startedAt)} />
             <Definition label="Finished" value={formatDate(detail.run.finishedAt)} />
-            <Definition label="Max steps" value={String(detail.run.maxSteps)} />
-            <Definition
-              label="Repair attempts"
-              value={`${detail.run.retryCount} / ${detail.run.maxTestRetries}`}
-            />
-            <Definition label="Review retries" value={String(detail.run.maxReviewRetries)} />
             <Definition label="Dispatch revision" value={String(detail.run.dispatchRevision)} />
           </dl>
         </details>
@@ -230,13 +224,14 @@ export function RunDetail({
                     {approval.comment}
                   </p>
                 )}
-                {approval.status === "PENDING" && (
+                {/* Plan approvals belong to the retired workflow mode: shown, not actionable. */}
+                {approval.status === "PENDING" && approval.kind !== "PLAN" && (
                   <div className="approval-actions">
                     <label>
                       拒绝反馈
                       <textarea
                         data-testid={`approval-feedback-${approval.id}`}
-                        placeholder="说明需要修改的计划或工具调用；拒绝时必填。"
+                        placeholder="说明拒绝发布的原因；拒绝时必填。"
                         value={rejectFeedback}
                         onChange={(event) =>
                           setFeedback((current) => ({
@@ -254,7 +249,7 @@ export function RunDetail({
                         disabled={busyAction === `approval-${approval.id}`}
                         onClick={() => void onResolveApproval(approval, "APPROVED")}
                       >
-                        批准并继续
+                        批准发布
                       </button>
                       <button
                         className="button button--danger"
@@ -268,7 +263,7 @@ export function RunDetail({
                           void onResolveApproval(approval, "REJECTED", rejectFeedback.trim())
                         }
                       >
-                        {approval.kind === "PLAN" ? "拒绝并重新规划" : "拒绝发布"}
+                        拒绝发布
                       </button>
                     </div>
                   </div>
@@ -309,8 +304,8 @@ export function RunDetail({
       <section className="panel" aria-labelledby="tests-heading">
         <SectionHeading
           id="tests-heading"
-          title="Test / Repair"
-          subtitle={`最多 ${detail.run.maxTestRetries} 次修复，当前记录 ${detail.run.retryCount} 次`}
+          title="Verification"
+          subtitle="宿主执行的公开检查与修订记录"
         />
         <div className="compact-timeline">
           {tests.map((event) => (

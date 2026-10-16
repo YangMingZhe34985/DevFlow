@@ -227,25 +227,6 @@ describe("RunProcessor", () => {
     );
   });
 
-  it("parks a generated plan without completing the run", async () => {
-    const run = { ...executionRecord(), currentStage: "GENERATE_PLAN" as const };
-    const runs = runRepository({ claim: vi.fn(async () => run) });
-    const plan = {
-      summary: "Review the implementation plan",
-      steps: [{ id: "one", title: "Inspect", description: "Inspect tests first." }],
-    };
-    const executor: RunExecutionPort = {
-      execute: vi.fn(async () => ({ status: "WAITING_APPROVAL" as const, plan })),
-    };
-
-    await expect(createProcessor(runs, executor).process(job(run.id))).resolves.toMatchObject({
-      outcome: "COMPLETED",
-      status: "WAITING_APPROVAL",
-    });
-    expect(runs.pauseForApproval).toHaveBeenCalledWith(run.id, expect.any(String), plan);
-    expect(runs.complete).not.toHaveBeenCalled();
-  });
-
   it("parks a GitHub side-effect approval without completing the run", async () => {
     const run = { ...executionRecord(), currentStage: "GENERATE_DIFF" as const };
     const runs = runRepository({ claim: vi.fn(async () => run) });
@@ -406,18 +387,6 @@ function runRepository(overrides: Partial<RunRepository> = {}): RunRepository {
       status: result.status,
       currentStage: result.status === "SUCCEEDED" ? "DONE" : "FAILED",
       result,
-    })),
-    pauseForApproval: vi.fn(async () => ({
-      run: { ...run, status: "WAITING_APPROVAL", currentStage: "WAITING_APPROVAL" },
-      approval: {
-        id: randomUUID(),
-        runId: run.id,
-        kind: "PLAN",
-        status: "PENDING",
-        request: {},
-        requestedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      },
     })),
     pauseForGitHubApproval: vi.fn(async () => ({
       run: { ...run, status: "WAITING_APPROVAL", currentStage: "WAITING_PUSH_APPROVAL" },

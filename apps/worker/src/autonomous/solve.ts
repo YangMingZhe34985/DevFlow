@@ -279,13 +279,9 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
                     ),
                   ),
                 }),
-            maxTurns: Math.max(
-              0,
-              Math.min(
-                tier === 1 ? 2 : (input.review.maxTurns ?? 8),
-                input.limits.maxTurns - kernel.turns,
-              ),
-            ),
+            // Review turns are its own allowance, like its cost ceiling: a solver
+            // that used every turn still gets its candidate reviewed.
+            maxTurns: tier === 1 ? 2 : (input.review.maxTurns ?? 8),
           },
           signal: input.signal,
           ...(input.onEvent ? { onEvent: input.onEvent } : {}),

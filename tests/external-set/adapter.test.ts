@@ -82,6 +82,18 @@ describe("official scoring", () => {
     expect(result.core.status).toBe("PASS");
     expect(result.reproduction.status).toBe("NOT_CONFIGURED");
   });
+  it("treats an official empty P2P group as not applicable, not as a failure", () => {
+    const noP2P = { ...expected, p2p: [] };
+    const result = mapOfficial(report, noP2P, integrity);
+    expect(result.baseline.status).toBe("NOT_APPLICABLE");
+    expect(result.strictPatchPass).toBe(true);
+    const unresolved = {
+      ...report,
+      resolved: false,
+      tests_status: { ...report.tests_status, FAIL_TO_PASS: { success: [], failure: ["new"] } },
+    };
+    expect(mapOfficial(unresolved, noP2P, integrity).strictPatchPass).toBe(false);
+  });
   it("does not trust resolved when observations are missing", () => {
     expect(mapOfficial({ ...report, tests_status: {} }, expected, integrity).strictPatchPass).toBe(
       false,

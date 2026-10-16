@@ -140,6 +140,21 @@ describe("tool-free triage and escalation", () => {
     expect(model.requests).toHaveLength(2);
   });
 
+  it("still reviews a changed candidate after the solver used every turn", async () => {
+    const reviewer = new FakeLanguageModel([triage("FAIL", [finding("blocking")])]);
+    const result = await runAutonomousSolve({
+      ...solve(reviewer),
+      model: new FakeLanguageModel([
+        step("bash", { command: "true" }),
+        step("bash", { command: "true" }),
+      ]),
+      limits: { maxTurns: 2 },
+    });
+    expect(result.kernel.stopReason).toBe("TURN_LIMIT");
+    expect(result.review).toMatchObject({ tier: 1, verdict: "FAIL" });
+    expect(reviewer.requests).toHaveLength(1);
+  });
+
   it("limits tool investigation to eight turns even if callers request more", async () => {
     const model = new FakeLanguageModel([
       triage("CONCERNS", [], [concern]),

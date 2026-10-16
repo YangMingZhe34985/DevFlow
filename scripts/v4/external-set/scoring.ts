@@ -10,7 +10,8 @@ export interface OfficialCaseReport {
   tests_status?: Record<string, TestStatus>;
 }
 function group(status: TestStatus | undefined, expected: readonly string[]) {
-  if (!expected.length) return { status: "NOT_CONFIGURED", passed: 0, failed: 0, missing: 0 };
+  // An official empty group has nothing to break, so it cannot block a strict pass.
+  if (!expected.length) return { status: "NOT_APPLICABLE", passed: 0, failed: 0, missing: 0 };
   const success = new Set(status?.success ?? []),
     failures = new Set(status?.failure ?? []);
   const missing = expected.filter((t) => !success.has(t) && !failures.has(t)).length;
@@ -41,7 +42,10 @@ export function mapOfficial(
   return {
     officialResolved: report.resolved === true,
     strictPatchPass:
-      valid && report.resolved === true && baseline.status === "PASS" && core.status === "PASS",
+      valid &&
+      report.resolved === true &&
+      (baseline.status === "PASS" || baseline.status === "NOT_APPLICABLE") &&
+      core.status === "PASS",
     baseline,
     core,
     reproduction: { status: "NOT_CONFIGURED" },

@@ -22,6 +22,9 @@ const { values: args } = parseArgs({
     campaign: { type: "string", default: "stage2-v1" },
     "budget-cny": { type: "string" },
     "per-case-cny": { type: "string" },
+    // Same solver defaults as scripts/v4/phase0-dataset.ts so both suites are comparable.
+    reasoning: { type: "string", default: "low" },
+    "max-output": { type: "string", default: "8192" },
   },
 });
 // Validate authorization before importing any provider configuration.
@@ -274,7 +277,11 @@ for (const caseId of selectedCases) {
       model: liveModels?.solver.model ?? new FakeLanguageModel(responses),
       ...(liveModels
         ? {
-            settings: liveModels.solver.settings,
+            settings: {
+              ...liveModels.solver.settings,
+              reasoningEffort: args.reasoning as never,
+              maxOutputTokens: Number(args["max-output"]),
+            },
             price: liveModels.solver.price,
             review: liveModels.review,
           }

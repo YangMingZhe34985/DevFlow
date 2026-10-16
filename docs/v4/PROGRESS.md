@@ -2,6 +2,54 @@
 
 方案见 [DevFlow_v4.0_Autonomous_Refactor_Plan.md](../../DevFlow_v4.0_Autonomous_Refactor_Plan.md)。本文只记录**已验证的状态**和下一步，最新条目在上方。
 
+## 2026-10-16：Phase 4 产品化与旧路径退役
+
+退役前的代码打了标签 `v4-pre-retirement`。退役依据：合成集上，autonomous 的严格通过率为 9/10 和 10/10，旧路径最好只有 5/10；外部留出集按用户决定不再测试旧路径。
+
+各步内容：
+
+- **4.1 GitHub 交付独立**（`2bdd05e`）：推送和创建 PR 改由 `GitHubDeliveryExecutor` 完成，所有模式共用。
+- **4.2 默认模式切换**（`7a194df`）：新 Run 默认使用 autonomous；CLI 改为在 Kernel 上运行 ACI 工具。
+- **4.3 删除旧执行路径**（`b2a951a`）：删除 workflow、team、旧 Runtime，以及 worker 中的 PRG 实现。
+  - 删除哪些文件，依据的是从各个入口出发的 import 可达性分析，而不是逐个人工判断；
+  - 删除了 `@devflow/workflow` 和 `@devflow/git` 两个包；
+  - API 只接受 autonomous；路由器拒绝执行已退役模式的历史 Run，但这些 Run 已经批准的 GitHub 发布仍可完成。
+- **4.4 删除 PRG 的剩余部分**（`80413d7`）：删除 `localizationMode` 选项、仓库索引存储，以及 tree-sitter 依赖。
+- **4.5 数据库、共享类型、界面与文档**（`b5fed8d`、`da03029`、`4cfc06c` 及文档提交）：
+  - 删除数据库 benchmark 流程和 `@devflow/eval` 包；
+  - 删除团队持久化与租约防护、预算账本、计划审批；
+  - 删除 Planner 相关 schema；
+  - Web 表单不再询问旧的步数和重试上限。
+  - 数据库表全部保留，没有做破坏性迁移，历史 Run 仍可读取。
+
+**规模变化：**
+
+| 项目                                                 | 退役前    | 退役后    | 变化 |
+| ---------------------------------------------------- | --------- | --------- | ---- |
+| 源码（`apps/*/src`、`packages/*/src`，不含生成代码） | 61,523 行 | 16,957 行 | −72% |
+| 测试                                                 | 45,202 行 | 9,485 行  | —    |
+| 包                                                   | 9 个      | 6 个      | —    |
+
+**新增或改写的测试：**
+
+- 交付契约测试：任意模式准备的变更集，推送和创建的 PR 内容与之完全一致；
+- p9 浏览器测试改写为 autonomous 流程：在 Web 中创建 → 修复 → 审查 → 显示 Diff，另含无改动时失败的情况；
+- `test:p1` 改为运行 autonomous 的 Docker 测试；
+- `test:postgres` 用于 Run 所有权和租约测试。
+
+**验证结果：**
+
+- 单元测试 292 个通过；
+- 集成测试 p1、p3、p5、p9、p10、postgres 全部通过；
+- Playwright E2E 通过；
+- lint、类型检查、prettier 通过。
+
+**仍保留的内容：**
+
+- 单个 autonomous 执行器；
+- 数据库中旧模式的历史数据读取能力；
+- 本地被 Git 忽略的 Planner 录制夹具（是否删除需要用户决定）。
+
 ## 2026-10-16：外部留出集首次有效评测（R3，提交 `e9f5d01`）
 
 - **题目**：SWE-bench Verified 15 题 + Multilingual 5 题，每题跑 1 次。模型：求解用 GLM-5.3（low），审查用 DeepSeek-v4-pro。

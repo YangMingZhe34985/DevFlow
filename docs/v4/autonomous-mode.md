@@ -4,25 +4,23 @@
 
 ## 启用
 
-通过 API 创建 Run 时指定执行模式：
+通过 API 创建 Run：
 
 ```json
 POST /api/v1/runs
-{ "taskId": "<task id>", "executionMode": "autonomous" }
+{ "taskId": "<task id>" }
 ```
 
-Web 端在创建 Run 的表单中选择 “Execution mode → autonomous”。
+Web 端创建 Run 时无需选择执行模式。
 
-- 与 `team` / `single` 不同，`autonomous` 不需要 `DEVFLOW_TEAM_ENABLED`。
-- 默认模式仍是 `workflow`。旧路径没有改动，可以随时切回。
+- 自 Phase 4 起，autonomous 是唯一的执行模式，`executionMode` 可省略；API 只接受 `"autonomous"`。
+- workflow / team / single 模式已经退役。这些模式下的历史 Run 仍可读取，但 Worker 拒绝执行；它们已经批准的 GitHub 推送和 PR 仍可完成。
 - 执行模式保存在 Run 的 metadata 里，因此不需要数据库迁移。
 
 ## 一次 Run 的流程
 
 1. **准备**：创建租约受控的 Docker 沙箱。LOCAL 仓库使用创建 Run 时捕获的快照。
-2. **选择检查配置**：
-   - benchmark Run 使用冻结配置中的公开检查 profile 和保护路径；
-   - 普通 Run 自动发现公开检查（npm scripts、pytest 等），默认只保护 `.git/` 和 `.github/workflows/`，允许 Agent 新增或修改测试。
+2. **选择检查配置**：自动发现公开检查（npm scripts、pytest 等）；只保护 `.git/` 和 `.github/workflows/`，允许 Agent 新增或修改测试。
 3. **求解**：Agent 只有四个工具。
 
    | 工具        | 用途                       |
@@ -52,7 +50,7 @@ Web 端在创建 Run 的表单中选择 “Execution mode → autonomous”。
 
 | 变量                                         | 默认值   | 作用                                                                      |
 | -------------------------------------------- | -------- | ------------------------------------------------------------------------- |
-| `LLM_EXECUTE_*`                              | —        | 求解模型绑定（与 workflow 模式的 Coding 阶段共用）                        |
+| `LLM_EXECUTE_*`                              | —        | 求解模型绑定                                                              |
 | `LLM_REVIEW_*`                               | 现有配置 | 独立 Reviewer 模型，可与求解模型分别配置                                  |
 | `DEVFLOW_TIMEOUT_MS`                         | 1500000  | 整个 Run 的绝对期限；恢复后不会重置                                       |
 | `DEVFLOW_MAX_COST_MICROS`                    | 未设置   | Run 费用硬上限；设置时必须为该模型配置价格                                |
@@ -62,7 +60,7 @@ Web 端在创建 Run 的表单中选择 “Execution mode → autonomous”。
 | `DEVFLOW_AUTONOMOUS_MAX_REVISIONS`           | 2        | 宿主验证失败后，最多回到同一会话修订的次数                                |
 | `DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS`        | 5        | 每隔多少轮保存一次检查点（工作区 diff + 对话）                            |
 | `DEVFLOW_AUTONOMOUS_REVIEW`                  | 1        | 1 开启独立审查；0 关闭                                                    |
-| `DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS`       | 8        | 第 2 层轮数上限，范围 1–8，同时受 Run 剩余轮数限制；替代旧 MAX_TURNS      |
+| `DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS`       | 8        | 第 2 层轮数上限，范围 1–8；审查轮数独立于求解轮数，费用仍受审查上限约束   |
 | `DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT`       | 4096     | 两层审查的输出上限，覆盖 REVIEW 绑定                                      |
 | `DEVFLOW_AUTONOMOUS_REVIEW_REASONING`        | medium   | 第 2 层（工具核查）的思考强度；模型不支持时降到最接近的较低档位           |
 | `DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING` | none     | 第 1 层（单次结论）的思考强度，默认关闭思考；不支持 none 的模型降到最低档 |
@@ -104,7 +102,7 @@ Web 端在创建 Run 的表单中选择 “Execution mode → autonomous”。
 - **计费不会被重置**：花费从该 Run 自己的事件日志重算。已经发出但没有收到回执的请求按最坏情况计入，不记为零。
 - **模型绑定校验**：求解和 Reviewer 的绑定均纳入检查点身份；恢复时配置变化会被拒绝。
 - **费用切片**：Review 开启且配置 Run 费用上限时，求解累计最多使用 `cap × (1 - reserve)`，两层审查（含格式重试、修订后重审、后续尝试与恢复前花费）累计最多使用 `reviewCeiling = floor(cap × reserve)`，同时不超过 Run 剩余额度。求解额度检查从总账扣除审查已花费用，审查不会挤占修订额度。每次模型请求按输入估算加完整输出上限报价，无法容纳下一请求即 NEEDS_EVIDENCE，summary 为 `review budget exhausted`。已确认与未确认费用均计入。关闭审查时沿用完整 Run 预算。配置上限时两个模型均需提供价格；未配置上限时只有轮数和期限限制。
-- **模型参数**：两层共用 REVIEW 模型及新的输出/思考覆盖值。GLM 5.3 仅支持 low/high/max，DeepSeek v4 支持 none/low/high/max；不支持的覆盖值（包括默认 medium）保留原绑定档位，原绑定未设置时使用供应商默认值。旧 `DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS` 已由 `DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS` 替代。
+- **模型参数**：两层共用 REVIEW 模型及新的输出/思考覆盖值。GLM 5.3 仅支持 low/high/max，DeepSeek v4 支持 none/low/high/max；不支持的覆盖值（包括默认 medium）降到模型支持的最近一档。旧 `DEVFLOW_AUTONOMOUS_REVIEW_MAX_TURNS` 已由 `DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS` 替代。
 - **结果口径**：runner 的轨迹在每层开始/结束记录 `at` 和 `tier`，结果 JSON 的 `review` 包含最终层级、疑点数和 Run 累计审查 `costMicros`（包含未确认费用）；各层事件的费用为该层本次用量。
 
 ## 已知限制
@@ -112,5 +110,4 @@ Web 端在创建 Run 的表单中选择 “Execution mode → autonomous”。
 - bash 的只读约定由提示词和审查后的工作区校验保证；测试产生的 git ignored 构建/缓存文件不参与结论判定。快照包含这些文件，回滚时一并恢复。
 - 分层审查尚未进行付费模型评测，Fake Model 只能证明链路行为，不能证明真实缺陷检出率或费用目标已达到。
 - 15% 是比例封顶，不是固定 ¥0.2；例如 Run 上限 ¥4 时审查上限为 ¥0.6。首次审查的长输入未必命中缓存，15–30K Token 的单次费用也未必低于 ¥0.2。应根据后续受控评测配置 reserve 与 Run 上限。
-- Web 端的流程节点仍按 workflow 的十个阶段展示；autonomous Run 的过程以事件时间线和工具调用为准。
 - 测试覆盖：单元测试；Docker 集成测试（修订回路、检查点恢复）；PostgreSQL + RunProcessor 端到端测试。真实模型的门槛评测需要另行授权运行。

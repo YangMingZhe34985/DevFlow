@@ -105,7 +105,6 @@ export interface TaskStore {
 export interface RunRecord {
   executionMode?: "workflow" | "team" | "single" | "autonomous";
   teamConfiguration?: TeamConfiguration;
-  localizationMode?: "legacy" | "legacy-dynamic" | "prg";
   id: RunId;
   taskId: string;
   idempotencyKey?: string;
@@ -136,7 +135,6 @@ export interface RunExecutionRecord extends RunRecord {
 export interface CreateRunInput {
   executionMode?: "workflow" | "team" | "single" | "autonomous" | undefined;
   teamConfiguration?: TeamConfiguration | undefined;
-  localizationMode?: "legacy" | "legacy-dynamic" | "prg" | undefined;
   taskId: string;
   idempotencyKey?: string | undefined;
   modelProvider?: string | undefined;
@@ -445,8 +443,6 @@ export interface DatabaseAdapter extends DatabaseLifecycle {
   readonly teams?: TeamStore;
   /** Required by the resource scheduler; optional only for legacy adapters. */
   readonly budgetLedgers?: BudgetLedgerStore;
-  /** Immutable, scope-bound localization entries. Optional for legacy/test adapters. */
-  readonly repositoryIndexes?: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
@@ -455,12 +451,6 @@ export interface DatabaseAdapter extends DatabaseLifecycle {
   readonly githubPublications: DatabaseGitHubPublicationStore;
   readonly benchmarkExecutions: BenchmarkExecutionStore;
   readonly events: EventStore;
-}
-
-export interface RepositoryIndexStore {
-  /** Keys are immutable within an access scope; publish never replaces an existing value. */
-  get(scope: string, key: string): Promise<unknown | undefined>;
-  publish(scope: string, key: string, value: unknown): Promise<void>;
 }
 
 export interface AtomicEventWriter extends EventSink {

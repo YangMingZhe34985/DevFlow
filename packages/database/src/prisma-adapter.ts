@@ -65,7 +65,6 @@ import type {
   PersistedRunTransition,
   RepositoryRecord,
   RepositoryStore,
-  RepositoryIndexStore,
   ResolveApprovalInput,
   RunExecutionRecord,
   RunDetailRecord,
@@ -90,7 +89,6 @@ type RunWithTaskAndRepository = Prisma.RunGetPayload<{
 export class PrismaDatabaseAdapter implements DatabaseAdapter {
   readonly teams: PrismaTeamStore;
   readonly budgetLedgers: BudgetLedgerStore;
-  readonly repositoryIndexes: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
@@ -103,21 +101,6 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   constructor(readonly client: PrismaClient) {
     this.teams = new PrismaTeamStore(client);
     this.budgetLedgers = new PrismaBudgetLedgerStore(client);
-    this.repositoryIndexes = {
-      get: async (scope, key) => {
-        const entry = await client.repositoryIndexEntry.findUnique({
-          where: { scope_key: { scope, key } },
-        });
-        return entry?.value;
-      },
-      publish: async (scope, key, value) => {
-        // Unique immutable keys fence stale builders; no update/upsert can overwrite a publication.
-        await client.repositoryIndexEntry.createMany({
-          data: [{ scope, key, value: JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue }],
-          skipDuplicates: true,
-        });
-      },
-    };
     this.repositories = new PrismaRepositoryStore(client);
     this.tasks = new PrismaTaskStore(client);
     this.runs = new PrismaRunStore(client);
@@ -404,7 +387,6 @@ class PrismaRunStore implements RunRepository {
           data: {
             taskId: input.taskId,
             metadata: {
-              localizationMode: input.localizationMode ?? "legacy",
               executionMode: ExecutionModeSchema.parse(input.executionMode ?? "autonomous"),
               teamConfiguration: TeamConfigurationSchema.parse(input.teamConfiguration ?? {}),
             },
@@ -1912,7 +1894,6 @@ function mapTask(task: PrismaTask): TaskRecord {
 function mapRun(run: PrismaRun): RunRecord {
   const result = resultFromRun(run);
   return {
-    localizationMode: localizationModeFromMetadata(run.metadata),
     executionMode: executionModeFromMetadata(run.metadata),
     teamConfiguration: TeamConfigurationSchema.parse(
       recordValue(run.metadata).teamConfiguration ?? {},
@@ -2204,9 +2185,6 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
     ) !== teamCanonicalJson(TeamConfigurationSchema.parse(input.teamConfiguration ?? {}))
       ? "teamConfiguration"
       : undefined,
-    localizationModeFromMetadata(existing.metadata) !== (input.localizationMode ?? "legacy")
-      ? "localizationMode"
-      : undefined,
     existing.modelProvider !== (input.modelProvider ?? null) ? "modelProvider" : undefined,
     existing.modelName !== (input.modelName ?? null) ? "modelName" : undefined,
     existing.maxSteps !== (input.maxSteps ?? 25) ? "maxSteps" : undefined,
@@ -2218,13 +2196,6 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
       `Idempotency key is already associated with different Run options: ${mismatches.join(", ")}.`,
     );
   }
-}
-
-function localizationModeFromMetadata(metadata: unknown): "legacy" | "legacy-dynamic" | "prg" {
-  const mode = recordValue(metadata).localizationMode;
-  if (mode === undefined || mode === "legacy") return "legacy";
-  if (mode === "prg" || mode === "legacy-dynamic") return mode;
-  throw conflict("Invalid persisted Localization mode; resume cannot choose a new mode.");
 }
 
 function executionModeFromMetadata(metadata: unknown) {

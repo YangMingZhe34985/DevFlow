@@ -34,7 +34,6 @@ import { RunEventStreamService } from "./run-event-stream.service.js";
 const CreateRunSchema = z.strictObject({
   // workflow/team/single were retired in v4; their persisted Runs stay readable.
   executionMode: z.literal("autonomous").optional(),
-  localizationMode: z.enum(["legacy", "legacy-dynamic", "prg"]).optional(),
   taskId: IdSchema,
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
   modelProvider: z.string().trim().min(1).max(100).optional(),

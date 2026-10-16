@@ -6,8 +6,6 @@
   "main": "./dist/main.js",
   "scripts": {
     "dev": "node --watch --watch-preserve-output --enable-source-maps dist/main.js",
-    "benchmark": "tsx src/benchmark-main.ts",
-    "benchmark:efficiency": "tsx src/benchmark-main.ts --efficiency",
     "build": "tsc -b",
     "start": "node --enable-source-maps dist/main.js",
     "clean": "rimraf dist",
@@ -22,11 +20,9 @@
     "@devflow/sandbox": "2.4.0",
     "@devflow/shared": "2.4.0",
     "@devflow/tools": "2.4.0",
-    "@vscode/tree-sitter-wasm": "0.3.1",
     "bullmq": "6.3.7",
     "dotenv": "18.0.0",
     "ioredis": "6.0.0",
-    "typescript": "5.9.3",
     "zod": "4.6.5"
   }
 }

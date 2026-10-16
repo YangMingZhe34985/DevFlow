@@ -29,7 +29,6 @@ import {
 
 import type { WorkerEnvironment } from "../config/env.js";
 import { resolveStageModel } from "../config/stage-models.js";
-import { prepareBenchmarkEvaluation } from "../runs/benchmark-evaluation.js";
 import { captureGitHubChanges, isGitHubRepositoryUri } from "../runs/github-changeset.js";
 import { prepareGitHubPushApproval, requireFullCommit } from "../runs/github-delivery.js";
 import { ensureLocalRunSnapshot } from "../runs/local-run-snapshot.js";
@@ -41,8 +40,8 @@ import { reviewSettings } from "./review.js";
 
 const PROJECT_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 export const AUTONOMOUS_CHECKPOINT_ARTIFACT = "autonomous-checkpoint.json";
-/** Without a benchmark configuration only repository plumbing is protected; tests may change. */
-const DEFAULT_PROTECTED_PATHS = [".git/", ".github/workflows/"];
+/** Only repository plumbing is protected; the agent may change and add tests. */
+const PROTECTED_PATHS = [".git/", ".github/workflows/"];
 
 export interface AutonomousModel {
   model: LanguageModelPort;
@@ -125,14 +124,10 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         signal,
       );
       sandboxes.set(currentAttempt, sandbox);
-      const benchmark = await prepareBenchmarkEvaluation(this.database, run, sandbox, signal);
-      const profile =
-        benchmark?.configuration.runtime.publicVerificationProfile ??
-        (await discoverPublicVerification(sandbox, signal)).profile;
-      const protectedPaths = benchmark?.configuration.protectedPaths ?? DEFAULT_PROTECTED_PATHS;
+      const { profile } = await discoverPublicVerification(sandbox, signal);
       const protectedPath = (path: string) =>
-        matchesAny(path, protectedPaths)
-          ? `${path} is protected (${benchmark ? "it grades the fix" : "repository plumbing"}); change other files instead. Put scratch scripts in /tmp.`
+        matchesAny(path, PROTECTED_PATHS)
+          ? `${path} is protected (repository plumbing); change other files instead. Put scratch scripts in /tmp.`
           : undefined;
       const baseCommit = await readHead(sandbox, signal);
       const activeCheckpoint =
@@ -156,7 +151,6 @@ export class AutonomousRunExecutor implements RunExecutionPort {
             signal,
           );
           sandboxes.set(number, fresh);
-          await prepareBenchmarkEvaluation(this.database, run, fresh, signal);
           await this.saveCheckpoint(
             run.id,
             fresh,
@@ -199,7 +193,7 @@ export class AutonomousRunExecutor implements RunExecutionPort {
         },
         maxRevisions: this.environment.DEVFLOW_AUTONOMOUS_MAX_REVISIONS,
         protectedPath,
-        protectedSummary: `Do not edit: ${protectedPaths.join(", ")}. Put scratch scripts in /tmp.`,
+        protectedSummary: `Do not edit: ${PROTECTED_PATHS.join(", ")}. Put scratch scripts in /tmp.`,
         ...(resume ? { resume } : {}),
         signal,
         onEvent: (event) => this.recordKernelEvent(run.id, event, metrics),

@@ -12,8 +12,7 @@
     { "path": "../../packages/github" },
     { "path": "../../packages/tools" },
     { "path": "../../packages/agent" },
-    { "path": "../../packages/database" },
-    { "path": "../../packages/eval" }
+    { "path": "../../packages/database" }
   ],
   "include": ["src/**/*.ts"],
   "exclude": ["dist", "tests"]

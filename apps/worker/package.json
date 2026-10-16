@@ -15,7 +15,6 @@
   "dependencies": {
     "@devflow/agent": "2.4.0",
     "@devflow/database": "2.4.0",
-    "@devflow/eval": "2.4.0",
     "@devflow/github": "2.4.0",
     "@devflow/sandbox": "2.4.0",
     "@devflow/shared": "2.4.0",

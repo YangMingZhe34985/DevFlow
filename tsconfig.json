@@ -8,7 +8,6 @@
     { "path": "./packages/tools" },
     { "path": "./packages/agent" },
     { "path": "./packages/database" },
-    { "path": "./packages/eval" },
     { "path": "./apps/cli" },
     { "path": "./apps/api" },
     { "path": "./apps/worker" }

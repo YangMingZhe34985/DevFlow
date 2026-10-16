@@ -20,6 +20,19 @@ export interface AciTool {
   execute(input: unknown, signal: AbortSignal): Promise<AciToolResult>;
 }
 
+/** The sandbox cannot run anything more; retrying from the model only burns budget. */
+const TERMINAL_SANDBOX_CODES = new Set([
+  "SANDBOX_CANCELLED",
+  "SANDBOX_LOST_OWNERSHIP",
+  "SANDBOX_ALREADY_DISPOSED",
+  "SANDBOX_PROCESS_FAILED",
+]);
+
+export function isTerminalSandboxError(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" && TERMINAL_SANDBOX_CODES.has(code);
+}
+
 export function defineAciTool<T>(definition: {
   name: string;
   description: string;
@@ -44,7 +57,7 @@ export function defineAciTool<T>(definition: {
       try {
         return await definition.run(parsed.data, signal);
       } catch (error) {
-        if (signal.aborted) throw error;
+        if (signal.aborted || isTerminalSandboxError(error)) throw error;
         return {
           isError: true,
           content: `${definition.name} failed: ${error instanceof Error ? error.message : String(error)}`,

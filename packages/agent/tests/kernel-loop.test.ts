@@ -130,6 +130,52 @@ describe("runAgentLoop", () => {
     );
   });
 
+  it("stops with usage intact once the sandbox can no longer run commands", async () => {
+    const dead = defineAciTool({
+      name: "bash",
+      description: "Run a command.",
+      inputSchema: z.object({}),
+      readOnly: false,
+      async run() {
+        throw Object.assign(new Error("Sandbox operation cancelled"), {
+          code: "SANDBOX_CANCELLED",
+        });
+      },
+    });
+    const flaky = defineAciTool({
+      name: "flaky",
+      description: "Fail once in an ordinary way.",
+      inputSchema: z.object({}),
+      readOnly: true,
+      async run() {
+        throw new Error("grep: not found");
+      },
+    });
+    const model = new FakeLanguageModel([
+      fakeModelResponse({ toolCalls: [call("1", "flaky", {})], usage: usage(100) }),
+      fakeModelResponse({
+        toolCalls: [call("2", "bash", {}), call("3", "echo", { text: "never" })],
+        usage: usage(200),
+      }),
+      fakeModelResponse({ toolCalls: [call("4", "echo", { text: "never" })] }),
+    ]);
+    const log: string[] = [];
+    const result = await runAgentLoop({
+      model,
+      system: "s",
+      task: "t",
+      tools: [dead, flaky, echoTool(log)],
+      limits: { maxTurns: 10 },
+      signal: signal(),
+    });
+    expect(result.stopReason).toBe("ENVIRONMENT_ERROR");
+    expect(result.summary).toContain("Sandbox operation cancelled");
+    expect(result.usage.modelCalls).toBe(2);
+    expect(result.usage.inputTokens).toBe(300);
+    expect(toolMessages(result.messages)[0]).toMatchObject({ isError: true });
+    expect(log).toEqual([]);
+  });
+
   it("returns unknown tools and invalid arguments to the model instead of stopping", async () => {
     const model = new FakeLanguageModel([
       fakeModelResponse({

@@ -26,7 +26,13 @@ export interface KernelLimits {
 }
 
 export type KernelStopReason =
-  "SUBMITTED" | "TURN_LIMIT" | "COST_LIMIT" | "DEADLINE" | "NO_ACTION" | "MODEL_ERROR";
+  | "SUBMITTED"
+  | "TURN_LIMIT"
+  | "COST_LIMIT"
+  | "DEADLINE"
+  | "NO_ACTION"
+  | "MODEL_ERROR"
+  | "ENVIRONMENT_ERROR";
 
 export interface KernelUsage {
   modelCalls: number;
@@ -270,10 +276,16 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
               signal,
               AbortSignal.timeout(Math.max(1, limits.deadlineAt - Date.now())),
             ]);
+      let environmentError: string | undefined;
       const result = tool
         ? await tool.execute(call.input, toolSignal).catch((error: unknown) => {
-            if (signal.aborted || !toolSignal.aborted) throw error;
-            return { isError: true, content: "Tool stopped at the Run deadline." };
+            if (signal.aborted) throw error;
+            if (!toolSignal.aborted)
+              environmentError = error instanceof Error ? error.message : String(error);
+            return {
+              isError: true,
+              content: environmentError ?? "Tool stopped at the Run deadline.",
+            };
           })
         : {
             isError: true,
@@ -295,6 +307,8 @@ export async function runAgentLoop(options: KernelOptions): Promise<KernelResult
         durationMs: Date.now() - started,
         content,
       });
+      if (environmentError !== undefined)
+        return finish("ENVIRONMENT_ERROR", { summary: environmentError });
       if ("submitted" in result && result.submitted) {
         // Calls after submit in the same reply are answered but not executed.
         for (const skipped of response.toolCalls.slice(index + 1))

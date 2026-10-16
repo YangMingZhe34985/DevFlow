@@ -341,3 +341,32 @@ describe("review and solving share a fixed cost slice", () => {
     ).toThrow();
   });
 });
+
+describe("terminal sandbox failure", () => {
+  it("returns the metered solve without touching the lost sandbox again", async () => {
+    const { sandbox, exec } = fakeSandbox();
+    const lost = Object.assign(new Error("Sandbox operation cancelled"), {
+      code: "SANDBOX_CANCELLED",
+    });
+    let callsWhenLost: number | undefined;
+    const healthy = exec.getMockImplementation()!;
+    exec.mockImplementation(async (command) => {
+      if (callsWhenLost !== undefined) throw lost;
+      if (command.program === "bash" && (command.args ?? []).join(" ").includes("probe-sandbox")) {
+        callsWhenLost = exec.mock.calls.length;
+        throw lost;
+      }
+      return healthy(command);
+    });
+    const model = new FakeLanguageModel([
+      step("bash", { command: "echo probe-sandbox" }),
+      step("bash", { command: "echo never" }),
+    ]);
+    const result = await runAutonomousSolve({ ...attemptInput(), sandbox, model });
+    expect(result.kernel.stopReason).toBe("ENVIRONMENT_ERROR");
+    expect(result.kernel.usage.modelCalls).toBe(1);
+    expect(result).toMatchObject({ patch: "", changedFiles: [], revisions: 0 });
+    expect(result.verification).toBeUndefined();
+    expect(exec.mock.calls.length).toBe(callsWhenLost);
+  });
+});

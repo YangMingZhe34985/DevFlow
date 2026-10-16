@@ -209,6 +209,8 @@ for (const caseId of selectedCases) {
     workspaceRoot: process.cwd(),
   });
   let session: Awaited<ReturnType<typeof manager.create>> | undefined;
+  // One deadline for the whole case: the sandbox session must outlive every attempt.
+  const runSignal = AbortSignal.timeout(args.live ? 1_500_000 : 300_000);
   const events: unknown[] = [];
   let result;
   try {
@@ -235,7 +237,7 @@ for (const caseId of selectedCases) {
               networkEnabled: false,
             },
           },
-          AbortSignal.timeout(300_000),
+          runSignal,
         );
         const info = JSON.parse(execFileSync("docker", ["inspect", session.id]).toString())[0];
         if (info.Config.Labels["devflow.suite"] !== "external-set")
@@ -291,7 +293,7 @@ for (const caseId of selectedCases) {
         deadlineAt: Date.now() + (args.live ? 1_500_000 : 300_000),
         ...(liveModels ? { maxInputTokens: liveModels.solver.contextTokens } : {}),
       },
-      signal: AbortSignal.timeout(args.live ? 1_500_000 : 300_000),
+      signal: runSignal,
       onEvent: (event) => {
         events.push(event);
       },

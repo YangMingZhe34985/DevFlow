@@ -213,6 +213,16 @@ export async function runAutonomousSolve(input: SolveInput): Promise<SolveResult
           });
     submittedResume = false;
     if (kernel.stopReason === "SUBMITTED") await input.onTurnEnd?.(kernel, revisions);
+    if (kernel.stopReason === "ENVIRONMENT_ERROR")
+      return {
+        kernel,
+        ...(input.review ? { reviewSpentMicros } : {}),
+        revisions,
+        baseCommit,
+        patch: "",
+        changedFiles: [],
+        excludedFiles: [],
+      };
     verification = (await hasChanges(input.sandbox, baseCommit, input.signal))
       ? await verifyCandidate(input, baseCommit)
       : undefined;

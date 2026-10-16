@@ -4,45 +4,42 @@ import { pathToFileURL } from "node:url";
 
 import {
   createConfiguredLanguageModel,
-  DefaultAgentRuntime,
-  JsonFileAgentStateStore,
-  type ModelToolDescriptor,
+  runAgentLoop,
   type SupportedLlmProvider,
   type VercelAiModelConfig,
 } from "@devflow/agent";
-import { SandboxGitService } from "@devflow/git";
 import { DockerSandboxManager, type SandboxSession } from "@devflow/sandbox";
 import { DevflowError, toDevflowError } from "@devflow/shared";
 import {
-  DefaultToolExecutor,
-  ExplicitToolPolicy,
-  registerCoreTools,
-  ToolRegistry,
-  type ToolExecutionRequest,
+  createBashTool,
+  createEditFileTool,
+  createReadFileTool,
+  createSubmitTool,
 } from "@devflow/tools";
 
-import { loadProjectEnvironment, resolveProjectStateDirectory } from "./environment.js";
+import { loadProjectEnvironment } from "./environment.js";
 import { configureUtf8Terminal, printEvent } from "./terminal.js";
 
 interface CliOptions {
   repositoryPath: string;
   task: string;
-  maxSteps: number;
-  maxRetries: number;
+  maxTurns: number;
   timeoutMs: number;
   image: string;
 }
 
+const SYSTEM_PROMPT = `You are an autonomous software engineer working on the repository at /workspace inside an isolated Linux sandbox without network access.
+Investigate with bash and read_file, change files with edit_file, run the project's tests to check your work, and call submit with a short summary when the task is done.`;
+
 function printUsage(): void {
-  console.log(`DevFlow P1/P2/P3 CLI Agent
+  console.log(`DevFlow CLI agent
 
 Usage:
   npm run dev:cli -- --repo <repository-path> [options] "<task>"
 
 Options:
   --repo <path>         Repository copied into the Docker sandbox (default: .)
-  --max-steps <number>  Maximum model turns (default: DEVFLOW_MAX_STEPS or 25)
-  --max-retries <number> Retry failed model calls (default: DEVFLOW_MAX_RETRIES or 2)
+  --max-turns <number>  Maximum model turns (default: DEVFLOW_MAX_STEPS or 40)
   --timeout-ms <number> Total run deadline (default: DEVFLOW_TIMEOUT_MS or 900000)
   --image <name>        Sandbox image (default: DEVFLOW_SANDBOX_IMAGE)
   --help                Show this help
@@ -72,6 +69,7 @@ async function main(): Promise<number> {
     }
   };
   process.once("SIGINT", onInterrupt);
+  const signal = AbortSignal.any([cancellation.signal, AbortSignal.timeout(options.timeoutMs)]);
 
   const manager = new DockerSandboxManager({
     image: options.image,
@@ -93,69 +91,39 @@ async function main(): Promise<number> {
           networkEnabled: false,
         },
       },
-      cancellation.signal,
+      signal,
     );
-
-    const git = new SandboxGitService();
-    const registry = new ToolRegistry();
-    registerCoreTools(registry, git);
-    const executor = new DefaultToolExecutor(
-      registry,
-      new ExplicitToolPolicy(["READ", "WRITE", "EXECUTE", "GIT"]),
-    );
-    const tools: ModelToolDescriptor[] = registry.list().map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-    }));
-    const stateStore = new JsonFileAgentStateStore(
-      resolveProjectStateDirectory(process.env.DEVFLOW_STATE_DIR),
-    );
-    const emit = async (event: Parameters<typeof printEvent>[0]): Promise<void> =>
-      printEvent(event);
-    const runtime = new DefaultAgentRuntime(model);
-    const result = await runtime.run(
-      {
-        maxSteps: options.maxSteps,
-        timeoutMs: options.timeoutMs,
-        maxRetries: options.maxRetries,
-      },
-      {
-        runId,
-        task: {
-          taskId: randomUUID(),
-          repositoryId: randomUUID(),
-          title: options.task,
-          description: options.task,
-        },
-        signal: cancellation.signal,
-        tools,
-        stateStore,
-        emit,
-        executeTool: async (stepId, request: ToolExecutionRequest, signal = cancellation.signal) =>
-          executor.execute(request, {
-            runId,
-            stepId,
-            sandbox: sandbox as SandboxSession,
-            signal,
-            emit,
-          }),
-      },
-    );
+    const result = await runAgentLoop({
+      model,
+      system: SYSTEM_PROMPT,
+      task: options.task,
+      tools: [
+        createBashTool({ sandbox }),
+        createReadFileTool({ sandbox }),
+        createEditFileTool({ sandbox }),
+        createSubmitTool(),
+      ],
+      limits: { maxTurns: options.maxTurns, deadlineAt: Date.now() + options.timeoutMs },
+      signal,
+      onEvent: printEvent,
+    });
 
     console.log("\n=== Final Git Diff ===");
-    if (cancellation.signal.aborted) {
+    if (signal.aborted) {
       console.log("(diff skipped because the run was cancelled)");
     } else {
-      const diff = await git.diff(sandbox, { maxBytes: 500_000 }, cancellation.signal);
-      console.log(diff.patch.length > 0 ? diff.patch : "(no tracked changes)");
+      const diff = await sandbox.exec(
+        { program: "git", args: ["diff"], timeoutMs: 60_000, maxOutputBytes: 500_000 },
+        signal,
+      );
+      console.log(diff.stdout.length > 0 ? diff.stdout : "(no tracked changes)");
     }
+    const usage = result.usage;
     console.log(
-      `Result: ${result.status}; steps=${String(result.metrics.steps)}; modelCalls=${String(result.metrics.modelCalls)}; retries=${String(result.metrics.retries)}; tools=${String(result.metrics.toolCalls)}; modelLatencyMs=${String(result.metrics.modelLatencyMs)}; toolLatencyMs=${String(result.metrics.toolLatencyMs)}`,
+      `Result: ${result.stopReason}; turns=${String(result.turns)}; modelCalls=${String(usage.modelCalls)}; inputTokens=${String(usage.inputTokens)}; outputTokens=${String(usage.outputTokens)}`,
     );
     if (result.summary !== undefined) console.log(result.summary);
-    if (result.error !== undefined) console.error(`${result.error.code}: ${result.error.message}`);
-    return result.status === "SUCCEEDED" ? 0 : 1;
+    return result.stopReason === "SUBMITTED" ? 0 : 1;
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     if (sandbox !== undefined) {
@@ -167,8 +135,7 @@ async function main(): Promise<number> {
 
 function parseArguments(args: readonly string[]): CliOptions {
   let repositoryPath = path.resolve(".");
-  let maxSteps = readPositiveNumber("DEVFLOW_MAX_STEPS", 25);
-  let maxRetries = readNonnegativeNumber("DEVFLOW_MAX_RETRIES", 2);
+  let maxTurns = readPositiveNumber("DEVFLOW_MAX_STEPS", 40);
   let timeoutMs = readPositiveNumber("DEVFLOW_TIMEOUT_MS", 900_000);
   let image = process.env.DEVFLOW_SANDBOX_IMAGE ?? "devflow-sandbox:local";
   const taskParts: string[] = [];
@@ -177,13 +144,8 @@ function parseArguments(args: readonly string[]): CliOptions {
     const argument = args[index];
     if (argument === "--repo") {
       repositoryPath = path.resolve(requiredOption(args, ++index, "--repo"));
-    } else if (argument === "--max-steps") {
-      maxSteps = parsePositiveInteger(requiredOption(args, ++index, "--max-steps"), "--max-steps");
-    } else if (argument === "--max-retries") {
-      maxRetries = parseNonnegativeInteger(
-        requiredOption(args, ++index, "--max-retries"),
-        "--max-retries",
-      );
+    } else if (argument === "--max-turns") {
+      maxTurns = parsePositiveInteger(requiredOption(args, ++index, "--max-turns"), "--max-turns");
     } else if (argument === "--timeout-ms") {
       timeoutMs = parsePositiveInteger(
         requiredOption(args, ++index, "--timeout-ms"),
@@ -208,7 +170,7 @@ function parseArguments(args: readonly string[]): CliOptions {
       message: "A task description is required. Run with --help for usage.",
     });
   }
-  return { repositoryPath, task, maxSteps, maxRetries, timeoutMs, image };
+  return { repositoryPath, task, maxTurns, timeoutMs, image };
 }
 
 function readModelConfig(): VercelAiModelConfig {
@@ -248,28 +210,12 @@ function readPositiveNumber(name: string, fallback: number): number {
   return value === undefined ? fallback : parsePositiveInteger(value, name);
 }
 
-function readNonnegativeNumber(name: string, fallback: number): number {
-  const value = process.env[name];
-  return value === undefined ? fallback : parseNonnegativeInteger(value, name);
-}
-
 function parsePositiveInteger(value: string, name: string): number {
   const parsed = Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) {
     throw new DevflowError({
       code: "VALIDATION_ERROR",
       message: `${name} must be a positive integer.`,
-    });
-  }
-  return parsed;
-}
-
-function parseNonnegativeInteger(value: string, name: string): number {
-  const parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new DevflowError({
-      code: "VALIDATION_ERROR",
-      message: `${name} must be a non-negative integer.`,
     });
   }
   return parsed;

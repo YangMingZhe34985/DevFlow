@@ -259,7 +259,17 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
         bindingHash: "p5-fake-reviewer",
       }),
     });
-    const compositeExecutor: RunExecutionPort = {
+    const router = new ExecutionModeRouter(
+      {
+        execute: async () => {
+          throw new Error("P5 creates only autonomous Runs.");
+        },
+      },
+      autonomousExecutor,
+      new GitHubDeliveryExecutor(database, environment),
+    );
+    // Queue semantics are mode-independent: inject faults around the real executor.
+    const faultInjectingExecutor: RunExecutionPort = {
       execute: async (run, signal) => {
         const attempt = (executionAttempts.get(run.id) ?? 0) + 1;
         executionAttempts.set(run.id, attempt);
@@ -269,22 +279,15 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
         if (run.task.title === "Long cancellable run") {
           return await waitUntilCancelled(run, signal);
         }
+        if (run.task.title === "Full Docker Agent") return await router.execute(run, signal);
         return succeededResult(run.id);
       },
     };
-    const processor = new RunProcessor(
-      database.runs,
-      new ExecutionModeRouter(
-        compositeExecutor,
-        autonomousExecutor,
-        new GitHubDeliveryExecutor(database, environment),
-      ),
-      {
-        workerId: "integration-" + randomUUID(),
-        leaseMs: 5_000,
-        cancellationPollMs: 100,
-      },
-    );
+    const processor = new RunProcessor(database.runs, faultInjectingExecutor, {
+      workerId: "integration-" + randomUUID(),
+      leaseMs: 5_000,
+      cancellationPollMs: 100,
+    });
     workerRedis = new Redis(redisUrl, { maxRetriesPerRequest: null });
     workerQueue = new WorkerRunQueue(queueName, workerRedis);
     queueWorker = new Worker(

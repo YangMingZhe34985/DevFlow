@@ -405,7 +405,7 @@ class PrismaRunStore implements RunRepository {
             taskId: input.taskId,
             metadata: {
               localizationMode: input.localizationMode ?? "legacy",
-              executionMode: ExecutionModeSchema.parse(input.executionMode ?? "workflow"),
+              executionMode: ExecutionModeSchema.parse(input.executionMode ?? "autonomous"),
               teamConfiguration: TeamConfigurationSchema.parse(input.teamConfiguration ?? {}),
             },
             ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
@@ -2196,7 +2196,7 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
     throw conflict("Idempotency key is already associated with another task.");
   }
   const mismatches = [
-    executionModeFromMetadata(existing.metadata) !== (input.executionMode ?? "workflow")
+    executionModeFromMetadata(existing.metadata) !== (input.executionMode ?? "autonomous")
       ? "executionMode"
       : undefined,
     teamCanonicalJson(

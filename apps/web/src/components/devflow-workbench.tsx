@@ -741,7 +741,7 @@ function RunForm({
   }) {
   const selectedTask = tasks.find((task) => task.id === selectedTaskId);
   const [idempotencyKey, setIdempotencyKey] = useState("");
-  const [executionMode, setExecutionMode] = useState<"workflow" | "autonomous">("workflow");
+  const [executionMode, setExecutionMode] = useState<"workflow" | "autonomous">("autonomous");
   const [modelProvider, setModelProvider] = useState("");
   const [modelName, setModelName] = useState("");
   const [maxSteps, setMaxSteps] = useState("25");

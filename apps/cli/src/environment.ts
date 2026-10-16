@@ -11,14 +11,6 @@ export interface LoadProjectEnvironmentOptions {
   processEnv?: Record<string, string | undefined>;
 }
 
-export function resolveProjectStateDirectory(
-  configuredDirectory: string | undefined,
-  projectRoot = PROJECT_ROOT,
-): string {
-  const selected = configuredDirectory?.trim() || ".devflow/state";
-  return path.isAbsolute(selected) ? path.normalize(selected) : path.resolve(projectRoot, selected);
-}
-
 export function loadProjectEnvironment(
   options: LoadProjectEnvironmentOptions = {},
 ): DotenvConfigOutput {

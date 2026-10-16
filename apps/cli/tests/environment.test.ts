@@ -4,12 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import {
-  loadProjectEnvironment,
-  PROJECT_ENV_PATH,
-  PROJECT_ROOT,
-  resolveProjectStateDirectory,
-} from "../src/environment.js";
+import { loadProjectEnvironment, PROJECT_ENV_PATH, PROJECT_ROOT } from "../src/environment.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -25,16 +20,6 @@ describe("CLI project environment", () => {
   it("resolves .env from the project root rather than process.cwd()", () => {
     expect(path.resolve(PROJECT_ROOT)).toBe(path.resolve("."));
     expect(PROJECT_ENV_PATH).toBe(path.join(path.resolve("."), ".env"));
-  });
-
-  it("resolves state storage from the project root rather than process.cwd()", () => {
-    const absoluteStateDirectory = path.resolve(os.tmpdir(), "devflow-state");
-
-    expect(resolveProjectStateDirectory(".devflow/state")).toBe(
-      path.join(PROJECT_ROOT, ".devflow", "state"),
-    );
-    expect(resolveProjectStateDirectory("   ")).toBe(path.join(PROJECT_ROOT, ".devflow", "state"));
-    expect(resolveProjectStateDirectory(absoluteStateDirectory)).toBe(absoluteStateDirectory);
   });
 
   it("loads an explicit UTF-8 env file without replacing existing variables", async () => {

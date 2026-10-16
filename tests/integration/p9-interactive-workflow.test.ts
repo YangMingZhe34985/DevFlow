@@ -208,6 +208,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
 
     const runForm = page.getByTestId("run-form");
     await runForm.getByLabel("Task").selectOption({ label: taskTitle });
+    await runForm.getByTestId("run-execution-mode").selectOption("workflow");
     // Both the initial plan and rejection recovery now include two read-only Agents.
     await runForm.getByLabel("Max steps").fill("16");
     await runForm.getByLabel("Max repair").fill("2");
@@ -344,6 +345,7 @@ integrationDescribe("P6-P9 interactive approval workflow", () => {
     });
     const created = await request("POST", "/runs", {
       taskId: task.id,
+      executionMode: "workflow",
       maxSteps: 8,
       maxTestRetries: 1,
     });

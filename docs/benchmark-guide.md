@@ -1,6 +1,6 @@
 # DevFlow 验证与评测使用说明
 
-本文件保存可重复使用的操作和判分规则。历次成绩记录在 [v4 进度](v4/PROGRESS.md)，退役前的历史成绩见[溯源书](devflow-history-and-architecture.md)。
+本文件保存可重复使用的操作和判分规则。历次成绩记录在 [v4 进度](v4/PROGRESS.md)。
 
 ## 1. 日常工程验证
 

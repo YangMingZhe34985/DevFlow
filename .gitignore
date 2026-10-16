@@ -58,7 +58,6 @@ codex.md
 # Private migration notes, raw model traffic, billing and trusted evaluation data
 /datasets
 /docs/Devflow-*
-!/docs/devflow-history-and-architecture.md
 /docs/current-technical-report.md
 /docs/performance/
 /docs/archive/
@@ -84,3 +83,11 @@ codex.md
 
 # Personal resume documents
 /docs/*简历*.docx
+
+# Local-only design history: retired designs, the v4 refactor plan, the pre-v4
+# architecture record and one-off experiment reports. Current docs live in docs/.
+/PRG*.md
+/DevFlow_v*.md
+/docs/devflow-history-and-architecture.md
+/docs/v4/phase0-*-report.md
+/scripts/v4/external-set/*_report.py

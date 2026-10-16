@@ -1,4 +1,4 @@
-# DevFlow 2.4.0
+# DevFlow 4.0.0
 
 [中文](README_CN.md) | [English](README.md)
 
@@ -8,7 +8,24 @@ DevFlow 把仓库任务和 GitHub Issue 交给一个自主 Agent 修复，并让
 - **验证与审查**：宿主独立复跑公开检查，再由独立的 Reviewer 分层审查。
 - **交付**：GitHub 推送和 Pull Request 都必须经过人工审批。
 
-当前架构为 v4 autonomous，设计见 [autonomous 模式说明](docs/v4/autonomous-mode.md)，演进过程见 [v4 进度](docs/v4/PROGRESS.md)。旧的 workflow / team / single 执行路径和 PRG 定位已在 Phase 4 退役。这些模式下的历史 Run 仍可读取，但不能再执行。
+## v4.0.0 更新内容
+
+v4.0.0 用单个自主 Agent 取代了原来的多阶段工作流。设计见 [autonomous 模式说明](docs/v4/autonomous-mode.md)，演进过程见 [v4 进度](docs/v4/PROGRESS.md)。
+
+- **执行方式**：一个 Agent 使用 `bash`、`read_file`、`edit_file`、`submit` 四个通用工具自主求解，取代原先的 Localization → Planner → 计划审批 → Coding → Review 流水线。
+- **验证与审查**：
+  - 宿主独立复跑自动发现的公开检查；
+  - 分层独立审查：无工具初审，出现具体疑点才进行有界核查；
+  - 验证失败或审查判 FAIL 时，返回同一会话修订；结论不成立时，换新沙箱再尝试。
+- **资源控制**：每个 Run 有费用、轮数和截止时间三项硬上限，未确认的调用按最坏情况计费，并支持检查点恢复。
+- **交付**：GitHub 推送和 PR 由独立的交付执行器完成，仍需两级人工审批。
+- **退役**：
+  - 退役内容：workflow / team / single 执行模式、PRG 定位、Resource Budget Scheduler、团队持久化、数据库 benchmark 流程，以及 `@devflow/workflow`、`@devflow/git`、`@devflow/eval` 三个包；
+  - 规模：源码约减少 72%；
+  - 历史数据：历史 Run 仍可读取，但不再执行，数据库没有做破坏性迁移；
+  - 找回：退役前的代码保留在 Git 标签 `v4-pre-retirement`。
+- **CLI**：直接运行同一个 Agent 内核。
+- **评测**：新增外部留出集（SWE-bench Verified + Multilingual），以及对应的预算受控评测入口。
 
 ## 评测结果
 
@@ -121,4 +138,4 @@ node scripts/check-release-files.mjs
 - **集成测试**：需要 Docker 或 PostgreSQL，包括 `npm run test:p1`、`test:p3`、`test:p5`、`test:p9`、`test:p10`、`test:postgres`。这些命令会自行启动和清理所需的基础设施。
 - **费用**：单元测试和集成测试都使用模拟模型，不调用付费模型。
 
-[架构与历史](docs/devflow-history-and-architecture.md) · [测试说明](tests/README.md) · [脚本说明](scripts/README.md) · [MIT License](LICENSE)
+[文档入口](docs/README.md) · [测试说明](tests/README.md) · [脚本说明](scripts/README.md) · [MIT License](LICENSE)

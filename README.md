@@ -1,10 +1,20 @@
-# DevFlow 2.4.0
+# DevFlow 4.0.0
 
 [中文](README_CN.md) | [English](README.md)
 
 DevFlow hands repository tasks and GitHub issues to an autonomous agent, keeping every run observable and auditable. The agent explores, edits, runs tests and submits on its own inside an isolated Docker sandbox. The host re-runs the public checks independently, and an independent reviewer then examines the candidate in tiers. GitHub pushes and pull requests always require human approval.
 
-The current architecture is v4 autonomous: see the [autonomous mode design](docs/v4/autonomous-mode.md) and [v4 progress log](docs/v4/PROGRESS.md). The legacy workflow / team / single execution paths and PRG localization were retired in Phase 4. Runs persisted under those modes remain readable but cannot execute.
+## What's new in v4.0.0
+
+v4.0.0 replaces the multi-stage workflow with a single autonomous agent. See the [autonomous mode design](docs/v4/autonomous-mode.md) and the [v4 progress log](docs/v4/PROGRESS.md).
+
+- One agent with four general tools (`bash`, `read_file`, `edit_file`, `submit`) replaces the Localization → Planner → plan approval → Coding → Review pipeline.
+- The host independently re-runs discovered public checks. Tiered independent review starts with tool-free triage and adds bounded tool checks only for concrete concerns. Verification failures and review FAILs go back to the same session, and unresolved candidates get a fresh-sandbox attempt.
+- Every Run has hard cost, turn and deadline limits, unconfirmed calls are charged at their worst case, and Runs resume from checkpoints.
+- GitHub push and PR go through a dedicated delivery executor, still behind two human approvals.
+- Retired: the workflow / team / single modes, PRG localization, the resource budget scheduler, team persistence, the database benchmark pipeline, and the `@devflow/workflow`, `@devflow/git` and `@devflow/eval` packages. This cut about 72% of the source. Historical Runs stay readable but no longer execute, and there was no destructive database migration. The pre-retirement code is kept under the Git tag `v4-pre-retirement`.
+- The CLI runs the same agent kernel directly.
+- New external held-out set (SWE-bench Verified + Multilingual) with a budget-gated evaluation entry.
 
 ## Results
 
@@ -79,4 +89,4 @@ node scripts/check-release-files.mjs
 
 Integration tests need Docker or PostgreSQL: `npm run test:p1`, `test:p3`, `test:p5`, `test:p9`, `test:p10` and `test:postgres` start and clean up what they need. Unit and integration tests use fake models and never call paid models.
 
-[Architecture and history](docs/devflow-history-and-architecture.md) · [Tests](tests/README.md) · [Scripts](scripts/README.md) · [MIT License](LICENSE)
+[Docs](docs/README.md) · [Tests](tests/README.md) · [Scripts](scripts/README.md) · [MIT License](LICENSE)

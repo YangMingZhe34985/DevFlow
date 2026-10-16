@@ -35,9 +35,5 @@ scripts/localization-graph-fix-replay.mjs
 scripts/review-length-recovery-live.mjs
 scripts/build-historical-benchmark.mjs
 scripts/summarize-*.mjs
-# Preserve the original user-authored algorithm proposal byte-for-byte.
-PRG：Progressive Repository Graph 算法设计.md
-# Preserve the approved v3.0 requirements verbatim.
-DevFlow_v3.0_MultiAgent_Refactor_Brief.md
 # Preserve the new user-authored stability brief verbatim.
 docs/stability-autonomy-brief-20261013.md

@@ -1,6 +1,6 @@
 {
   "name": "@devflow/tools",
-  "version": "2.4.0",
+  "version": "4.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/index.js",
@@ -21,8 +21,8 @@
     "typecheck": "tsc -b"
   },
   "dependencies": {
-    "@devflow/sandbox": "2.4.0",
-    "@devflow/shared": "2.4.0",
+    "@devflow/sandbox": "4.0.0",
+    "@devflow/shared": "4.0.0",
     "zod": "4.6.5"
   }
 }

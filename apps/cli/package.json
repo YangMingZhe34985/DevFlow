@@ -1,6 +1,6 @@
 {
   "name": "@devflow/cli",
-  "version": "2.4.0",
+  "version": "4.0.0",
   "private": true,
   "type": "module",
   "main": "./dist/main.js",
@@ -13,10 +13,10 @@
     "typecheck": "tsc -b"
   },
   "dependencies": {
-    "@devflow/agent": "2.4.0",
-    "@devflow/sandbox": "2.4.0",
-    "@devflow/shared": "2.4.0",
-    "@devflow/tools": "2.4.0",
+    "@devflow/agent": "4.0.0",
+    "@devflow/sandbox": "4.0.0",
+    "@devflow/shared": "4.0.0",
+    "@devflow/tools": "4.0.0",
     "dotenv": "18.0.0"
   }
 }

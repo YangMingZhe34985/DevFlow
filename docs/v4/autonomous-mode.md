@@ -1,6 +1,6 @@
 # autonomous 执行模式使用说明（v4）
 
-`executionMode: "autonomous"` 由单个 Agent 使用通用工具自主求解 Issue；宿主负责隔离、计量、独立复验、持久化与交付审批。设计依据见 [v4 方案](../../DevFlow_v4.0_Autonomous_Refactor_Plan.md)，同条件对照结果见 [Phase 0 A1 报告](phase0-A1-report.md)。
+`executionMode: "autonomous"` 由单个 Agent 使用通用工具自主求解 Issue；宿主负责隔离、计量、独立复验、持久化与交付审批。演进过程和评测结果见 [v4 进度](PROGRESS.md)。
 
 ## 启用
 

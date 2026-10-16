@@ -2,52 +2,38 @@ import { describe, expect, it } from "vitest";
 
 import { loadWorkerEnvironment } from "../src/config/env.js";
 
-describe("Worker runtime budget configuration", () => {
-  it("provides safe structured-output, reasoning, and token defaults", () => {
+describe("Worker runtime configuration", () => {
+  it("provides safe structured-output, deadline and autonomous defaults", () => {
     const environment = loadWorkerEnvironment({
       DATABASE_URL: "postgresql://devflow:devflow@localhost:5432/devflow",
     });
 
     expect(environment).toMatchObject({
       LLM_STRUCTURED_OUTPUT_MODE: "auto",
-      LLM_REASONING_PROFILE: "efficient",
-      DEVFLOW_MAX_TOTAL_TOKENS: 250_000,
       DEVFLOW_TIMEOUT_MS: 1_500_000,
-      DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS: 240_000,
-      DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS: 210_000,
-      DEVFLOW_FINALIZE_TIMEOUT_MS: 30_000,
+      DEVFLOW_AUTONOMOUS_REVIEW: "1",
+      DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING: "none",
+      DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: 2,
     });
-    expect(environment.DEVFLOW_MAX_MODEL_CALLS).toBeUndefined();
-    expect(environment.DEVFLOW_MAX_TOOL_CALLS).toBeUndefined();
+    expect(environment.DEVFLOW_MAX_COST_MICROS).toBeUndefined();
   });
 
-  it("accepts explicit modes and positive budget overrides", () => {
-    const environment = loadWorkerEnvironment({
-      DATABASE_URL: "postgresql://devflow:devflow@localhost:5432/devflow",
+  it("accepts explicit modes and a positive cost cap, treating blanks as unset", () => {
+    expect(
+      loadWorkerEnvironment({
+        DATABASE_URL: "postgresql://devflow:devflow@localhost:5432/devflow",
+        LLM_STRUCTURED_OUTPUT_MODE: "json-schema",
+        DEVFLOW_MAX_COST_MICROS: "4000000",
+      }),
+    ).toMatchObject({
       LLM_STRUCTURED_OUTPUT_MODE: "json-schema",
-      LLM_REASONING_PROFILE: "provider-default",
-      DEVFLOW_MAX_MODEL_CALLS: "31",
-      DEVFLOW_MAX_TOOL_CALLS: "75",
-      DEVFLOW_MAX_TOTAL_TOKENS: "125000",
+      DEVFLOW_MAX_COST_MICROS: 4_000_000,
     });
-
-    expect(environment).toMatchObject({
-      LLM_STRUCTURED_OUTPUT_MODE: "json-schema",
-      LLM_REASONING_PROFILE: "provider-default",
-      DEVFLOW_MAX_MODEL_CALLS: 31,
-      DEVFLOW_MAX_TOOL_CALLS: 75,
-      DEVFLOW_MAX_TOTAL_TOKENS: 125_000,
-    });
-  });
-
-  it("treats empty optional budget overrides as unset", () => {
-    const environment = loadWorkerEnvironment({
-      DATABASE_URL: "postgresql://devflow:devflow@localhost:5432/devflow",
-      DEVFLOW_MAX_MODEL_CALLS: "",
-      DEVFLOW_MAX_TOOL_CALLS: "  ",
-    });
-
-    expect(environment.DEVFLOW_MAX_MODEL_CALLS).toBeUndefined();
-    expect(environment.DEVFLOW_MAX_TOOL_CALLS).toBeUndefined();
+    expect(
+      loadWorkerEnvironment({
+        DATABASE_URL: "postgresql://devflow:devflow@localhost:5432/devflow",
+        DEVFLOW_MAX_COST_MICROS: "  ",
+      }).DEVFLOW_MAX_COST_MICROS,
+    ).toBeUndefined();
   });
 });

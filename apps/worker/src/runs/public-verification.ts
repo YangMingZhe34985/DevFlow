@@ -1,6 +1,33 @@
 import { createHash } from "node:crypto";
-import { PublicVerificationProfileSchema, type PublicVerificationProfile } from "@devflow/eval";
 import type { CommandResult, SandboxSession } from "@devflow/sandbox";
+import { z } from "zod";
+
+/** Host-provided public project checks. Evaluator commands never belong here. */
+export const PublicVerificationProfileSchema = z
+  .object({
+    version: z.literal(1),
+    checks: z
+      .array(
+        z
+          .object({
+            kind: z.enum(["build", "typecheck", "lint", "test"]),
+            source: z.string().min(1).max(2000),
+            command: z
+              .object({
+                program: z.string().min(1),
+                args: z.array(z.string()).default([]),
+                cwd: z.string().min(1).default("."),
+                timeoutMs: z.number().int().positive().max(300_000).optional(),
+                environment: z.record(z.string(), z.string()).default({}),
+              })
+              .strict(),
+          })
+          .strict(),
+      )
+      .max(16),
+  })
+  .strict();
+export type PublicVerificationProfile = z.infer<typeof PublicVerificationProfileSchema>;
 
 export const VERIFICATION_ORDER = ["build", "typecheck", "lint", "test"] as const;
 export interface PublicCheckResult {

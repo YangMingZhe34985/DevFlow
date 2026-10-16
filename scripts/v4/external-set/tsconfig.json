@@ -1,0 +1,19 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "incremental": false,
+    "declaration": false,
+    "declarationMap": false,
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "adapter.ts",
+    "scoring.ts",
+    "prepare.ts",
+    "evaluate.ts",
+    "live-budget.ts",
+    "live-models.ts",
+    "../../../tests/external-set/*.test.ts"
+  ]
+}

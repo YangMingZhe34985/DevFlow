@@ -5,10 +5,12 @@ import { type RunJob } from "@devflow/shared";
 import { Worker } from "bullmq";
 import { Redis } from "ioredis";
 
+import { AutonomousRunExecutor } from "./autonomous/executor.js";
+import { ExecutionModeRouter } from "./autonomous/router.js";
 import { loadWorkerEnvironment } from "./config/env.js";
 import { startHealthServer, stopHealthServer } from "./health/server.js";
 import { BullRunQueue } from "./queue/bull-run-queue.js";
-import { ApprovalWorkflowRunExecutor } from "./runs/approval-workflow-run-executor.js";
+import { GitHubDeliveryExecutor } from "./runs/github-delivery.js";
 import { RunProcessor } from "./runs/run.processor.js";
 import { RunRecovery } from "./runs/run-recovery.js";
 
@@ -16,7 +18,10 @@ const environment = loadWorkerEnvironment();
 const database = PrismaDatabaseAdapter.fromConnectionString(environment.DATABASE_URL);
 const redis = new Redis(environment.REDIS_URL, { maxRetriesPerRequest: null });
 const runQueue = new BullRunQueue(environment.RUN_QUEUE_NAME, redis);
-const executor = new ApprovalWorkflowRunExecutor(database, environment);
+const executor = new ExecutionModeRouter(
+  new AutonomousRunExecutor(database, environment),
+  new GitHubDeliveryExecutor(database, environment),
+);
 const processor = new RunProcessor(database.runs, executor, {
   workerId: `worker-${process.pid}-${randomUUID()}`,
   leaseMs: environment.WORKER_LEASE_MS,

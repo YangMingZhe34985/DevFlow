@@ -1,4 +1,4 @@
-import type { NewAgentEvent } from "@devflow/shared";
+import type { KernelEvent } from "@devflow/agent";
 
 export interface TerminalLine {
   stream: "stdout" | "stderr";
@@ -12,68 +12,43 @@ export function configureUtf8Terminal(): void {
   process.env.LC_ALL ??= "C.UTF-8";
 }
 
-export function printEvent(event: NewAgentEvent): void {
+export function printEvent(event: KernelEvent): void {
   for (const line of renderEvent(event)) {
     const target = line.stream === "stderr" ? process.stderr : process.stdout;
     target.write(`${line.text}\n`);
   }
 }
 
-export function renderEvent(event: NewAgentEvent): TerminalLine[] {
-  const payload = isRecord(event.payload) ? event.payload : {};
+export function renderEvent(event: KernelEvent): TerminalLine[] {
   switch (event.type) {
-    case "LLM_REQUEST":
+    case "model_request":
+      return [{ stream: "stdout", text: `\n[turn ${String(event.turn)}] asking the model` }];
+    case "model_error":
       return [
         {
-          stream: "stdout",
-          text: `\n[step] Asking the model (messages=${String(payload.messageCount)}, attempt=${String(payload.attempt)})`,
+          stream: "stderr",
+          text: `[model] ${event.message}${event.willRetry ? " (retrying)" : ""}`,
         },
       ];
-    case "TOOL_CALL":
+    case "tool":
       return [
         {
-          stream: "stdout",
-          text: `[tool] ${String(payload.name)} (${String(payload.permission)})`,
+          stream: event.isError ? "stderr" : "stdout",
+          text: `[tool] ${event.call.name} -> ${event.isError ? "error" : "ok"}`,
         },
-      ];
-    case "TOOL_RESULT": {
-      const lines: TerminalLine[] = [
         {
-          stream: payload.ok === true ? "stdout" : "stderr",
-          text: `[tool] ${String(payload.name)} -> ${payload.ok === true ? "ok" : "failed"}`,
+          stream: event.isError ? "stderr" : "stdout",
+          text: indent(event.content.slice(0, 4_000)),
         },
       ];
-      if (payload.name === "runCommand" && payload.ok === true && isRecord(payload.output)) {
-        lines.push({ stream: "stdout", text: `       exit=${String(payload.output.exitCode)}` });
-        if (typeof payload.output.stdout === "string" && payload.output.stdout.trim().length > 0) {
-          lines.push({
-            stream: "stdout",
-            text: indent(payload.output.stdout.trim().slice(0, 4_000)),
-          });
-        }
-        if (typeof payload.output.stderr === "string" && payload.output.stderr.trim().length > 0) {
-          lines.push({
-            stream: "stderr",
-            text: indent(payload.output.stderr.trim().slice(0, 4_000)),
-          });
-        }
-      }
-      return lines;
-    }
-    case "RUN_FAILED":
-    case "RUN_CANCELLED":
-      return [{ stream: "stderr", text: `[run] ${event.type.toLowerCase()}` }];
     default:
       return [];
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function indent(value: string): string {
   return value
+    .trim()
     .split(/\r?\n/u)
     .map((line) => `       ${line}`)
     .join("\n");

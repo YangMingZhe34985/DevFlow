@@ -8,9 +8,9 @@ import type {
 } from "@devflow/github";
 import {
   assertCredentialFreeRepositoryUri,
+  ExecutionModeSchema,
   DevflowError,
   type AgentEvent,
-  type AgentPlan,
   type DevflowErrorShape,
   type NewAgentEvent,
   RunMetricsSchema,
@@ -27,8 +27,6 @@ import {
   PrismaClient,
   type Approval as PrismaApproval,
   type Artifact as PrismaArtifact,
-  type BenchmarkCaseExecution as PrismaBenchmarkCaseExecution,
-  type BenchmarkSuiteExecution as PrismaBenchmarkSuiteExecution,
   type Event as PrismaEvent,
   type GitHubPublication as PrismaGitHubPublication,
   type Repository as PrismaRepository,
@@ -42,11 +40,6 @@ import type {
   ApprovalStore,
   ArtifactRecord,
   ArtifactStore,
-  BenchmarkCaseExecutionRecord,
-  BenchmarkExecutionStore,
-  BenchmarkSuiteExecutionRecord,
-  BudgetLedgerRecord,
-  BudgetLedgerStore,
   CreateArtifactInput,
   CreateApprovalInput,
   CreateRepositoryInput,
@@ -59,7 +52,6 @@ import type {
   PersistedRunTransition,
   RepositoryRecord,
   RepositoryStore,
-  RepositoryIndexStore,
   ResolveApprovalInput,
   RunExecutionRecord,
   RunDetailRecord,
@@ -69,8 +61,6 @@ import type {
   TaskRecord,
   TaskStore,
   StepRecord,
-  StartBenchmarkCaseExecutionInput,
-  StartBenchmarkSuiteExecutionInput,
   ToolCallRecord,
   UpdateRepositoryInput,
   UpdateTaskInput,
@@ -82,41 +72,21 @@ type RunWithTaskAndRepository = Prisma.RunGetPayload<{
 }>;
 
 export class PrismaDatabaseAdapter implements DatabaseAdapter {
-  readonly budgetLedgers: BudgetLedgerStore;
-  readonly repositoryIndexes: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
   readonly approvals: ApprovalStore;
   readonly artifacts: ArtifactStore;
   readonly githubPublications: DatabaseGitHubPublicationStore;
-  readonly benchmarkExecutions: BenchmarkExecutionStore;
   readonly events: EventStore;
 
   constructor(readonly client: PrismaClient) {
-    this.budgetLedgers = new PrismaBudgetLedgerStore(client);
-    this.repositoryIndexes = {
-      get: async (scope, key) => {
-        const entry = await client.repositoryIndexEntry.findUnique({
-          where: { scope_key: { scope, key } },
-        });
-        return entry?.value;
-      },
-      publish: async (scope, key, value) => {
-        // Unique immutable keys fence stale builders; no update/upsert can overwrite a publication.
-        await client.repositoryIndexEntry.createMany({
-          data: [{ scope, key, value: JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue }],
-          skipDuplicates: true,
-        });
-      },
-    };
     this.repositories = new PrismaRepositoryStore(client);
     this.tasks = new PrismaTaskStore(client);
     this.runs = new PrismaRunStore(client);
     this.approvals = new PrismaApprovalStore(client);
     this.artifacts = new PrismaArtifactStore(client);
     this.githubPublications = new PrismaGitHubPublicationStore(client);
-    this.benchmarkExecutions = new PrismaBenchmarkExecutionStore(client);
     this.events = new PrismaEventWriter(client);
   }
 
@@ -136,90 +106,6 @@ export class PrismaDatabaseAdapter implements DatabaseAdapter {
   async ping(): Promise<void> {
     await this.client.$queryRaw`SELECT 1`;
   }
-}
-
-/** Whole-document CAS preserves unrelated Run metadata as well as ledger revisions. */
-class PrismaBudgetLedgerStore implements BudgetLedgerStore {
-  constructor(private readonly client: PrismaClient) {}
-
-  async get(runId: string): Promise<BudgetLedgerRecord | null> {
-    return await databaseCall(async () => {
-      const run = await this.client.run.findUnique({
-        where: { id: runId },
-        select: { metadata: true },
-      });
-      if (run === null) throw notFound("Run", runId);
-      return readBudgetLedgerMetadata(run.metadata).ledger;
-    });
-  }
-
-  async compareAndSwap(
-    runId: string,
-    expectedRevision: number | null,
-    value: unknown,
-  ): Promise<boolean> {
-    if (
-      expectedRevision !== null &&
-      (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0)
-    ) {
-      throw new DevflowError({
-        code: "VALIDATION_ERROR",
-        message: "Invalid budget ledger revision.",
-      });
-    }
-    return await databaseCall(async () => {
-      const run = await this.client.run.findUnique({
-        where: { id: runId },
-        select: { metadata: true },
-      });
-      if (run === null) throw notFound("Run", runId);
-      const { metadata, ledger } = readBudgetLedgerMetadata(run.metadata);
-      if ((ledger?.revision ?? null) !== expectedRevision) return false;
-      const changed = await this.client.run.updateMany({
-        where: {
-          id: runId,
-          metadata: { equals: run.metadata === null ? Prisma.AnyNull : run.metadata },
-        },
-        data: {
-          metadata: jsonInput({
-            ...metadata,
-            resourceBudgetLedger: {
-              revision: expectedRevision === null ? 0 : expectedRevision + 1,
-              value,
-            },
-          }),
-        },
-      });
-      return changed.count === 1;
-    });
-  }
-}
-
-function readBudgetLedgerMetadata(value: Prisma.JsonValue | null): {
-  metadata: Record<string, unknown>;
-  ledger: BudgetLedgerRecord | null;
-} {
-  if (value !== null && (typeof value !== "object" || Array.isArray(value))) {
-    throw new DevflowError({ code: "CONFLICT", message: "Run metadata is not a JSON object." });
-  }
-  const metadata = (value ?? {}) as Record<string, unknown>;
-  const entry = metadata.resourceBudgetLedger;
-  if (entry === undefined) return { metadata, ledger: null };
-  if (
-    entry === null ||
-    typeof entry !== "object" ||
-    Array.isArray(entry) ||
-    !("revision" in entry) ||
-    !Number.isSafeInteger(entry.revision) ||
-    (entry.revision as number) < 0 ||
-    !("value" in entry)
-  ) {
-    throw new DevflowError({
-      code: "CONFLICT",
-      message: "Persisted resource budget ledger is corrupt.",
-    });
-  }
-  return { metadata, ledger: { revision: entry.revision as number, value: entry.value } };
 }
 
 class PrismaRepositoryStore implements RepositoryStore {
@@ -369,6 +255,9 @@ class PrismaRunStore implements RunRepository {
         const created = await this.client.run.create({
           data: {
             taskId: input.taskId,
+            metadata: {
+              executionMode: ExecutionModeSchema.parse(input.executionMode ?? "autonomous"),
+            },
             ...(input.idempotencyKey === undefined ? {} : { idempotencyKey: input.idempotencyKey }),
             ...(input.modelProvider === undefined ? {} : { modelProvider: input.modelProvider }),
             ...(input.modelName === undefined ? {} : { modelName: input.modelName }),
@@ -568,13 +457,18 @@ class PrismaRunStore implements RunRepository {
   }
 
   async renewLease(runId: string, owner: string, leaseMs: number): Promise<boolean> {
-    return await databaseCall(async () => {
-      const changed = await this.client.run.updateMany({
-        where: { id: runId, status: "RUNNING", executionOwner: owner },
-        data: { leaseExpiresAt: new Date(Date.now() + leaseMs) },
-      });
-      return changed.count === 1;
-    });
+    return await databaseCall(async () =>
+      this.client.$transaction(async (transaction) => {
+        // Evaluate expiry at the database, after any row-lock wait. An expired
+        // worker must claim a new execution identity; it cannot revive itself.
+        if (!(await lockLiveRunOwner(transaction, runId, owner))) return false;
+        const changed = await transaction.$executeRaw`
+        UPDATE "Run" SET "leaseExpiresAt" = clock_timestamp() + (${leaseMs} * interval '1 millisecond')
+        WHERE "id" = ${runId} AND "status" = 'RUNNING' AND "executionOwner" = ${owner}
+          AND "leaseExpiresAt" > clock_timestamp()`;
+        return changed === 1;
+      }),
+    );
   }
 
   async isCancellationRequested(runId: string): Promise<boolean> {
@@ -598,6 +492,7 @@ class PrismaRunStore implements RunRepository {
               message: "Run result ID does not match the claimed run.",
             });
           }
+          await assertLiveRunOwner(transaction, runId, owner);
           const current = await transaction.run.findFirst({
             where: { id: runId, status: "RUNNING", executionOwner: owner },
           });
@@ -659,57 +554,6 @@ class PrismaRunStore implements RunRepository {
     );
   }
 
-  async pauseForApproval(
-    runId: string,
-    owner: string,
-    plan: AgentPlan,
-  ): Promise<{ run: RunRecord; approval: ApprovalRecord }> {
-    return await databaseCall(
-      async () =>
-        await this.client.$transaction(async (transaction) => {
-          const changed = await transaction.run.updateMany({
-            where: {
-              id: runId,
-              status: "RUNNING",
-              executionOwner: owner,
-              cancelRequestedAt: null,
-            },
-            data: {
-              status: "WAITING_APPROVAL",
-              currentStage: "WAITING_APPROVAL",
-              executionOwner: null,
-              leaseExpiresAt: null,
-            },
-          });
-          if (changed.count !== 1) {
-            throw conflict("Run execution lease is no longer owned or cancellation was requested.");
-          }
-          await transaction.artifact.create({
-            data: {
-              runId,
-              kind: "PLAN",
-              name: "plan.json",
-              mimeType: "application/json",
-              content: JSON.stringify(plan, null, 2),
-              metadata: jsonInput({ summary: plan.summary, stepCount: plan.steps.length }),
-            },
-          });
-          const approval = await transaction.approval.create({
-            data: { runId, kind: "PLAN", request: jsonInput({ plan }) },
-          });
-          await appendEvent(transaction, {
-            runId,
-            type: "APPROVAL_REQUIRED",
-            occurredAt: new Date().toISOString(),
-            payload: eventJson({ approvalId: approval.id, kind: "PLAN", plan }),
-          });
-          const run = await transaction.run.findUnique({ where: { id: runId } });
-          if (run === null) throw notFound("Run", runId);
-          return { run: mapRun(run), approval: mapApproval(approval) };
-        }),
-    );
-  }
-
   async pauseForGitHubApproval(
     runId: string,
     owner: string,
@@ -721,6 +565,7 @@ class PrismaRunStore implements RunRepository {
     return await databaseCall(
       async () =>
         await this.client.$transaction(async (transaction) => {
+          await assertLiveRunOwner(transaction, runId, owner);
           const changed = await transaction.run.updateMany({
             where: {
               id: runId,
@@ -1017,18 +862,14 @@ class PrismaApprovalStore implements ApprovalStore {
           if (current.status !== "PENDING") throw conflict("Approval has already been resolved.");
           assertSafeGitHubApprovalResolution(current.kind, input);
 
+          // Only GitHub delivery approvals resume a Run. Plan approvals belong to the retired
+          // workflow mode; resolving a leftover one just records the decision.
           const workflowKind =
-            current.kind === "PLAN" && isWorkflowPlanRequest(current.request)
-              ? "PLAN"
-              : current.kind === "GITHUB_PUSH" || current.kind === "GITHUB_PULL_REQUEST"
-                ? current.kind
-                : undefined;
+            current.kind === "GITHUB_PUSH" || current.kind === "GITHUB_PULL_REQUEST"
+              ? current.kind
+              : undefined;
           const expectedStage =
-            workflowKind === "PLAN"
-              ? "WAITING_APPROVAL"
-              : workflowKind === "GITHUB_PUSH"
-                ? "WAITING_PUSH_APPROVAL"
-                : "WAITING_PR_APPROVAL";
+            workflowKind === "GITHUB_PUSH" ? "WAITING_PUSH_APPROVAL" : "WAITING_PR_APPROVAL";
           if (
             workflowKind !== undefined &&
             (current.run.status !== "WAITING_APPROVAL" ||
@@ -1050,16 +891,8 @@ class PrismaApprovalStore implements ApprovalStore {
             return { approval: mapApproval(approval), shouldEnqueue: false };
           }
 
-          const resume =
-            input.status === "APPROVED" || (workflowKind === "PLAN" && input.status === "REJECTED");
-          const resumeStage =
-            workflowKind === "PLAN"
-              ? input.status === "APPROVED"
-                ? "EXECUTE"
-                : "GENERATE_PLAN"
-              : workflowKind === "GITHUB_PUSH"
-                ? "PUSH"
-                : "CREATE_PR";
+          const resume = input.status === "APPROVED";
+          const resumeStage = workflowKind === "GITHUB_PUSH" ? "PUSH" : "CREATE_PR";
           const decisionAt = new Date();
           const terminalMessage =
             input.status === "CANCELLED"
@@ -1085,23 +918,15 @@ class PrismaApprovalStore implements ApprovalStore {
           });
           if (changed.count !== 1) throw conflict("Run approval state changed concurrently.");
           const decisionEvent =
-            workflowKind === "PLAN"
-              ? input.status === "APPROVED"
-                ? "PLAN_APPROVED"
-                : input.status === "REJECTED"
-                  ? "PLAN_REJECTED"
-                  : "RUN_CANCELLED"
+            input.status === "CANCELLED"
+              ? "RUN_CANCELLED"
               : workflowKind === "GITHUB_PUSH"
                 ? input.status === "APPROVED"
                   ? "PUSH_APPROVED"
-                  : input.status === "REJECTED"
-                    ? "PUSH_REJECTED"
-                    : "RUN_CANCELLED"
+                  : "PUSH_REJECTED"
                 : input.status === "APPROVED"
                   ? "PR_APPROVED"
-                  : input.status === "REJECTED"
-                    ? "PR_REJECTED"
-                    : "RUN_CANCELLED";
+                  : "PR_REJECTED";
           await appendEvent(transaction, {
             runId: current.runId,
             type: decisionEvent,
@@ -1164,9 +989,9 @@ class PrismaArtifactStore implements ArtifactStore {
         message: "Artifact requires content or uri.",
       });
     }
-    return await databaseCall(async () =>
+    const create = async (client: Pick<PrismaClient, "artifact">) =>
       mapArtifact(
-        await this.client.artifact.create({
+        await client.artifact.create({
           data: {
             runId: input.runId,
             ...(input.stepId === undefined ? {} : { stepId: input.stepId }),
@@ -1180,8 +1005,8 @@ class PrismaArtifactStore implements ArtifactStore {
             ...(input.metadata === undefined ? {} : { metadata: jsonInput(input.metadata) }),
           },
         }),
-      ),
-    );
+      );
+    return databaseCall(() => create(this.client));
   }
 
   async list(runId: string): Promise<readonly ArtifactRecord[]> {
@@ -1317,308 +1142,6 @@ class PrismaGitHubPublicationStore implements DatabaseGitHubPublicationStore {
   }
 }
 
-class PrismaBenchmarkExecutionStore implements BenchmarkExecutionStore {
-  constructor(private readonly client: PrismaClient) {}
-
-  async startSuite(
-    input: StartBenchmarkSuiteExecutionInput,
-  ): Promise<BenchmarkSuiteExecutionRecord> {
-    assertCredentialFreeSourceUris(input.profile);
-    return await databaseCall(async () => {
-      const current = await this.client.benchmarkSuiteExecution.findUnique({
-        where: { id: input.id },
-      });
-      if (current !== null) {
-        if (
-          current.suiteId !== input.suiteId ||
-          current.suiteVersion !== input.suiteVersion ||
-          current.pricingVersion !== input.pricingVersion
-        ) {
-          throw conflict("Benchmark suite execution id is already used by another definition.");
-        }
-        return mapBenchmarkSuiteExecution(current);
-      }
-      return mapBenchmarkSuiteExecution(
-        await this.client.benchmarkSuiteExecution.create({
-          data: {
-            id: input.id,
-            suiteId: input.suiteId,
-            suiteVersion: input.suiteVersion,
-            profile: jsonInput(input.profile),
-            pricingVersion: input.pricingVersion,
-          },
-        }),
-      );
-    });
-  }
-
-  async startCase(input: StartBenchmarkCaseExecutionInput): Promise<BenchmarkCaseExecutionRecord> {
-    assertCredentialFreeSourceUris(input.definition);
-    assertCredentialFreeSourceUris(input.profile);
-    return await databaseCall(async () => {
-      const current = await this.client.benchmarkCaseExecution.findUnique({
-        where: { id: input.id },
-      });
-      if (current !== null) {
-        if (
-          current.suiteExecutionId !== (input.suiteExecutionId ?? null) ||
-          current.suiteId !== input.suiteId ||
-          current.suiteVersion !== input.suiteVersion ||
-          current.caseId !== input.caseId ||
-          current.caseVersion !== input.caseVersion ||
-          current.definitionDigest !== input.definitionDigest
-        ) {
-          throw conflict("Benchmark case execution id is already used by another definition.");
-        }
-        return mapBenchmarkCaseExecution(current);
-      }
-      return mapBenchmarkCaseExecution(
-        await this.client.benchmarkCaseExecution.create({
-          data: {
-            id: input.id,
-            ...(input.suiteExecutionId === undefined
-              ? {}
-              : { suiteExecutionId: input.suiteExecutionId }),
-            suiteId: input.suiteId,
-            suiteVersion: input.suiteVersion,
-            caseId: input.caseId,
-            caseVersion: input.caseVersion,
-            definitionDigest: input.definitionDigest,
-            definition: jsonInput(input.definition),
-            profile: jsonInput(input.profile),
-          },
-        }),
-      );
-    });
-  }
-
-  async attachRun(executionId: string, runId: string): Promise<BenchmarkCaseExecutionRecord> {
-    return await databaseCall(async () => {
-      const current = await this.requireCase(executionId);
-      if (current.runId !== null && current.runId !== runId) {
-        throw conflict("Benchmark case execution is already attached to another Run.");
-      }
-      if (isTerminalBenchmarkStatus(current.status)) return mapBenchmarkCaseExecution(current);
-      return mapBenchmarkCaseExecution(
-        await this.client.benchmarkCaseExecution.update({
-          where: { id: executionId },
-          data: { runId, status: "RUNNING" },
-        }),
-      );
-    });
-  }
-
-  async markEvaluating(executionId: string): Promise<BenchmarkCaseExecutionRecord> {
-    return await databaseCall(async () => {
-      const current = await this.requireCase(executionId);
-      if (current.status === "EVALUATING") return mapBenchmarkCaseExecution(current);
-      if (current.status !== "RUNNING") {
-        throw conflict(`Benchmark case cannot enter evaluation from ${current.status}.`);
-      }
-      return mapBenchmarkCaseExecution(
-        await this.client.benchmarkCaseExecution.update({
-          where: { id: executionId },
-          data: { status: "EVALUATING" },
-        }),
-      );
-    });
-  }
-
-  async recordObservation(
-    executionId: string,
-    observation: unknown,
-  ): Promise<BenchmarkCaseExecutionRecord> {
-    assertCredentialFreeSourceUris(observation);
-    return await databaseCall(async () => {
-      const current = await this.requireCase(executionId);
-      if (isTerminalBenchmarkStatus(current.status)) {
-        throw conflict("A terminal benchmark case observation cannot be replaced.");
-      }
-      return mapBenchmarkCaseExecution(
-        await this.client.benchmarkCaseExecution.update({
-          where: { id: executionId },
-          data: { observation: jsonInput(observation) },
-        }),
-      );
-    });
-  }
-
-  async completeCase(
-    executionId: string,
-    input: { result: unknown; metrics: unknown; provenance: unknown; succeeded: boolean },
-  ): Promise<BenchmarkCaseExecutionRecord> {
-    assertCredentialFreeSourceUris(input.result);
-    assertCredentialFreeSourceUris(input.metrics);
-    assertCredentialFreeSourceUris(input.provenance);
-    return await databaseCall(async () => {
-      const current = await this.requireCase(executionId);
-      if (isTerminalBenchmarkStatus(current.status)) {
-        if (jsonEqual(current.result, input.result)) return mapBenchmarkCaseExecution(current);
-        throw conflict("A terminal benchmark case result cannot be replaced.");
-      }
-      return mapBenchmarkCaseExecution(
-        await this.client.benchmarkCaseExecution.update({
-          where: { id: executionId },
-          data: {
-            status: input.succeeded ? "SUCCEEDED" : "FAILED",
-            result: jsonInput(input.result),
-            metrics: jsonInput(input.metrics),
-            provenance: jsonInput(input.provenance),
-            finishedAt: new Date(),
-          },
-        }),
-      );
-    });
-  }
-
-  async failCase(executionId: string, failure: unknown): Promise<BenchmarkCaseExecutionRecord> {
-    assertCredentialFreeSourceUris(failure);
-    return await databaseCall(async () => {
-      const current = await this.requireCase(executionId);
-      if (isTerminalBenchmarkStatus(current.status)) return mapBenchmarkCaseExecution(current);
-      return mapBenchmarkCaseExecution(
-        await this.client.benchmarkCaseExecution.update({
-          where: { id: executionId },
-          data: { status: "FAILED", failure: jsonInput(failure), finishedAt: new Date() },
-        }),
-      );
-    });
-  }
-
-  async completeSuite(
-    suiteExecutionId: string,
-    input: { result: unknown; metrics: unknown; succeeded: boolean },
-  ): Promise<BenchmarkSuiteExecutionRecord> {
-    assertCredentialFreeSourceUris(input.result);
-    assertCredentialFreeSourceUris(input.metrics);
-    return await databaseCall(async () => {
-      const current = await this.requireSuite(suiteExecutionId);
-      if (isTerminalBenchmarkStatus(current.status)) {
-        if (jsonEqual(current.result, input.result)) return mapBenchmarkSuiteExecution(current);
-        throw conflict("A terminal benchmark suite result cannot be replaced.");
-      }
-      return mapBenchmarkSuiteExecution(
-        await this.client.benchmarkSuiteExecution.update({
-          where: { id: suiteExecutionId },
-          data: {
-            status: input.succeeded ? "SUCCEEDED" : "FAILED",
-            result: jsonInput(input.result),
-            metrics: jsonInput(input.metrics),
-            finishedAt: new Date(),
-          },
-        }),
-      );
-    });
-  }
-
-  async failSuite(
-    suiteExecutionId: string,
-    failure: unknown,
-  ): Promise<BenchmarkSuiteExecutionRecord> {
-    assertCredentialFreeSourceUris(failure);
-    return await databaseCall(async () => {
-      const current = await this.requireSuite(suiteExecutionId);
-      if (isTerminalBenchmarkStatus(current.status)) return mapBenchmarkSuiteExecution(current);
-      return mapBenchmarkSuiteExecution(
-        await this.client.benchmarkSuiteExecution.update({
-          where: { id: suiteExecutionId },
-          data: { status: "FAILED", failure: jsonInput(failure), finishedAt: new Date() },
-        }),
-      );
-    });
-  }
-
-  async findCase(executionId: string): Promise<BenchmarkCaseExecutionRecord | null> {
-    return await databaseCall(async () => {
-      const record = await this.client.benchmarkCaseExecution.findUnique({
-        where: { id: executionId },
-      });
-      return record === null ? null : mapBenchmarkCaseExecution(record);
-    });
-  }
-
-  async findCaseByRunId(runId: string): Promise<BenchmarkCaseExecutionRecord | null> {
-    return await databaseCall(async () => {
-      const record = await this.client.benchmarkCaseExecution.findUnique({ where: { runId } });
-      return record === null ? null : mapBenchmarkCaseExecution(record);
-    });
-  }
-
-  async findSuite(suiteExecutionId: string): Promise<BenchmarkSuiteExecutionRecord | null> {
-    return await databaseCall(async () => {
-      const record = await this.client.benchmarkSuiteExecution.findUnique({
-        where: { id: suiteExecutionId },
-      });
-      return record === null ? null : mapBenchmarkSuiteExecution(record);
-    });
-  }
-
-  async listCases(suiteId: string): Promise<readonly BenchmarkCaseExecutionRecord[]> {
-    return await databaseCall(async () =>
-      (
-        await this.client.benchmarkCaseExecution.findMany({
-          where: { suiteId },
-          orderBy: [{ startedAt: "asc" }, { id: "asc" }],
-        })
-      ).map(mapBenchmarkCaseExecution),
-    );
-  }
-
-  async listUnfinished(limit = 100): Promise<readonly BenchmarkCaseExecutionRecord[]> {
-    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
-      throw new DevflowError({
-        code: "VALIDATION_ERROR",
-        message: "Benchmark recovery limit must be between 1 and 1000.",
-      });
-    }
-    return await databaseCall(async () =>
-      (
-        await this.client.benchmarkCaseExecution.findMany({
-          where: { status: { in: ["QUEUED", "RUNNING", "EVALUATING"] } },
-          orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
-          take: limit,
-        })
-      ).map(mapBenchmarkCaseExecution),
-    );
-  }
-
-  async recoverInterrupted(staleBefore: Date): Promise<number> {
-    return await databaseCall(async () => {
-      const recovered = await this.client.benchmarkCaseExecution.updateMany({
-        where: {
-          status: { in: ["QUEUED", "RUNNING", "EVALUATING"] },
-          updatedAt: { lt: staleBefore },
-        },
-        data: {
-          status: "INTERRUPTED",
-          failure: {
-            code: "WORKER_INTERRUPTED",
-            message: "Benchmark worker stopped unexpectedly.",
-          },
-          finishedAt: new Date(),
-        },
-      });
-      return recovered.count;
-    });
-  }
-
-  private async requireCase(executionId: string): Promise<PrismaBenchmarkCaseExecution> {
-    const record = await this.client.benchmarkCaseExecution.findUnique({
-      where: { id: executionId },
-    });
-    if (record === null) throw notFound("Benchmark case execution", executionId);
-    return record;
-  }
-
-  private async requireSuite(suiteExecutionId: string): Promise<PrismaBenchmarkSuiteExecution> {
-    const record = await this.client.benchmarkSuiteExecution.findUnique({
-      where: { id: suiteExecutionId },
-    });
-    if (record === null) throw notFound("Benchmark suite execution", suiteExecutionId);
-    return record;
-  }
-}
-
 class PrismaEventWriter implements EventStore {
   constructor(private readonly client: PrismaClient) {}
 
@@ -1643,9 +1166,9 @@ class PrismaEventWriter implements EventStore {
   async append(event: NewAgentEvent): Promise<AgentEvent> {
     return await databaseCall(
       async () =>
-        await this.client.$transaction(
-          async (transaction) => await appendEvent(transaction, event),
-        ),
+        await this.client.$transaction(async (transaction) => {
+          return appendEvent(transaction, event);
+        }),
     );
   }
 }
@@ -1854,6 +1377,7 @@ function mapTask(task: PrismaTask): TaskRecord {
 function mapRun(run: PrismaRun): RunRecord {
   const result = resultFromRun(run);
   return {
+    executionMode: executionModeFromMetadata(run.metadata),
     id: run.id,
     taskId: run.taskId,
     ...(run.idempotencyKey === null ? {} : { idempotencyKey: run.idempotencyKey }),
@@ -1984,53 +1508,6 @@ function mapGitHubPublication(publication: PrismaGitHubPublication): GitHubPubli
   };
 }
 
-function mapBenchmarkSuiteExecution(
-  execution: PrismaBenchmarkSuiteExecution,
-): BenchmarkSuiteExecutionRecord {
-  return {
-    id: execution.id,
-    suiteId: execution.suiteId,
-    suiteVersion: execution.suiteVersion,
-    status: execution.status,
-    profile: execution.profile,
-    pricingVersion: execution.pricingVersion,
-    ...(execution.metrics === null ? {} : { metrics: execution.metrics }),
-    ...(execution.result === null ? {} : { result: execution.result }),
-    ...(execution.failure === null ? {} : { failure: execution.failure }),
-    startedAt: execution.startedAt.toISOString(),
-    ...(execution.finishedAt === null ? {} : { finishedAt: execution.finishedAt.toISOString() }),
-    updatedAt: execution.updatedAt.toISOString(),
-  };
-}
-
-function mapBenchmarkCaseExecution(
-  execution: PrismaBenchmarkCaseExecution,
-): BenchmarkCaseExecutionRecord {
-  return {
-    id: execution.id,
-    ...(execution.suiteExecutionId === null
-      ? {}
-      : { suiteExecutionId: execution.suiteExecutionId }),
-    suiteId: execution.suiteId,
-    suiteVersion: execution.suiteVersion,
-    caseId: execution.caseId,
-    caseVersion: execution.caseVersion,
-    status: execution.status,
-    ...(execution.runId === null ? {} : { runId: execution.runId }),
-    definitionDigest: execution.definitionDigest,
-    definition: execution.definition,
-    profile: execution.profile,
-    ...(execution.observation === null ? {} : { observation: execution.observation }),
-    ...(execution.metrics === null ? {} : { metrics: execution.metrics }),
-    ...(execution.provenance === null ? {} : { provenance: execution.provenance }),
-    ...(execution.result === null ? {} : { result: execution.result }),
-    ...(execution.failure === null ? {} : { failure: execution.failure }),
-    startedAt: execution.startedAt.toISOString(),
-    ...(execution.finishedAt === null ? {} : { finishedAt: execution.finishedAt.toISOString() }),
-    updatedAt: execution.updatedAt.toISOString(),
-  };
-}
-
 function resultFromRun(run: PrismaRun): RunResult | undefined {
   if (!isTerminalStatus(run.status)) return undefined;
   const error =
@@ -2133,6 +1610,9 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
     throw conflict("Idempotency key is already associated with another task.");
   }
   const mismatches = [
+    executionModeFromMetadata(existing.metadata) !== (input.executionMode ?? "autonomous")
+      ? "executionMode"
+      : undefined,
     existing.modelProvider !== (input.modelProvider ?? null) ? "modelProvider" : undefined,
     existing.modelName !== (input.modelName ?? null) ? "modelName" : undefined,
     existing.maxSteps !== (input.maxSteps ?? 25) ? "maxSteps" : undefined,
@@ -2146,6 +1626,12 @@ function assertSameIdempotentRun(existing: PrismaRun, input: CreateRunInput): vo
   }
 }
 
+function executionModeFromMetadata(metadata: unknown) {
+  const parsed = ExecutionModeSchema.safeParse(recordValue(metadata).executionMode ?? "workflow");
+  if (!parsed.success) throw conflict("Invalid frozen execution mode.");
+  return parsed.data;
+}
+
 function canTransitionTask(current: TaskStatus, next: TaskStatus): boolean {
   if (current === next) return true;
   if (current === "OPEN") return ["COMPLETED", "CANCELLED", "ARCHIVED"].includes(next);
@@ -2154,14 +1640,6 @@ function canTransitionTask(current: TaskStatus, next: TaskStatus): boolean {
 
 function isTerminalStatus(status: RunStatus): status is RunResult["status"] {
   return ["SUCCEEDED", "FAILED", "CANCELLED", "TIMED_OUT"].includes(status);
-}
-
-function isTerminalBenchmarkStatus(status: BenchmarkCaseExecutionRecord["status"]): boolean {
-  return status === "SUCCEEDED" || status === "FAILED" || status === "INTERRUPTED";
-}
-
-function jsonEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 function jsonInput(value: unknown): Prisma.InputJsonValue {
@@ -2193,10 +1671,6 @@ function assertSafeGitHubApprovalResolution(
     ...(input.comment === undefined ? {} : { comment: input.comment }),
     ...(input.resolution === undefined ? {} : { resolution: input.resolution }),
   });
-}
-
-function isWorkflowPlanRequest(value: unknown): boolean {
-  return typeof value === "object" && value !== null && "plan" in value;
 }
 
 function assertSamePublication(
@@ -2254,25 +1728,6 @@ function assertNoCredentialMaterial(value: unknown): void {
   visit(value);
 }
 
-function assertCredentialFreeSourceUris(value: unknown): void {
-  const seen = new Set<unknown>();
-  const visit = (candidate: unknown): void => {
-    if (typeof candidate !== "object" || candidate === null || seen.has(candidate)) return;
-    seen.add(candidate);
-    if (Array.isArray(candidate)) {
-      for (const item of candidate) visit(item);
-      return;
-    }
-    for (const [key, nested] of Object.entries(candidate)) {
-      if (key === "sourceUri" && typeof nested === "string") {
-        assertCredentialFreeRepositoryUri(nested);
-      }
-      visit(nested);
-    }
-  };
-  visit(value);
-}
-
 function recordValue(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -2300,6 +1755,31 @@ function errorShape(error: unknown): DevflowErrorShape {
 
 function notFound(entity: string, id: string): DevflowError {
   return new DevflowError({ code: "NOT_FOUND", message: entity + " '" + id + "' was not found." });
+}
+
+async function assertLiveRunOwner(
+  transaction: TransactionClient,
+  runId: string,
+  owner: string,
+): Promise<void> {
+  if (!(await lockLiveRunOwner(transaction, runId, owner)))
+    throw conflict("Run execution lease is expired or no longer owned.");
+}
+
+async function lockLiveRunOwner(
+  transaction: TransactionClient,
+  runId: string,
+  owner: string,
+): Promise<boolean> {
+  // SELECT/UPDATE predicates can be evaluated before waiting for a row lock.
+  // Acquire the owner row first, then check the database clock in a new statement.
+  const locked = await transaction.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Run" WHERE "id" = ${runId} AND "status" = 'RUNNING'
+      AND "executionOwner" = ${owner} FOR UPDATE`;
+  if (locked.length !== 1) return false;
+  const live = await transaction.$queryRaw<Array<{ id: string }>>`
+    SELECT "id" FROM "Run" WHERE "id" = ${runId} AND "leaseExpiresAt" > clock_timestamp()`;
+  return live.length === 1;
 }
 
 function conflict(message: string): DevflowError {

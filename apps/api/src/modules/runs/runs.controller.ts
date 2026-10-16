@@ -32,6 +32,8 @@ import { DATABASE, RUN_QUEUE } from "../../infrastructure/tokens.js";
 import { RunEventStreamService } from "./run-event-stream.service.js";
 
 const CreateRunSchema = z.strictObject({
+  // workflow/team/single were retired in v4; their persisted Runs stay readable.
+  executionMode: z.literal("autonomous").optional(),
   taskId: IdSchema,
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
   modelProvider: z.string().trim().min(1).max(100).optional(),
@@ -81,6 +83,15 @@ export class RunsController {
         : undefined;
     const persisted = await this.database.runs.create({
       ...input,
+      maxSteps:
+        input.maxSteps ??
+        existing?.maxSteps ??
+        z.coerce
+          .number()
+          .int()
+          .min(1)
+          .max(200)
+          .parse(process.env.DEVFLOW_MAX_STEPS ?? 25),
       ...(initialArtifact === undefined ? {} : { initialArtifact }),
     });
     if (persisted.run.status === "QUEUED") {

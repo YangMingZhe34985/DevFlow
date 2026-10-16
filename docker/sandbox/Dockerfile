@@ -13,6 +13,6 @@ RUN chown devflow:devflow /workspace
 
 USER devflow
 
-# The future sandbox manager creates one container per Run, copies/clones a
-# repository into /workspace and invokes structured commands with docker exec.
+# The sandbox manager uses this image for isolated workflow and autonomous Runs,
+# copies/clones repositories into /workspace and runs commands with docker exec.
 CMD ["sleep", "infinity"]

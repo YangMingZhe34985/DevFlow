@@ -1,5 +1,4 @@
 import type {
-  AgentPlan,
   AgentEvent,
   EventSink,
   NewAgentEvent,
@@ -100,6 +99,7 @@ export interface TaskStore {
 }
 
 export interface RunRecord {
+  executionMode?: "workflow" | "team" | "single" | "autonomous";
   id: RunId;
   taskId: string;
   idempotencyKey?: string;
@@ -128,6 +128,7 @@ export interface RunExecutionRecord extends RunRecord {
 }
 
 export interface CreateRunInput {
+  executionMode?: "workflow" | "team" | "single" | "autonomous" | undefined;
   taskId: string;
   idempotencyKey?: string | undefined;
   modelProvider?: string | undefined;
@@ -171,11 +172,6 @@ export interface RunRepository {
   renewLease(runId: RunId, owner: string, leaseMs: number): Promise<boolean>;
   isCancellationRequested(runId: RunId): Promise<boolean>;
   complete(runId: RunId, owner: string, result: RunResult): Promise<RunRecord>;
-  pauseForApproval(
-    runId: RunId,
-    owner: string,
-    plan: AgentPlan,
-  ): Promise<{ run: RunRecord; approval: ApprovalRecord }>;
   pauseForGitHubApproval(
     runId: RunId,
     owner: string,
@@ -311,111 +307,11 @@ export interface ArtifactStore {
   list(runId: RunId): Promise<readonly ArtifactRecord[]>;
 }
 
-/** A run-scoped, compare-and-swap JSON record. The scheduler owns its schema. */
-export interface BudgetLedgerRecord {
-  revision: number;
-  value: unknown;
-}
-
-export interface BudgetLedgerStore {
-  get(runId: RunId): Promise<BudgetLedgerRecord | null>;
-  /** null creates revision 0; an existing revision may only advance by one. */
-  compareAndSwap(runId: RunId, expectedRevision: number | null, value: unknown): Promise<boolean>;
-}
-
 export interface DatabaseGitHubPublicationStore extends GitHubPublicationStore {
   initialize(
     runId: RunId,
     input: InitializeGitHubPublicationInput,
   ): Promise<GitHubPublicationRecord>;
-}
-
-export type BenchmarkExecutionStatus =
-  "QUEUED" | "RUNNING" | "EVALUATING" | "SUCCEEDED" | "FAILED" | "INTERRUPTED";
-
-export interface BenchmarkSuiteExecutionRecord {
-  id: string;
-  suiteId: string;
-  suiteVersion: string;
-  status: BenchmarkExecutionStatus;
-  profile: unknown;
-  pricingVersion: string;
-  metrics?: unknown;
-  result?: unknown;
-  failure?: unknown;
-  startedAt: string;
-  finishedAt?: string;
-  updatedAt: string;
-}
-
-export interface BenchmarkCaseExecutionRecord {
-  id: string;
-  suiteExecutionId?: string;
-  suiteId: string;
-  suiteVersion: string;
-  caseId: string;
-  caseVersion: string;
-  status: BenchmarkExecutionStatus;
-  runId?: RunId;
-  definitionDigest: string;
-  definition: unknown;
-  profile: unknown;
-  observation?: unknown;
-  metrics?: unknown;
-  provenance?: unknown;
-  result?: unknown;
-  failure?: unknown;
-  startedAt: string;
-  finishedAt?: string;
-  updatedAt: string;
-}
-
-export interface StartBenchmarkSuiteExecutionInput {
-  id: string;
-  suiteId: string;
-  suiteVersion: string;
-  profile: unknown;
-  pricingVersion: string;
-}
-
-export interface StartBenchmarkCaseExecutionInput {
-  id: string;
-  suiteExecutionId?: string;
-  suiteId: string;
-  suiteVersion: string;
-  caseId: string;
-  caseVersion: string;
-  definitionDigest: string;
-  definition: unknown;
-  profile: unknown;
-}
-
-/** Durable state for production benchmark execution and crash recovery. */
-export interface BenchmarkExecutionStore {
-  startSuite(input: StartBenchmarkSuiteExecutionInput): Promise<BenchmarkSuiteExecutionRecord>;
-  startCase(input: StartBenchmarkCaseExecutionInput): Promise<BenchmarkCaseExecutionRecord>;
-  attachRun(executionId: string, runId: RunId): Promise<BenchmarkCaseExecutionRecord>;
-  markEvaluating(executionId: string): Promise<BenchmarkCaseExecutionRecord>;
-  recordObservation(
-    executionId: string,
-    observation: unknown,
-  ): Promise<BenchmarkCaseExecutionRecord>;
-  completeCase(
-    executionId: string,
-    input: { result: unknown; metrics: unknown; provenance: unknown; succeeded: boolean },
-  ): Promise<BenchmarkCaseExecutionRecord>;
-  failCase(executionId: string, failure: unknown): Promise<BenchmarkCaseExecutionRecord>;
-  completeSuite(
-    suiteExecutionId: string,
-    input: { result: unknown; metrics: unknown; succeeded: boolean },
-  ): Promise<BenchmarkSuiteExecutionRecord>;
-  failSuite(suiteExecutionId: string, failure: unknown): Promise<BenchmarkSuiteExecutionRecord>;
-  findCase(executionId: string): Promise<BenchmarkCaseExecutionRecord | null>;
-  findCaseByRunId(runId: RunId): Promise<BenchmarkCaseExecutionRecord | null>;
-  findSuite(suiteExecutionId: string): Promise<BenchmarkSuiteExecutionRecord | null>;
-  listCases(suiteId: string): Promise<readonly BenchmarkCaseExecutionRecord[]>;
-  listUnfinished(limit?: number): Promise<readonly BenchmarkCaseExecutionRecord[]>;
-  recoverInterrupted(staleBefore: Date): Promise<number>;
 }
 
 export interface RunDetailRecord {
@@ -431,23 +327,13 @@ export interface RunDetailRecord {
 }
 
 export interface DatabaseAdapter extends DatabaseLifecycle {
-  /** Required by the resource scheduler; optional only for legacy adapters. */
-  readonly budgetLedgers?: BudgetLedgerStore;
-  /** Immutable, scope-bound localization entries. Optional for legacy/test adapters. */
-  readonly repositoryIndexes?: RepositoryIndexStore;
   readonly repositories: RepositoryStore;
   readonly tasks: TaskStore;
   readonly runs: RunRepository;
   readonly approvals: ApprovalStore;
   readonly artifacts: ArtifactStore;
   readonly githubPublications: DatabaseGitHubPublicationStore;
-  readonly benchmarkExecutions: BenchmarkExecutionStore;
   readonly events: EventStore;
-}
-
-export interface RepositoryIndexStore {
-  get(scope: string, key: string): Promise<unknown | undefined>;
-  publish(scope: string, key: string, value: unknown): Promise<void>;
 }
 
 export interface AtomicEventWriter extends EventSink {

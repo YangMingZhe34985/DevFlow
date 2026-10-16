@@ -10,6 +10,96 @@ import { RunProcessor } from "../src/runs/run.processor.js";
 import { RunRecovery } from "../src/runs/run-recovery.js";
 
 describe("RunProcessor", () => {
+  it("renews ownership while a long host operation awaits IO and records the lease timing", async () => {
+    vi.useFakeTimers();
+    try {
+      const run = executionRecord();
+      let finish!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const runs = runRepository({ claim: vi.fn(async () => run) });
+      const timing = vi.fn(async () => undefined);
+      const processor = new RunProcessor(
+        runs,
+        {
+          execute: async (_run, signal) => {
+            await waiting;
+            expect(signal.aborted).toBe(false);
+            return succeeded(run.id);
+          },
+        },
+        { workerId: "worker", leaseMs: 1000, cancellationPollMs: 100, observeTiming: timing },
+      );
+      const active = processor.process(job(run.id));
+      await vi.advanceTimersByTimeAsync(5000);
+      finish();
+      await expect(active).resolves.toMatchObject({ status: "SUCCEEDED" });
+      expect(runs.renewLease).toHaveBeenCalledTimes(50);
+      expect(timing).toHaveBeenCalledWith(
+        run.id,
+        expect.objectContaining({
+          lease: expect.objectContaining({ renewals: 50, failedChecks: 0, deadlineReached: false }),
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(runs.renewLease).toHaveBeenCalledTimes(50);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fences an executor even if a hung heartbeat later succeeds after the lease deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const run = executionRecord();
+      let lateRenewal!: (value: boolean) => void;
+      const runs = runRepository({
+        claim: vi.fn(async () => run),
+        renewLease: vi.fn(
+          async () =>
+            await new Promise<boolean>((resolve) => {
+              lateRenewal = resolve;
+            }),
+        ),
+      });
+      const timing = vi.fn(async () => undefined);
+      const processor = new RunProcessor(
+        runs,
+        {
+          execute: async (_run, signal) => {
+            await new Promise<void>((resolve) =>
+              signal.addEventListener("abort", () => resolve(), { once: true }),
+            );
+            // A badly behaved executor returning success must not bypass the fence.
+            return succeeded(run.id);
+          },
+        },
+        { workerId: "worker", leaseMs: 1000, cancellationPollMs: 100, observeTiming: timing },
+      );
+      const active = processor.process(job(run.id));
+      await vi.advanceTimersByTimeAsync(1001);
+      await expect(active).resolves.toMatchObject({ status: "FAILED" });
+      expect(runs.complete).toHaveBeenCalledWith(
+        run.id,
+        expect.any(String),
+        expect.objectContaining({
+          error: expect.objectContaining({ code: "SANDBOX_LOST_OWNERSHIP" }),
+        }),
+      );
+      lateRenewal(true);
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(runs.renewLease).toHaveBeenCalledTimes(1);
+      expect(runs.complete).toHaveBeenCalledTimes(1);
+      expect(timing).toHaveBeenCalledWith(
+        run.id,
+        expect.objectContaining({ lease: expect.objectContaining({ deadlineReached: true }) }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("preserves persisted PLAN usage when EXECUTE infrastructure fails", async () => {
     const run = executionRecord();
     const runs = runRepository({ claim: vi.fn(async () => run) });
@@ -135,25 +225,6 @@ describe("RunProcessor", () => {
         }),
       }),
     );
-  });
-
-  it("parks a generated plan without completing the run", async () => {
-    const run = { ...executionRecord(), currentStage: "GENERATE_PLAN" as const };
-    const runs = runRepository({ claim: vi.fn(async () => run) });
-    const plan = {
-      summary: "Review the implementation plan",
-      steps: [{ id: "one", title: "Inspect", description: "Inspect tests first." }],
-    };
-    const executor: RunExecutionPort = {
-      execute: vi.fn(async () => ({ status: "WAITING_APPROVAL" as const, plan })),
-    };
-
-    await expect(createProcessor(runs, executor).process(job(run.id))).resolves.toMatchObject({
-      outcome: "COMPLETED",
-      status: "WAITING_APPROVAL",
-    });
-    expect(runs.pauseForApproval).toHaveBeenCalledWith(run.id, expect.any(String), plan);
-    expect(runs.complete).not.toHaveBeenCalled();
   });
 
   it("parks a GitHub side-effect approval without completing the run", async () => {
@@ -316,18 +387,6 @@ function runRepository(overrides: Partial<RunRepository> = {}): RunRepository {
       status: result.status,
       currentStage: result.status === "SUCCEEDED" ? "DONE" : "FAILED",
       result,
-    })),
-    pauseForApproval: vi.fn(async () => ({
-      run: { ...run, status: "WAITING_APPROVAL", currentStage: "WAITING_APPROVAL" },
-      approval: {
-        id: randomUUID(),
-        runId: run.id,
-        kind: "PLAN",
-        status: "PENDING",
-        request: {},
-        requestedAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      },
     })),
     pauseForGitHubApproval: vi.fn(async () => ({
       run: { ...run, status: "WAITING_APPROVAL", currentStage: "WAITING_PUSH_APPROVAL" },

@@ -27,7 +27,7 @@ test("projects a live RUN_FAILED event into the Run detail UI", async ({ page })
   await expect(page.getByRole("button", { name: "取消 Run" })).toHaveCount(0);
 });
 
-test("offers a Web-first P10-P11 acceptance workflow", async ({ page }) => {
+test("offers a Web-first acceptance workflow", async ({ page }) => {
   await mockApi(page);
   await page.goto("/acceptance");
 
@@ -38,7 +38,7 @@ test("offers a Web-first P10-P11 acceptance workflow", async ({ page }) => {
   const taskForm = page.getByTestId("task-form");
   await expect(taskForm.getByLabel("Repository")).toHaveValue(REPOSITORY_ID);
   await expect(taskForm.getByLabel("Base ref")).toHaveValue("");
-  await expect(page.getByTestId("acceptance-guide")).toContainText("npm run test:p11");
+  await expect(page.getByTestId("acceptance-guide")).not.toContainText("Plan");
 });
 
 test("creates a Task without a client-supplied commit and shows the resolved base", async ({

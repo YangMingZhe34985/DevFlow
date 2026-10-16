@@ -1,5 +1,7 @@
 # ADR-0001：使用 npm workspaces 与端口式模块边界
 
+初始化时的决定，至今仍然成立。v2–v3 曾增加团队多 Agent 实验，v4 又回到单 Agent，始终复用同一套 Worker、端口和持久化设施。当前架构见 [autonomous 模式](../v4/autonomous-mode.md)。
+
 - 状态：Accepted
 - 日期：2026-09-18
 

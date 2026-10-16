@@ -4,7 +4,6 @@ import {
   discoverPublicVerification,
   runPublicVerification,
 } from "../src/runs/public-verification.js";
-import { extractRepairDiagnostics } from "../src/runs/workflow-context.js";
 
 const result = (exitCode = 0, stdout = "ok") => ({
   exitCode,
@@ -46,10 +45,6 @@ describe("public validation and diagnostic handoff", () => {
     });
     expect(exec).toHaveBeenCalledTimes(1);
     expect(tested.checks.map((c) => c.status)).toEqual(["FAIL", "NOT_RUN", "NOT_RUN", "NOT_RUN"]);
-    expect(extractRepairDiagnostics(tested.stdout)[0]).toMatchObject({
-      path: "src/composables/useSettingsTabSync.ts",
-      line: 18,
-    });
   });
   it("shares its deadline and checks the budget before each command", async () => {
     let time = 0;
@@ -82,26 +77,5 @@ describe("public validation and diagnostic handoff", () => {
       reason: "TOOL_BUDGET_EXCEEDED",
     });
     expect(tested.checks[1]?.status).toBe("NOT_CONFIGURED");
-  });
-  it("extracts compiler locations and closest Python project frames, rejecting external paths", () => {
-    expect(
-      extractRepairDiagnostics(
-        "tests/cli.py:29: in test_cli\ntests/conftest.py:94: in __call__\nsrc/service.py:140: in resolve\nsrc/registry.py:115: in lookup_execution",
-      )[0],
-    ).toMatchObject({ path: "src/registry.py", line: 115 });
-    expect(
-      extractRepairDiagnostics(
-        'File "/workspace/src/pyplugin/services/execution_service.py", line 140, in run\nFile "/workspace/src/pyplugin/registry/registry.py", line 115, in lookup_execution\nFile "/usr/lib/python/site-packages/x.py", line 20',
-      ),
-    ).toEqual([
-      expect.objectContaining({ path: "src/pyplugin/registry/registry.py", line: 115 }),
-      expect.objectContaining({ path: "src/pyplugin/services/execution_service.py", line: 140 }),
-    ]);
-    expect(
-      extractRepairDiagnostics(
-        "[ERROR] src/main/java/App.java:[9,2] error\nsrc/main.cpp:12:3: error: x\nsrc/module.py:24: error: incompatible type",
-      )[0]?.path,
-    ).toBe("src/main/java/App.java");
-    expect(extractRepairDiagnostics("/outside/src/module.py:24: error")).toEqual([]);
   });
 });

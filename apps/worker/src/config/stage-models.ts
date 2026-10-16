@@ -3,7 +3,8 @@ import { z } from "zod";
 import { DevflowError } from "@devflow/shared";
 import type { VercelAiModelConfig, ModelGenerationSettings } from "@devflow/agent";
 
-export const MODEL_STAGES = ["LOCALIZATION", "PLANNER", "EXECUTE", "REPAIR", "REVIEW"] as const;
+/** EXECUTE binds the solver; REVIEW binds the independent reviewer. */
+export const MODEL_STAGES = ["EXECUTE", "REVIEW"] as const;
 export type ModelStage = (typeof MODEL_STAGES)[number];
 const blank = (v: unknown) => (typeof v === "string" && !v.trim() ? undefined : v);
 const optional = <T extends z.ZodType>(schema: T) => z.preprocess(blank, schema.optional());
@@ -60,7 +61,9 @@ export function resolveStageModel(
   },
   run: { modelProvider?: string; modelName?: string } = {},
 ) {
-  const override = env.stageModels?.[stage] ?? {};
+  const override = Object.fromEntries(
+    Object.entries(env.stageModels?.[stage] ?? {}).filter(([, v]) => v !== undefined),
+  ) as StageOptions;
   const provider = override.provider ?? run.modelProvider ?? env.LLM_PROVIDER;
   const model = override.model ?? run.modelName ?? env.LLM_MODEL;
   const baseUrl = override.baseUrl ?? env.LLM_BASE_URL;

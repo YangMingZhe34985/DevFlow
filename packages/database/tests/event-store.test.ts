@@ -87,6 +87,7 @@ describe("Prisma event store", () => {
     });
     const eventCreate = vi.fn(async () => undefined);
     const transaction = {
+      $queryRaw: vi.fn(async () => [{ id: runId }]),
       run: {
         findFirst: vi.fn(async () => current),
         updateMany: vi.fn(async () => ({ count: 1 })),
@@ -319,6 +320,7 @@ describe("Prisma event store", () => {
     });
     const updateMany = vi.fn(async () => ({ count: 1 }));
     const transaction = {
+      $queryRaw: vi.fn(async () => [{ id: runId }]),
       run: {
         findFirst: vi.fn(async () => current),
         updateMany,

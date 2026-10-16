@@ -35,3 +35,5 @@ scripts/localization-graph-fix-replay.mjs
 scripts/review-length-recovery-live.mjs
 scripts/build-historical-benchmark.mjs
 scripts/summarize-*.mjs
+# Preserve the new user-authored stability brief verbatim.
+docs/stability-autonomy-brief-20261013.md

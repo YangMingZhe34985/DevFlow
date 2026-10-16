@@ -191,9 +191,7 @@ export function DevflowWorkbench({ initialRunId, acceptanceMode = false }: Devfl
         await resolveApproval(approval.id, {
           status,
           actorId: "devflow-web",
-          ...(feedback === undefined
-            ? {}
-            : { comment: feedback, resolution: { feedback, action: "REPLAN" } }),
+          ...(feedback === undefined ? {} : { comment: feedback }),
         });
         await loadDetail(approval.runId);
         eventStream.reconnect();
@@ -399,9 +397,6 @@ function AcceptanceGuide({
   runs: readonly RunRecord[];
   detail?: RunDetail;
 }) {
-  const planApproved = detail?.approvals.some(
-    (approval) => approval.kind === "PLAN" && approval.status === "APPROVED",
-  );
   const pushApproved = detail?.approvals.some(
     (approval) => approval.kind === "GITHUB_PUSH" && approval.status === "APPROVED",
   );
@@ -416,7 +411,6 @@ function AcceptanceGuide({
     { label: "创建 Repository", done: repositories.length > 0 },
     { label: "创建 Task", done: tasks.length > 0 },
     { label: "启动 Run", done: runs.length > 0 },
-    { label: "审阅并批准 Plan", done: planApproved === true },
     {
       label: gitRun ? "显式批准 Push" : "LOCAL Run 无需 Push",
       done: gitRun ? pushApproved === true : detail !== undefined,
@@ -432,7 +426,7 @@ function AcceptanceGuide({
     <section className="panel acceptance-guide" data-testid="acceptance-guide">
       <div className="acceptance-heading">
         <div>
-          <p className="section-kicker">P10–P11 acceptance</p>
+          <p className="section-kicker">Acceptance</p>
           <h1>Web 验收中心</h1>
           <p>
             使用左侧表单完成创建，在 Run Detail 中处理所有审批并观察实时事件；无需手写 API、SSE
@@ -454,13 +448,6 @@ function AcceptanceGuide({
           </li>
         ))}
       </ol>
-      <div className="acceptance-note">
-        <strong>P11 可信 Benchmark</strong>
-        <span>
-          隐藏 evaluator、超时和防篡改必须由自动化执行；只需运行一次 <code>npm run test:p11</code>
-          ，不再逐条手工拼命令。
-        </span>
-      </div>
     </section>
   );
 }
@@ -743,9 +730,6 @@ function RunForm({
   const [idempotencyKey, setIdempotencyKey] = useState("");
   const [modelProvider, setModelProvider] = useState("");
   const [modelName, setModelName] = useState("");
-  const [maxSteps, setMaxSteps] = useState("25");
-  const [maxTestRetries, setMaxTestRetries] = useState("3");
-  const [maxReviewRetries, setMaxReviewRetries] = useState("1");
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -757,9 +741,6 @@ function RunForm({
         ...(idempotencyKey.trim() === "" ? {} : { idempotencyKey: idempotencyKey.trim() }),
         ...(modelProvider.trim() === "" ? {} : { modelProvider: modelProvider.trim() }),
         ...(modelName.trim() === "" ? {} : { modelName: modelName.trim() }),
-        maxSteps: Number(maxSteps),
-        maxTestRetries: Number(maxTestRetries),
-        maxReviewRetries: Number(maxReviewRetries),
       });
       onCreated(response.run);
       onError(undefined);
@@ -836,41 +817,6 @@ function RunForm({
               placeholder="使用 Worker 默认值"
               value={modelName}
               onChange={(event) => setModelName(event.target.value)}
-            />
-          </label>
-        </div>
-        <div className="form-row">
-          <label>
-            Max steps
-            <input
-              required
-              min={1}
-              max={200}
-              type="number"
-              value={maxSteps}
-              onChange={(event) => setMaxSteps(event.target.value)}
-            />
-          </label>
-          <label>
-            Max repair
-            <input
-              required
-              min={0}
-              max={20}
-              type="number"
-              value={maxTestRetries}
-              onChange={(event) => setMaxTestRetries(event.target.value)}
-            />
-          </label>
-          <label>
-            Max review retry
-            <input
-              required
-              min={0}
-              max={10}
-              type="number"
-              value={maxReviewRetries}
-              onChange={(event) => setMaxReviewRetries(event.target.value)}
             />
           </label>
         </div>

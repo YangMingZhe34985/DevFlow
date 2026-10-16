@@ -1,38 +1,62 @@
-# DevFlow 2.3.1
-
-当前包版本 **2.3.1**。代码编辑与失败修复共用持久化的 Coding Session。Resource Budget Scheduler 开发批次严格通过 **1/4**（E07）；E10 已真实派发重新规划、获得新审批并恢复 Coding，但仍未完成修复，**未达到 v2.4 升级条件**。见[资源调度架构](docs/resource-budget-scheduler.md)、[本轮结果及剩余问题](docs/resource-budget-validation-20261008.md)和[此前 v2.3 验收记录](docs/unified-coding-loop-20261008.md)。
-
-后续[E10 Runtime P0 定向修复](docs/e10-runtime-p0-20261008.md)通过原始请求 Docker 回放与工程检查；独立单题真实复测仍因公开测试失败、下游时间预检停止而严格失败（**0/1**），该实验使用包版本 2.3.0。
-
-独立的[Tool Call Recovery 定向验收](docs/tool-call-recovery-e02-live-20261009.md)重新运行 E02 一次，公开验证、重新规划／新审批、同 Session 恢复、独立评分及 Review 均通过（**1/1**）。畸形参数恢复由原请求 Docker 回放验证，本次真实实验未重现该错误。这是后续冻结版本的单题结果，不是新的整批成功率。
-
-同一生产 Runtime 的后续[E05/E06/E08/E10 定向验证](docs/four-case-validation-20261009.md)严格通过 **1/4（E08）**。E05 原测试仍失败，E06 因实现证据不足停止，E10 已重新规划并恢复但仍有失败、最终停在工具上限。各批结果分别保留，E10 仍未达到 v2.4 条件。
-
-**2.3.1 补丁版本**整合已验证的资源调度、确定性上下文投影和有界工具参数恢复改进；详见[当前版本技术报告](docs/technical-report-v2.3.1-20261010.md)。历史实验版本与结果原样保留，本次版本整理不等于新增真实验收。
+# DevFlow 4.0.0
 
 [中文](README_CN.md) | [English](README.md)
 
-**项目复习入口：[整体技术报告与源码阅读指南](docs/project-study-guide-v2.3.1.md)**。从完整任务流转开始，介绍重点模块的内部机制、接口、设计取舍和源码入口，并提供自测问题。
+DevFlow 把仓库任务和 GitHub Issue 交给一个自主 Agent 修复，并让整个过程可观察、可审计。
 
-DevFlow 将仓库任务和 GitHub Issue 转化为可观察、可审批的 AI 工程运行，包含定位、经批准的修复规划、迭代 Coding Loop、确定性最终验证与独立评审。
+- **求解**：Agent 在隔离的 Docker 沙箱中自行决定探索、编辑、运行测试和提交。
+- **验证与审查**：宿主独立复跑公开检查，再由独立的 Reviewer 分层审查。
+- **交付**：GitHub 推送和 Pull Request 都必须经过人工审批。
 
-API 负责持久化意图和入队，Worker 负责执行；Agent 通过受策略约束的工具操作 Docker 沙箱中的代码。Task 锁定不可变基准 commit，Run 保存事件、源码引用、补丁、指标和预算。
+## v4.0.0 更新内容
 
-## 当前能力
+v4.0.0 用单个自主 Agent 取代了原来的多阶段工作流。设计见 [autonomous 模式说明](docs/v4/autonomous-mode.md)，演进过程见 [v4 进度](docs/v4/PROGRESS.md)。
 
-- 精简提案式 Planner：修复方向、拟修改文件、验证方式和不确定性；人工审批确定写入范围。
-- Localization、Planner、Coding、Review 分别配置模型，示例默认使用百炼。所有 Coding 迭代统一使用 `EXECUTE` 模型绑定；旧 `REPAIR` 配置仍可读取。
-- 版本化 TS/JS 文件依赖与导出关系，以及 Python/Java/C++ 有界静态导航；各阶段共享证据，歧义和不完整关系明确标注。
-- 修改前核对完整文件 SHA，支持精确文本替换和保护文件策略。
-- Review 保持无工具，可请求宿主进行有界补证和隔离的公开复现；确认的缺陷携带诊断任务、与当前 SHA 关联的证据和经校验的答复，返回同一 Coding Session。
-- 公开 build/typecheck/lint/test 验证 profile、源码诊断交接，以及需要新审批的一次有界范围重新规划。
-- 同一 Coding Session 在编辑、公开测试失败和 Review 反馈之间保留历史、检查点、工具策略及资源消费。重复观察不算新进展；编辑格式、工具参数和输出纠正共享一次有界纠正额度。
-- 稳定补丁仍可在批准范围内继续编辑。`finishPhase` 将候选交给 Workflow 强制执行最终验证；验证失败或明确的未完成事项，在剩余资源允许时返回同一会话。最终 Review 保持独立，见[当前 Coding 生命周期](docs/unified-coding-loop-20261008.md)。
-- Run 级 Resource Budget Scheduler：持久化准入与结算，按实际请求和重新规划操作清单估算资源；分别记录逻辑工具、内部执行及 IO，保持硬上限和受保护写入范围。
+- **执行方式**：一个 Agent 使用 `bash`、`read_file`、`edit_file`、`submit` 四个通用工具自主求解，取代原先的 Localization → Planner → 计划审批 → Coding → Review 流水线。
+- **验证与审查**：
+  - 宿主独立复跑自动发现的公开检查；
+  - 分层独立审查：无工具初审，出现具体疑点才进行有界核查；
+  - 验证失败或审查判 FAIL 时，返回同一会话修订；结论不成立时，换新沙箱再尝试。
+- **资源控制**：每个 Run 有费用、轮数和截止时间三项硬上限，未确认的调用按最坏情况计费，并支持检查点恢复。
+- **交付**：GitHub 推送和 PR 由独立的交付执行器完成，仍需两级人工审批。
+- **退役**：
+  - 退役内容：workflow / team / single 执行模式、PRG 定位、Resource Budget Scheduler、团队持久化、数据库 benchmark 流程，以及 `@devflow/workflow`、`@devflow/git`、`@devflow/eval` 三个包；
+  - 规模：源码约减少 72%；
+  - 历史数据：历史 Run 仍可读取，但不再执行，数据库没有做破坏性迁移；
+  - 找回：退役前的代码保留在 Git 标签 `v4-pre-retirement`。
+- **CLI**：直接运行同一个 Agent 内核。
+- **评测**：新增外部留出集（SWE-bench Verified + Multilingual），以及对应的预算受控评测入口。
 
-此前不同版本的九题单批严格通过 5/9；其中一题因费用阈值中断，单独续测后通过，历史九题覆盖中共有 6 题获得严格端到端成功证据。这些不是当前 Scheduler 版本的成绩。该小型数据集证明限定仓库中的实际修复能力，仍不足以代表任意仓库的成功率，见[验证结果与限制](docs/validation-v2.md)。
+## 评测结果
 
-v2.2 新数据集实验中，E09、E01 在同一冻结批次获得严格成功，E08 在后续单题批次通过。这些记录来自不同版本，不合并为同一批通过率，见[当前实验记录](docs/new-dataset-validation-20261007.md)。
+| 评测集                                                     | 结果                          | 每题平均费用 |
+| ---------------------------------------------------------- | ----------------------------- | ------------ |
+| 合成回归集 E01–E10                                         | 补丁严格通过 10/10（Phase 2） | 约 ¥1.6–2.2  |
+| 外部留出集（SWE-bench Verified 15 题 + Multilingual 5 题） | 官方验收通过 13/20（65%）     | ¥1.32        |
+
+- **退役前的旧 workflow 路径**：同一合成集上的最好成绩为 5/10。
+- **外部集口径**：每题只跑 1 次，样本小，置信区间较宽。
+- **模型**：求解使用 GLM-5.3，审查使用 DeepSeek-v4-pro。
+- **详细结果**：逐题结果和失败分析见 [v4 进度](docs/v4/PROGRESS.md)；已知的策略缺口见 [BACKLOG](docs/v4/BACKLOG.md)。
+
+## 工作方式
+
+```text
+仓库 + 锁定基准 commit 的 Task
+  -> Agent 自主求解（bash / read_file / edit_file / submit）
+  -> 宿主复跑公开检查（自动发现 build / typecheck / lint / test）
+       -> 失败：反馈回同一会话修订
+  -> 分层独立审查：第 1 层无工具初审，出现具体疑点才进入第 2 层有界核查
+       -> 判 FAIL：回到同一会话修订
+       -> 结论不成立：换新沙箱再尝试，共享同一份费用、轮数和时间上限
+  -> Diff -> LOCAL 仓库直接完成；GIT 仓库进入 Push 审批 -> PR 审批
+```
+
+### 主要边界
+
+- **资源上限**：每个 Run 有费用、轮数和截止时间三项硬上限。尚未确认的模型调用按最坏情况计费。
+- **受保护路径**：Agent 不能修改 `.git/` 和 `.github/workflows/`。
+- **凭证与审批**：GitHub 凭证只在平台侧使用，不进入沙箱或提示词；写操作默认关闭，需要显式开启并审批。
 
 ## 快速开始
 
@@ -45,7 +69,8 @@ cp .env.example .env
 npm ci
 ```
 
-PowerShell 使用 `Copy-Item .env.example .env`。在本地 .env 设置 `LLM_API_KEY` 并确认模型及平台配置，不要提交凭证。安装时会自动生成 Prisma Client。
+- **复制配置**：PowerShell 使用 `Copy-Item .env.example .env`。
+- **填写凭证**：在本地 `.env` 中设置 `LLM_API_KEY`，并确认模型配置。不要提交凭证。
 
 ```bash
 npm run infra:up
@@ -54,33 +79,50 @@ npm run sandbox:build
 npm run dev
 ```
 
-Web：http://localhost:3000；API：http://localhost:3001/api/v1；Worker 就绪检查：http://localhost:3002/health/ready。通过 `npm run infra:down` 停止基础设施。当前面向本地开发；对不可信网络开放前需补充适合部署环境的认证与授权。
+| 服务            | 地址                               |
+| --------------- | ---------------------------------- |
+| Web             | http://localhost:3000              |
+| API             | http://localhost:3001/api/v1       |
+| Worker 就绪检查 | http://localhost:3002/health/ready |
 
-## 分阶段模型
+停止基础设施：`npm run infra:down`。
 
-[.env.example](.env.example) 默认使用百炼兼容接口。Planner / Review 使用 `deepseek-v4-pro-0813`；整个 Coding Loop 使用 `glm-5.3`；Localization 继承 `LLM_MODEL`。Coding 使用 `LLM_EXECUTE_*`：开启思考、low 推理强度、8,192 输出 token 和 32,000 上下文 token。独立 Review 使用 high 推理强度、16,384 输出 token 和 64,000 上下文 token。`LLM_REPAIR_*` 保留为旧配置接口，不会创建另一套 Coding Agent，也不改变统一会话的额度。见[配置优先级、能力建议及预算](docs/stage-models.md)，修改后重启 Worker。
+当前面向本地开发。对不可信网络开放之前，需要先补充适合部署环境的认证与授权。
 
-## 工作流与边界
+命令行可以直接在本地仓库上运行同一个 Agent 内核：
 
-```text
-仓库 + 锁定 Task -> Localization -> Planner -> 计划审批
-  -> Unified Coding Loop：观察 -> 编辑 -> 测试 -> 分析失败 -> 修正
-  -> Workflow 最终验证 -> Independent Review
-       -> 验证失败 / 确认缺陷 -> 同一 Coding Session
-       -> 新增写入范围 -> Planner -> 新计划审批 -> 同一 Coding Session
-  -> Diff -> 本地完成或经批准的 GitHub Push / Pull Request
+```bash
+npm run dev:cli -- --repo <path> "<task>"
 ```
 
-提案合法、测试通过和 Issue 修复成立是不同结果。空目标或全 INSPECT 计划不授予写权限；扩大范围需重新审批。Review 默认无工具，由宿主提供当前证据。见[阶段职责、图的用途和保护规则](docs/v2-workflow.md)。
+## 模型配置
+
+[.env.example](.env.example) 默认使用百炼的 OpenAI 兼容接口，共两个模型绑定：
+
+| 绑定            | 用途          | 默认模型               | 推理强度 | 输出上限 |
+| --------------- | ------------- | ---------------------- | -------- | -------- |
+| `LLM_EXECUTE_*` | 求解 Agent    | `glm-5.3`              | low      | 8,192    |
+| `LLM_REVIEW_*`  | 独立 Reviewer | `deepseek-v4-pro-0813` | high     | 16,384   |
+
+审查的分层设置由 `DEVFLOW_AUTONOMOUS_REVIEW_*` 覆盖，详见[模型配置](docs/stage-models.md)。修改配置后需要重启 Worker。
 
 ## 仓库结构
 
-- `apps/api`、`web`、`cli`、`worker`：REST/SSE、界面、命令行与编排。
-- `packages/agent`、`tools`、`sandbox`：模型运行时、工具策略与隔离执行。
-- `packages/shared`、`workflow`、`database`、`git`、`github`、`eval`：契约、持久化、交付和评测。
-- `tests`、`docker`、`scripts`、`docs`：公开夹具、基础设施、验证与文档。
+- **应用**：`apps/api`（REST/SSE）、`apps/web`（界面）、`apps/cli`（命令行）、`apps/worker`（执行与交付）。
+- **基础包**：
+  - `packages/agent`：模型适配与 Agent 内核；
+  - `packages/tools`：ACI 工具；
+  - `packages/sandbox`：Docker 沙箱与仓库快照；
+  - `packages/database`：持久化；
+  - `packages/github`：GitHub 交付；
+  - `packages/shared`：共享契约。
+- **评测与配套**：
+  - `scripts/v4`：E01–E10 与外部留出集的评测入口；
+  - `tests`：单元与集成测试；
+  - `docker`：基础设施；
+  - `docs`：文档。
 
-旧实验实现、模型原始请求、费用账本、隐藏验收数据与私人接手笔记均排除在 Git 外。生产 Planner 只保留提案协议，已有持久化审批的兼容契约继续保留。
+模型原始请求、费用账本、隐藏验收数据和本地实验材料都不进入 Git。
 
 ## 开发验证
 
@@ -93,6 +135,7 @@ npm run test:e2e
 node scripts/check-release-files.mjs
 ```
 
-Docker 集成需显式启用并配置本地基础设施，普通单元测试不调用付费模型。GitHub 发布默认关闭，需要审批；平台凭证不传入沙箱。
+- **集成测试**：需要 Docker 或 PostgreSQL，包括 `npm run test:p1`、`test:p3`、`test:p5`、`test:p9`、`test:p10`、`test:postgres`。这些命令会自行启动和清理所需的基础设施。
+- **费用**：单元测试和集成测试都使用模拟模型，不调用付费模型。
 
-[架构](docs/architecture.md) · [测试说明](tests/README.md) · [脚本说明](scripts/README.md) · [MIT License](LICENSE)
+[文档入口](docs/README.md) · [测试说明](tests/README.md) · [脚本说明](scripts/README.md) · [MIT License](LICENSE)

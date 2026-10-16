@@ -41,33 +41,11 @@ const WorkerEnvironmentSchema = z.object({
   LLM_BASE_URL: optionalUrl,
   LLM_PROVIDER_NAME: optionalString,
   LLM_STRUCTURED_OUTPUT_MODE: z.enum(["auto", "json-schema", "json-object"]).default("auto"),
-  LLM_REASONING_PROFILE: z.enum(["efficient", "provider-default"]).default("efficient"),
-  DEVFLOW_MAX_RETRIES: z.coerce.number().int().min(0).default(2),
-  DEVFLOW_RELATION_GRAPH_ENABLED: z
+  DEVFLOW_TEAM_ENABLED: z
     .enum(["true", "false"])
-    .default("true")
-    .transform((v) => v === "true"),
-  DEVFLOW_CONTEXT_COMPRESSION_ENABLED: z
-    .enum(["true", "false"])
-    .default("true")
-    .transform((v) => v === "true"),
-  DEVFLOW_CONTEXT_COMPRESSION_MAX_CALLS: z.coerce.number().int().min(0).max(3).default(1),
-  DEVFLOW_CONTEXT_COMPRESSION_MAX_INPUT_TOKENS: z.coerce
-    .number()
-    .int()
-    .min(512)
-    .max(16000)
-    .default(6000),
-  DEVFLOW_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: z.coerce
-    .number()
-    .int()
-    .min(256)
-    .max(4096)
-    .default(2048),
-  DEVFLOW_MAX_MODEL_CALLS: optionalPositiveInteger,
-  DEVFLOW_MAX_TOOL_CALLS: optionalPositiveInteger,
-  DEVFLOW_MAX_TOOL_EXECUTIONS: optionalPositiveInteger,
-  DEVFLOW_MAX_IO_BYTES: optionalPositiveInteger,
+    .default("false")
+    .transform((v) => v === "true")
+    .optional(),
   DEVFLOW_MAX_COST_MICROS: optionalPositiveInteger,
   DEVFLOW_MODEL_PRICES_JSON: optionalString.refine((value) => {
     if (!value) return true;
@@ -80,8 +58,14 @@ const WorkerEnvironmentSchema = z.object({
         Object.values(parsed).every((rate: unknown) => {
           if (!rate || typeof rate !== "object") return false;
           const values = rate as Record<string, unknown>;
-          return [values.inputMicrosPerMillionTokens, values.outputMicrosPerMillionTokens].every(
-            (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0,
+          const rateValue = (n: unknown) =>
+            typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+          return (
+            [values.inputMicrosPerMillionTokens, values.outputMicrosPerMillionTokens].every(
+              rateValue,
+            ) &&
+            (values.cachedInputMicrosPerMillionTokens === undefined ||
+              rateValue(values.cachedInputMicrosPerMillionTokens))
           );
         })
       );
@@ -89,59 +73,7 @@ const WorkerEnvironmentSchema = z.object({
       return false;
     }
   }, "Model prices must be a JSON object of nonnegative integer input/output micros per million tokens."),
-  DEVFLOW_MAX_TOTAL_TOKENS: z.coerce.number().int().positive().default(250_000),
   DEVFLOW_TIMEOUT_MS: z.coerce.number().int().min(1_000).default(1_500_000),
-  DEVFLOW_REVIEW_REQUEST_TIMEOUT_MS: z.coerce.number().int().positive().default(240_000),
-  DEVFLOW_REVIEW_RECOVERY_TIMEOUT_MS: z.coerce.number().int().positive().default(210_000),
-  DEVFLOW_FINALIZE_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
-  DEVFLOW_STATE_DIR: z.string().min(1).default(".devflow/state"),
-  DEVFLOW_PLAN_AGENT_MAX_TOTAL_TOKENS: z.coerce.number().int().positive().default(12000).optional(),
-  DEVFLOW_PLAN_AGENT_MAX_MODEL_CALLS: z.coerce.number().int().positive().default(6).optional(),
-  DEVFLOW_PLAN_AGENT_TIMEOUT_MS: z.coerce.number().int().positive().default(120000).optional(),
-  DEVFLOW_PREPATCH_EFFICIENCY_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true")
-    .optional(),
-  DEVFLOW_PREPATCH_CONTEXT_TOKEN_CAP: z.coerce
-    .number()
-    .int()
-    .min(512)
-    .max(12000)
-    .default(6000)
-    .optional(),
-  DEVFLOW_POST_PATCH_CONVERGENCE_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true")
-    .optional(),
-  DEVFLOW_POST_PATCH_AUTOFINISH_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true")
-    .optional(),
-  DEVFLOW_EFFICIENCY_TRACE_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true")
-    .optional(),
-  DEVFLOW_EVIDENCE_ACTION_ENABLED: z
-    .enum(["true", "false"])
-    .default("false")
-    .transform((v) => v === "true")
-    .optional(),
-  DEVFLOW_EXPLORATION_READS: z.coerce.number().int().min(1).max(24).default(4).optional(),
-  DEVFLOW_EXPLORATION_SEARCHES: z.coerce.number().int().min(0).max(8).default(2).optional(),
-  DEVFLOW_EXPLORATION_RELOCATIONS: z.coerce.number().int().min(0).max(1).default(1).optional(),
-  DEVFLOW_WHOLE_FILE_WRITE_BYTES: z.coerce.number().int().min(0).max(8192).default(4096).optional(),
-  DEVFLOW_LOCALIZATION_SMALL_REPO_FILES: z.coerce
-    .number()
-    .int()
-    .min(0)
-    .max(512)
-    .default(64)
-    .optional(),
-  DEVFLOW_LOCALIZATION_FAST_FILES: z.coerce.number().int().min(1).max(8).default(3).optional(),
   DEVFLOW_SANDBOX_IMAGE: z.string().min(1).default("devflow-sandbox:local"),
   DEVFLOW_SANDBOX_CPUS: z.coerce.number().positive().max(64).default(2),
   DEVFLOW_SANDBOX_MEMORY_MB: z.coerce.number().int().min(6).default(2_048),
@@ -156,6 +88,24 @@ const WorkerEnvironmentSchema = z.object({
     .transform((value) => value === "true"),
   DEVFLOW_GITHUB_API_BASE_URL: z.string().url().default("https://api.github.com"),
   DEVFLOW_GITHUB_WEB_BASE_URL: z.string().url().default("https://github.com"),
+  // executionMode=autonomous: one agent loop; the Run deadline and cost cap above still apply.
+  DEVFLOW_AUTONOMOUS_MAX_TURNS: z.coerce.number().int().min(1).max(500).default(100),
+  DEVFLOW_AUTONOMOUS_CONTEXT_TOKENS: z.coerce.number().int().min(8_000).default(100_000),
+  DEVFLOW_AUTONOMOUS_MAX_REVISIONS: z.coerce.number().int().min(0).max(10).default(2),
+  DEVFLOW_AUTONOMOUS_CHECKPOINT_TURNS: z.coerce.number().int().min(1).max(50).default(5),
+  DEVFLOW_AUTONOMOUS_REVIEW: z.enum(["0", "1"]).default("1"),
+  DEVFLOW_AUTONOMOUS_REVIEW_TOOL_TURNS: z.coerce.number().int().min(1).max(8).default(8),
+  DEVFLOW_AUTONOMOUS_REVIEW_MAX_OUTPUT: z.coerce.number().int().positive().default(4096),
+  DEVFLOW_AUTONOMOUS_REVIEW_REASONING: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .default("medium"),
+  // Tier 1 is one structured verdict: thinking off where the model allows it. A real call
+  // with reasoning on spent ~6.4K output tokens on reasoning for a 4K-token review input.
+  DEVFLOW_AUTONOMOUS_REVIEW_TRIAGE_REASONING: z
+    .enum(["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+    .default("none"),
+  DEVFLOW_AUTONOMOUS_REVIEW_RESERVE: z.coerce.number().min(0).max(1).default(0.15),
+  DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(5).default(2),
 });
 
 export type WorkerEnvironment = z.infer<typeof WorkerEnvironmentSchema> & {

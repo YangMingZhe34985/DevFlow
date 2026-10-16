@@ -27,6 +27,18 @@ const compose = ["compose", "-f", "docker/compose.yml"];
 const npmCli = process.env.npm_execpath;
 if (npmCli === undefined) throw new Error("npm_execpath is required to run the migration.");
 run("docker", ["version"]);
+// Only containers created by this acceptance run can be attributed to it.
+const managedContainers = () =>
+  run(
+    "docker",
+    ["ps", "--all", "--filter", "label=devflow.managed=true", "--quiet"],
+    process.env,
+    true,
+  )
+    .trim()
+    .split(/\r?\n/u)
+    .filter(Boolean);
+const initialContainers = new Set(managedContainers());
 const initiallyRunning = new Set(
   run("docker", [...compose, "ps", "--status", "running", "--services"], process.env, true)
     .split(/\r?\n/u)
@@ -93,12 +105,7 @@ try {
   ]);
 }
 
-const residual = run(
-  "docker",
-  ["ps", "--all", "--filter", "label=devflow.managed=true", "--quiet"],
-  process.env,
-  true,
-).trim();
+const residual = managedContainers().filter((id) => !initialContainers.has(id));
 if (startedInfrastructure) run("docker", [...compose, "down"]);
 if (residual.length > 0) throw new Error("P10 integration left DevFlow sandbox containers behind.");
 if (failed) process.exitCode = 1;

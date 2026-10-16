@@ -26,27 +26,4 @@ describe("Prisma credential boundaries", () => {
     expect(create).not.toHaveBeenCalled();
     expect(update).not.toHaveBeenCalled();
   });
-
-  it("rejects a benchmark sourceUri before persisting its definition", async () => {
-    const findUnique = vi.fn();
-    const create = vi.fn();
-    const database = new PrismaDatabaseAdapter({
-      benchmarkCaseExecution: { findUnique, create },
-    } as unknown as PrismaClient);
-
-    await expect(
-      database.benchmarkExecutions.startCase({
-        id: "00000000-0000-4000-8000-000000000001",
-        suiteId: "suite",
-        suiteVersion: "1",
-        caseId: "case",
-        caseVersion: "1",
-        definitionDigest: "a".repeat(64),
-        definition: { repository: { sourceUri: CREDENTIAL_URI } },
-        profile: {},
-      }),
-    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
-    expect(findUnique).not.toHaveBeenCalled();
-    expect(create).not.toHaveBeenCalled();
-  });
 });

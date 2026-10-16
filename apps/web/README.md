@@ -2,7 +2,7 @@
 
 Next.js App Router 前端。Repository/Task/Run/Approval API 与 SSE 都由 NestJS API 提供，Web 不建立第二套业务后端。
 
-`NEXT_PUBLIC_API_BASE_URL` 会在构建时固化；容器内 Server Component 若需访问 API，应使用仅服务端的 `API_INTERNAL_BASE_URL`。
+`NEXT_PUBLIC_API_BASE_URL` 会在构建时固化，应设置为浏览器可以访问的 API 地址；修改后需重新构建 Web。
 
 ## 页面
 

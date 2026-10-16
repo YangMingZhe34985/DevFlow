@@ -1,7 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
-import os from "node:os";
 import path from "node:path";
 
 import { FakeLanguageModel, fakeModelResponse } from "@devflow/agent";
@@ -16,12 +14,11 @@ import { NestFactory } from "@nestjs/core";
 import { AppModule } from "../../apps/api/src/app.module.js";
 import { ApiExceptionFilter } from "../../apps/api/src/common/api-exception.filter.js";
 import { BullRunQueue as ApiRunQueue } from "../../apps/api/src/infrastructure/bull-run-queue.js";
+import { AutonomousRunExecutor } from "../../apps/worker/src/autonomous/executor.js";
+import { ExecutionModeRouter } from "../../apps/worker/src/autonomous/router.js";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.js";
 import { BullRunQueue as WorkerRunQueue } from "../../apps/worker/src/queue/bull-run-queue.js";
-import {
-  DockerAgentRunExecutor,
-  type LanguageModelFactory,
-} from "../../apps/worker/src/runs/docker-agent-run-executor.js";
+import { GitHubDeliveryExecutor } from "../../apps/worker/src/runs/github-delivery.js";
 import type { RunExecutionPort } from "../../apps/worker/src/runs/run-execution.js";
 import { RunProcessor } from "../../apps/worker/src/runs/run.processor.js";
 import { RunRecovery } from "../../apps/worker/src/runs/run-recovery.js";
@@ -41,7 +38,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
   let queueWorker: Worker | undefined;
   let app: Awaited<ReturnType<typeof NestFactory.create>>;
   let baseUrl: string;
-  let stateDirectory: string;
   const executionAttempts = new Map<string, number>();
   const modelCreations = new Map<string, number>();
 
@@ -61,7 +57,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     await app.listen(0, "127.0.0.1");
     const address = app.getHttpServer().address() as AddressInfo;
     baseUrl = "http://127.0.0.1:" + String(address.port) + "/api/v1";
-    stateDirectory = await mkdtemp(path.join(os.tmpdir(), "devflow-p5-state-"));
   }, 120_000);
 
   afterAll(async () => {
@@ -69,9 +64,6 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     await workerQueue?.close();
     await workerRedis?.quit();
     await app?.close();
-    if (stateDirectory !== undefined) {
-      await rm(stateDirectory, { recursive: true, force: true });
-    }
   }, 120_000);
 
   it("validates CRUD, transitions and queued cancellation over HTTP", async () => {
@@ -114,7 +106,7 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     expect(invalidTransition.status).toBe(409);
   }, 120_000);
 
-  it("runs API -> BullMQ -> Worker -> Agent/Docker -> PostgreSQL exactly once", async () => {
+  it("runs API -> BullMQ -> Worker -> autonomous/Docker -> PostgreSQL exactly once", async () => {
     await startWorker();
     const repository = await createRepository();
     const task = await createTask(repository.id, "Full Docker Agent");
@@ -122,6 +114,7 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     const first = await request("POST", "/runs", {
       taskId: task.id,
       idempotencyKey,
+      executionMode: "autonomous",
       maxSteps: 4,
     });
     expect(first.status).toBe(201);
@@ -131,13 +124,20 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     const succeeded = await waitForRun(runId, ["SUCCEEDED"]);
     expect(succeeded.result).toMatchObject({
       status: "SUCCEEDED",
-      metrics: { modelCalls: 2, toolCalls: 1 },
+      metrics: { modelCalls: 3, toolCalls: 2 },
     });
     expect(await database.client.event.count({ where: { runId } })).toBeGreaterThan(0);
+    expect((await database.events.list(runId)).map((event) => event.type)).toEqual(
+      expect.arrayContaining(["TOOL_RESULT", "TEST_RESULT", "REVIEW_RESULT", "RUN_COMPLETED"]),
+    );
+    expect(
+      (await database.artifacts.list(runId)).find((artifact) => artifact.kind === "DIFF")?.content,
+    ).toContain("+  return left - right;");
 
     const duplicate = await request("POST", "/runs", {
       taskId: task.id,
       idempotencyKey,
+      executionMode: "autonomous",
       maxSteps: 4,
     });
     expect(duplicate.body).toMatchObject({ created: false, run: { id: runId } });
@@ -145,6 +145,7 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     const conflictingReplay = await request("POST", "/runs", {
       taskId: task.id,
       idempotencyKey,
+      executionMode: "autonomous",
       maxSteps: 5,
     });
     expect(conflictingReplay.status).toBe(409);
@@ -189,30 +190,73 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
       DATABASE_URL: databaseUrl,
       REDIS_URL: redisUrl,
       RUN_QUEUE_NAME: queueName,
-      DEVFLOW_STATE_DIR: stateDirectory,
       DEVFLOW_TIMEOUT_MS: "60000",
       DEVFLOW_SANDBOX_MEMORY_MB: "256",
       DEVFLOW_SANDBOX_PIDS: "64",
       DEVFLOW_SANDBOX_NETWORK_ENABLED: "false",
+      DEVFLOW_AUTONOMOUS_REVIEW: "1",
+      DEVFLOW_AUTONOMOUS_MAX_ATTEMPTS: "1",
     });
-    const modelFactory: LanguageModelFactory = (run) => {
-      modelCreations.set(run.id, (modelCreations.get(run.id) ?? 0) + 1);
-      return new FakeLanguageModel([
-        fakeModelResponse({
-          toolCalls: [{ id: randomUUID(), name: "listFiles", input: { path: "." } }],
-          usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
-          latencyMs: 3,
-        }),
-        fakeModelResponse({
-          toolCalls: [],
-          text: "Inspected the repository in Docker.",
-          usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
-          latencyMs: 2,
-        }),
-      ]);
-    };
-    const dockerExecutor = new DockerAgentRunExecutor(database, environment, modelFactory);
-    const compositeExecutor: RunExecutionPort = {
+    const autonomousExecutor = new AutonomousRunExecutor(database, environment, {
+      modelFactory: (run) => {
+        modelCreations.set(run.id, (modelCreations.get(run.id) ?? 0) + 1);
+        return {
+          model: new FakeLanguageModel([
+            fakeModelResponse({
+              toolCalls: [
+                {
+                  id: randomUUID(),
+                  name: "edit_file",
+                  input: {
+                    path: "src/calculator.js",
+                    old_text:
+                      "  // Intentional fixture bug: the agent should change + to -.\n  return left + right;",
+                    new_text:
+                      "  // Intentional fixture bug: the agent should change + to -.\n  return left - right;",
+                  },
+                },
+              ],
+              usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+              latencyMs: 3,
+            }),
+            fakeModelResponse({
+              toolCalls: [
+                {
+                  id: randomUUID(),
+                  name: "submit",
+                  input: { summary: "Corrected subtraction in Docker." },
+                },
+              ],
+              usage: { inputTokens: 8, outputTokens: 4, totalTokens: 12 },
+              latencyMs: 2,
+            }),
+          ]),
+          settings: {},
+          bindingHash: "p5-fake-solver",
+        };
+      },
+      reviewModelFactory: () => ({
+        model: new FakeLanguageModel([
+          fakeModelResponse({
+            toolCalls: [],
+            output: {
+              concerns: [],
+              verdict: "PASS",
+              findings: [],
+              summary: "Subtraction verified.",
+            },
+          }),
+        ]),
+        settings: {},
+        bindingHash: "p5-fake-reviewer",
+      }),
+    });
+    const router = new ExecutionModeRouter(
+      autonomousExecutor,
+      new GitHubDeliveryExecutor(database, environment),
+    );
+    // Queue semantics are mode-independent: inject faults around the real executor.
+    const faultInjectingExecutor: RunExecutionPort = {
       execute: async (run, signal) => {
         const attempt = (executionAttempts.get(run.id) ?? 0) + 1;
         executionAttempts.set(run.id, attempt);
@@ -222,13 +266,11 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
         if (run.task.title === "Long cancellable run") {
           return await waitUntilCancelled(run, signal);
         }
-        if (run.task.title === "Full Docker Agent") {
-          return await dockerExecutor.execute(run, signal);
-        }
+        if (run.task.title === "Full Docker Agent") return await router.execute(run, signal);
         return succeededResult(run.id);
       },
     };
-    const processor = new RunProcessor(database.runs, compositeExecutor, {
+    const processor = new RunProcessor(database.runs, faultInjectingExecutor, {
       workerId: "integration-" + randomUUID(),
       leaseMs: 5_000,
       cancellationPollMs: 100,
@@ -281,13 +323,16 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     timeoutMs = 30_000,
   ): Promise<Record<string, unknown>> {
     const deadline = Date.now() + timeoutMs;
+    let last: Record<string, unknown> = {};
     while (Date.now() < deadline) {
-      const response = await request("GET", "/runs/" + runId);
-      if (statuses.includes(String(response.body.status))) return response.body;
+      last = (await request("GET", "/runs/" + runId)).body;
+      if (statuses.includes(String(last.status))) return last;
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     throw new Error(
-      "Timed out waiting for run " + runId + " to reach " + statuses.join(", ") + ".",
+      `Timed out waiting for run ${runId} to reach ${statuses.join(", ")}; last state: ${JSON.stringify(
+        { status: last.status, stage: last.currentStage, result: last.result },
+      ).slice(0, 2000)}`,
     );
   }
 
@@ -298,8 +343,9 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
   ): Promise<{ status: number; body: Record<string, unknown> }> {
     const response = await fetch(baseUrl + endpoint, {
       method,
-      headers: body === undefined ? undefined : { "content-type": "application/json" },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      ...(body === undefined
+        ? {}
+        : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
     });
     const responseBody = (await response.json()) as Record<string, unknown>;
     return { status: response.status, body: responseBody };

@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   captureLocalRepositorySnapshot,
@@ -263,6 +263,93 @@ describe("DockerSandboxManager", () => {
     });
     expect(runner.calls.filter((c) => c[0] === "rm")).toHaveLength(1);
     await second.dispose();
+  });
+
+  it("bounds a hung Docker transport and fences its late receipt instead of waiting for the Run deadline", async () => {
+    const states: Record<string, unknown>[] = [];
+    let completeLate!: (result: DockerCommandResult) => void;
+    let transportSignal: AbortSignal | undefined;
+    class Runner extends RecordingDockerRunner {
+      override async run(args: readonly string[], options?: DockerCommandOptions) {
+        if (args.includes("--hang")) {
+          transportSignal = options?.signal;
+          return await new Promise<DockerCommandResult>((resolve) => {
+            completeLate = resolve;
+          });
+        }
+        return super.run(args, options);
+      }
+    }
+    const runner = new Runner();
+    const manager = new DockerSandboxManager({
+      image: "test",
+      workspaceRoot: process.cwd(),
+      commandRunner: runner,
+      observeLifecycle: (event) => states.push(event),
+    });
+    const session = await manager.create(createOptions(randomUUID()));
+    vi.useFakeTimers();
+    try {
+      const command = session.exec({ program: "node", args: ["--hang"], timeoutMs: 1_000 });
+      const rejected = expect(command).rejects.toMatchObject({
+        code: "SANDBOX_RESOURCE_LIMIT",
+        details: { phase: "COMMAND", timeoutMs: 3_000, outcome: "UNKNOWN" },
+      });
+      await vi.advanceTimersByTimeAsync(3_001);
+      await rejected;
+      expect(transportSignal?.aborted).toBe(true);
+      completeLate({
+        exitCode: 0,
+        stdout: "late success",
+        stderr: "",
+        durationMs: 3_500,
+        outputTruncated: false,
+      });
+      await Promise.resolve();
+      await expect(session.writeFile({ path: "x", content: "unsafe" })).rejects.toMatchObject({
+        code: "SANDBOX_PROCESS_FAILED",
+      });
+      expect(
+        states.some((event) => event.phase === "COMMAND" && event.state === "OPERATION_COMPLETED"),
+      ).toBe(false);
+      await session.dispose();
+      expect(runner.calls.filter((call) => call[0] === "rm")).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds an unresponsive ownership check before issuing a command", async () => {
+    let hang = false;
+    const runner = new RecordingDockerRunner();
+    const manager = new DockerSandboxManager({
+      image: "test",
+      workspaceRoot: process.cwd(),
+      commandRunner: runner,
+      assertOwnership: async () => {
+        if (hang) await new Promise(() => undefined);
+      },
+    });
+    const session = await manager.create(createOptions(randomUUID()));
+    const callsBefore = runner.calls.length;
+    hang = true;
+    vi.useFakeTimers();
+    try {
+      const command = session.writeFile({ path: "x", content: "unverified" });
+      const rejected = expect(command).rejects.toMatchObject({
+        code: "SANDBOX_LOST_OWNERSHIP",
+        details: { phase: "OWNERSHIP_BEFORE", outcome: "UNKNOWN" },
+      });
+      await vi.advanceTimersByTimeAsync(5_001);
+      await rejected;
+      expect(runner.calls.length).toBe(callsBefore);
+      await expect(session.readFile({ path: "x" })).rejects.toMatchObject({
+        code: "SANDBOX_PROCESS_FAILED",
+      });
+      await session.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("revoked owners cannot begin writes or report in-flight success", async () => {

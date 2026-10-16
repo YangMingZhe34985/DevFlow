@@ -9,10 +9,8 @@
   "references": [
     { "path": "../../packages/shared" },
     { "path": "../../packages/sandbox" },
-    { "path": "../../packages/git" },
     { "path": "../../packages/tools" },
-    { "path": "../../packages/agent" },
-    { "path": "../../packages/workflow" }
+    { "path": "../../packages/agent" }
   ],
   "include": ["src/**/*.ts"],
   "exclude": ["dist", "tests"]

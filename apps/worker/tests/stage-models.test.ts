@@ -2,12 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { loadWorkerEnvironment } from "../src/config/env.js";
 import { resolveStageModel } from "../src/config/stage-models.js";
-import { stageLanguageModel } from "../src/runs/stage-language-model.js";
-import {
-  FakeLanguageModel,
-  fakeModelResponse,
-  createConfiguredLanguageModel,
-} from "@devflow/agent";
+import { createConfiguredLanguageModel } from "@devflow/agent";
 afterEach(() => vi.unstubAllGlobals());
 
 const env = {
@@ -19,9 +14,18 @@ const env = {
   LLM_PROVIDER_NAME: "bailian",
 };
 describe("stage model bindings", () => {
-  it.each(["REVIEW", "REPAIR"] as const)(
-    "forwards the public %s configuration to HTTP without a smaller internal output cap",
-    async (stage) => {
+  it.each([
+    {
+      stage: "REVIEW" as const,
+      model: "deepseek-v4-pro-0813",
+      maxTokens: 16384,
+      effort: "high",
+      context: 64000,
+    },
+    { stage: "EXECUTE" as const, model: "glm-5.3", maxTokens: 8192, effort: "low", context: 32000 },
+  ])(
+    "forwards the public $stage configuration to HTTP without a smaller internal output cap",
+    async ({ stage, model, maxTokens, effort, context }) => {
       const example = Object.fromEntries(
         readFileSync(".env.example", "utf8")
           .split(/\r?\n/u)
@@ -69,36 +73,33 @@ describe("stage model bindings", () => {
         { signal: new AbortController().signal },
       );
       expect(bodies[0]).toMatchObject({
-        model: stage === "REVIEW" ? "deepseek-v4-pro-0813" : "glm-5.3",
-        max_tokens: 16384,
+        model,
+        max_tokens: maxTokens,
         enable_thinking: true,
-        reasoning_effort: stage === "REVIEW" ? "high" : "low",
+        reasoning_effort: effort,
       });
-      expect(configured.stageModels?.[stage]?.contextTokens).toBe(64000);
+      expect(configured.stageModels?.[stage]?.contextTokens).toBe(context);
     },
   );
   it("resolves independent models/settings while inheriting default transport and credentials", () => {
     const configured = loadWorkerEnvironment({
       ...env,
-      LLM_PLANNER_MODEL: "deepseek-v4-pro-0813",
-      LLM_EXECUTE_MODEL: "glm-5.3",
-      LLM_PLANNER_REASONING_EFFORT: "high",
-      LLM_EXECUTE_REASONING_EFFORT: "low",
+      LLM_REVIEW_MODEL: "deepseek-v4-pro-0813",
+      LLM_REVIEW_REASONING_EFFORT: "high",
     });
-    const planner = resolveStageModel("PLANNER", configured);
+    const review = resolveStageModel("REVIEW", configured);
     const execute = resolveStageModel("EXECUTE", configured);
-    expect(planner.config.model).toBe("deepseek-v4-pro-0813");
-    expect(execute.config.model).toBe("glm-5.3");
-    expect(planner.settings.reasoningEffort).toBe("high");
-    expect(execute.settings.reasoningEffort).toBe("low");
-    expect(resolveStageModel("REVIEW", configured).config.model).toBe("default");
-    expect(JSON.stringify(planner.provenance)).not.toContain(env.LLM_API_KEY);
-    expect(planner.provenance.configurationHash).not.toBe(execute.provenance.configurationHash);
+    expect(review.config.model).toBe("deepseek-v4-pro-0813");
+    expect(execute.config.model).toBe("default");
+    expect(review.settings.reasoningEffort).toBe("high");
+    expect(execute.settings.reasoningEffort).toBeUndefined();
+    expect(JSON.stringify(review.provenance)).not.toContain(env.LLM_API_KEY);
+    expect(review.provenance.configurationHash).not.toBe(execute.provenance.configurationHash);
   });
   it("stage selection takes priority over a legacy run default, without changing the run", () => {
-    const configured = loadWorkerEnvironment({ ...env, LLM_PLANNER_MODEL: "stage" });
+    const configured = loadWorkerEnvironment({ ...env, LLM_REVIEW_MODEL: "stage" });
     const run = { modelProvider: "openai-compatible", modelName: "run-default" };
-    expect(resolveStageModel("PLANNER", configured, run).config.model).toBe("stage");
+    expect(resolveStageModel("REVIEW", configured, run).config.model).toBe("stage");
     expect(resolveStageModel("EXECUTE", configured, run).config.model).toBe("run-default");
     expect(run.modelName).toBe("run-default");
   });
@@ -124,59 +125,5 @@ describe("stage model bindings", () => {
       const configured = loadWorkerEnvironment({ ...env, LLM_EXECUTE_MODEL: "glm-5.3", ...bad });
       expect(() => resolveStageModel("EXECUTE", configured)).toThrow(/glm-5.3/);
     }
-  });
-  it("preserves format repair none and clamps requested output to the stage cap", async () => {
-    const model = new FakeLanguageModel([
-      fakeModelResponse({ toolCalls: [] }),
-      fakeModelResponse({ toolCalls: [] }),
-    ]);
-    const records: unknown[] = [];
-    const bound = stageLanguageModel({
-      model,
-      stage: "PLANNER",
-      settings: { reasoningEffort: "high", maxOutputTokens: 8000 },
-      provenance: { model: "test" },
-      record: async (artifact, binding) => {
-        records.push({ artifact, binding });
-      },
-    });
-    await bound.generate(
-      {
-        messages: [{ role: "USER", content: "work" }],
-        tools: [],
-        settings: { maxOutputTokens: 9000 },
-      },
-      { signal: AbortSignal.timeout(1000) },
-    );
-    await bound.generate(
-      {
-        messages: [{ role: "SYSTEM", content: "You are a lossless JSON format converter." }],
-        tools: [],
-        settings: { reasoningEffort: "none", maxOutputTokens: 1024 },
-      },
-      { signal: AbortSignal.timeout(1000) },
-    );
-    expect(model.requests[0]?.settings).toEqual({ reasoningEffort: "high", maxOutputTokens: 8000 });
-    expect(model.requests[1]?.settings).toEqual({ reasoningEffort: "none", maxOutputTokens: 1024 });
-    expect(records).toHaveLength(2);
-  });
-
-  it("honors explicit non-thinking inspection and recovery without recognizing prompt text", async () => {
-    const model = new FakeLanguageModel([fakeModelResponse({ toolCalls: [] })]);
-    const bound = stageLanguageModel({
-      model,
-      stage: "PLANNER",
-      settings: { reasoningEffort: "high", maxOutputTokens: 8192 },
-      provenance: {},
-    });
-    await bound.generate(
-      {
-        messages: [{ role: "USER", content: "Inspect evidence" }],
-        tools: [],
-        settings: { reasoningEffort: "none", maxOutputTokens: 768 },
-      },
-      { signal: new AbortController().signal },
-    );
-    expect(model.requests[0]?.settings).toEqual({ reasoningEffort: "none", maxOutputTokens: 768 });
   });
 });

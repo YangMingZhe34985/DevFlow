@@ -292,6 +292,7 @@ export interface CreateTaskInput {
 
 export interface CreateRunInput {
   taskId: string;
+  executionMode?: "autonomous";
   idempotencyKey?: string;
   modelProvider?: string;
   modelName?: string;

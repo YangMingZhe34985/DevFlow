@@ -20,6 +20,7 @@ import { AutonomousRunExecutor } from "../../apps/worker/src/autonomous/executor
 import { ExecutionModeRouter } from "../../apps/worker/src/autonomous/router.js";
 import { loadWorkerEnvironment } from "../../apps/worker/src/config/env.js";
 import { BullRunQueue as WorkerRunQueue } from "../../apps/worker/src/queue/bull-run-queue.js";
+import { GitHubDeliveryExecutor } from "../../apps/worker/src/runs/github-delivery.js";
 import type { RunExecutionPort } from "../../apps/worker/src/runs/run-execution.js";
 import { RunProcessor } from "../../apps/worker/src/runs/run.processor.js";
 import { RunRecovery } from "../../apps/worker/src/runs/run-recovery.js";
@@ -273,7 +274,11 @@ integrationDescribe("P4-P5 API, persistence and queue", () => {
     };
     const processor = new RunProcessor(
       database.runs,
-      new ExecutionModeRouter(compositeExecutor, autonomousExecutor),
+      new ExecutionModeRouter(
+        compositeExecutor,
+        autonomousExecutor,
+        new GitHubDeliveryExecutor(database, environment),
+      ),
       {
         workerId: "integration-" + randomUUID(),
         leaseMs: 5_000,

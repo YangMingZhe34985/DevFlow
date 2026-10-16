@@ -151,16 +151,9 @@ import {
 } from "./review-evidence-retention.js";
 import {
   EnvironmentGitHubCredentialSource,
-  GitHubChangeSchema,
-  GitHubProviderError,
-  GitHubPublicationCoordinator,
   GitHubRestProvider,
-  operationKeyForRun,
-  redactGitHubSecrets,
-  type GitHubApprovalGrant,
   type GitHubChange,
   type GitHubProvider,
-  type GitHubPublicationRecord,
 } from "@devflow/github";
 import {
   DockerSandboxManager,
@@ -235,7 +228,11 @@ import {
   isGitHubRepositoryUri,
   parseGitHubRepositoryUri,
 } from "./github-changeset.js";
-import { prepareGitHubPushApproval, requireFullCommit } from "./github-delivery.js";
+import {
+  GitHubDeliveryExecutor,
+  prepareGitHubPushApproval,
+  requireFullCommit,
+} from "./github-delivery.js";
 import { ensureLocalRunSnapshot, requireLocalRunSnapshot } from "./local-run-snapshot.js";
 import type { RunExecutionOutcome, RunExecutionPort } from "./run-execution.js";
 import {
@@ -489,8 +486,12 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     if (run.currentStage === "START" || run.currentStage === "GENERATE_PLAN") {
       return await this.generatePlan(run, signal);
     }
-    if (run.currentStage === "PUSH") return await this.pushApprovedBranch(run, signal);
-    if (run.currentStage === "CREATE_PR") return await this.createApprovedPullRequest(run, signal);
+    if (run.currentStage === "PUSH" || run.currentStage === "CREATE_PR")
+      return await new GitHubDeliveryExecutor(
+        this.database,
+        this.environment,
+        this.githubProviderFactory,
+      ).execute(run, signal);
     if (run.currentStage !== "EXECUTE") {
       throw new DevflowError({
         code: "CONFLICT",
@@ -5069,167 +5070,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
     return await prepareGitHubPushApproval(this.database, run, changes, summary, metrics);
   }
 
-  private async pushApprovedBranch(
-    run: RunExecutionRecord,
-    signal: AbortSignal,
-  ): Promise<RunExecutionOutcome> {
-    const publication = await this.requireGitHubPublication(run.id);
-    const approval = await this.requireGitHubApproval(run.id, "GITHUB_PUSH");
-    const changeSet = await this.loadGitHubChangeSet(run.id, publication);
-    const coordinator = new GitHubPublicationCoordinator(
-      this.createGitHubProvider(run),
-      this.database.githubPublications,
-    );
-    const pushed = await this.githubOperation(
-      run.id,
-      "PUSH",
-      async () =>
-        await coordinator.pushApproved(
-          run.id,
-          approval,
-          {
-            operationKey: publication.pushOperationKey,
-            repository: publication.repository,
-            baseCommit: publication.baseCommit,
-            baseBranch: publication.baseBranch,
-            branchName: publication.branchName,
-            commitMessage: `DevFlow: ${run.task.title}`,
-            changes: changeSet.changes,
-          },
-          signal,
-        ),
-    );
-    const pullRequestOperationKey = operationKeyForRun(run.id, "pull-request");
-    return {
-      status: "WAITING_APPROVAL",
-      approvalKind: "GITHUB",
-      approval: {
-        kind: "GITHUB_PULL_REQUEST",
-        request: {
-          operationKey: pullRequestOperationKey,
-          repository: publication.repository,
-          branchName: publication.branchName,
-          baseBranch: publication.baseBranch,
-          commitSha: pushed.commitSha,
-          title: changeSet.pullRequest.title,
-        },
-      },
-    };
-  }
-
-  private async createApprovedPullRequest(
-    run: RunExecutionRecord,
-    signal: AbortSignal,
-  ): Promise<RunResult> {
-    const publication = await this.requireGitHubPublication(run.id);
-    const approval = await this.requireGitHubApproval(run.id, "GITHUB_PULL_REQUEST");
-    const changeSet = await this.loadGitHubChangeSet(run.id, publication);
-    if (publication.commitSha === undefined) {
-      throw new DevflowError({
-        code: "CONFLICT",
-        message: "GitHub publication has no persisted pushed commit.",
-      });
-    }
-    const coordinator = new GitHubPublicationCoordinator(
-      this.createGitHubProvider(run),
-      this.database.githubPublications,
-    );
-    const pullRequest = await this.githubOperation(
-      run.id,
-      "CREATE_PR",
-      async () =>
-        await coordinator.createPullRequestApproved(
-          run.id,
-          approval,
-          {
-            operationKey: operationKeyForRun(run.id, "pull-request"),
-            repository: publication.repository,
-            branchName: publication.branchName,
-            baseBranch: publication.baseBranch,
-            title: changeSet.pullRequest.title,
-            body: changeSet.pullRequest.body,
-          },
-          signal,
-        ),
-    );
-    return {
-      runId: run.id,
-      status: "SUCCEEDED",
-      summary: `${changeSet.summary} Pull request #${String(pullRequest.number)}: ${pullRequest.url}`,
-      metrics: changeSet.metrics,
-    };
-  }
-
-  private async requireGitHubPublication(runId: string): Promise<GitHubPublicationRecord> {
-    const publication = await this.database.githubPublications.findByRunId(runId);
-    if (publication === null) {
-      throw new DevflowError({
-        code: "NOT_FOUND",
-        message: "GitHub publication metadata was not found for this run.",
-      });
-    }
-    return publication;
-  }
-
-  private async requireGitHubApproval(
-    runId: string,
-    kind: GitHubApprovalGrant["kind"],
-  ): Promise<GitHubApprovalGrant> {
-    const approvals = await this.database.approvals.list(runId);
-    const approval = [...approvals]
-      .reverse()
-      .find((candidate) => candidate.kind === kind && candidate.status === "APPROVED");
-    if (
-      approval === undefined ||
-      (approval.kind !== "GITHUB_PUSH" && approval.kind !== "GITHUB_PULL_REQUEST")
-    ) {
-      throw new DevflowError({
-        code: "APPROVAL_REQUIRED",
-        message: `An approved ${kind} approval is required.`,
-      });
-    }
-    return {
-      id: approval.id,
-      runId: approval.runId,
-      kind: approval.kind,
-      status: approval.status,
-    };
-  }
-
-  private async loadGitHubChangeSet(
-    runId: string,
-    publication: GitHubPublicationRecord,
-  ): Promise<GitHubRunChangeSet> {
-    if (publication.changesArtifactId === undefined) {
-      throw new DevflowError({
-        code: "NOT_FOUND",
-        message: "GitHub publication does not reference a persisted change set.",
-      });
-    }
-    const artifact = (await this.database.artifacts.list(runId)).find(
-      (candidate) => candidate.id === publication.changesArtifactId,
-    );
-    if (artifact?.content === undefined) {
-      throw new DevflowError({
-        code: "NOT_FOUND",
-        message: "Persisted GitHub change set was not found.",
-      });
-    }
-    return parseGitHubRunChangeSet(artifact.content);
-  }
-
-  private createGitHubProvider(run: RunExecutionRecord): GitHubProvider {
-    if (this.githubProviderFactory !== undefined) return this.githubProviderFactory(run);
-    if (!this.environment.DEVFLOW_GITHUB_WRITE_ENABLED) {
-      throw new DevflowError({
-        code: "GITHUB_FAILED",
-        message:
-          "GitHub writes are disabled. Set DEVFLOW_GITHUB_WRITE_ENABLED=true at the Worker platform boundary after configuring credentials.",
-      });
-    }
-    return this.createGitHubReadProvider(run);
-  }
-
   private createGitHubReadProvider(run: RunExecutionRecord): GitHubProvider {
     if (this.githubProviderFactory !== undefined) return this.githubProviderFactory(run);
     return new GitHubRestProvider({
@@ -5237,42 +5077,6 @@ export class ApprovalWorkflowRunExecutor implements RunExecutionPort {
       apiBaseUrl: this.environment.DEVFLOW_GITHUB_API_BASE_URL,
       webBaseUrl: this.environment.DEVFLOW_GITHUB_WEB_BASE_URL,
     });
-  }
-
-  private async githubOperation<T>(
-    runId: string,
-    operation: "PUSH" | "CREATE_PR",
-    execute: () => Promise<T>,
-  ): Promise<T> {
-    try {
-      return await execute();
-    } catch (error) {
-      const providerError =
-        error instanceof GitHubProviderError
-          ? error
-          : new GitHubProviderError(
-              "PROVIDER_FAILED",
-              redactGitHubSecrets(error instanceof Error ? error.message : String(error)),
-              // The provider may already have completed the remote operation
-              // before a transient persistence error. Retrying is safe because
-              // both push and PR operations carry stable remote markers.
-              true,
-            );
-      await this.database.events.append({
-        runId,
-        type: "GITHUB_OPERATION_FAILED",
-        level: "ERROR",
-        occurredAt: new Date().toISOString(),
-        payload: { operation, error: providerError.toJSON() },
-      });
-      throw new DevflowError({
-        code: "GITHUB_FAILED",
-        message: providerError.message,
-        retryable: providerError.retryable,
-        details: { operation, provider: providerError.toJSON() },
-        cause: error,
-      });
-    }
   }
 
   private async runAgentPhase(input: {
@@ -7500,44 +7304,6 @@ function publicReadDenial(request: ToolExecutionRequest): string | undefined {
     return "READ_SCOPE: only public repository paths may be inspected.";
   }
   return undefined;
-}
-
-interface GitHubRunChangeSet {
-  changes: GitHubChange[];
-  summary: string;
-  metrics: RunMetrics;
-  pullRequest: { title: string; body: string };
-}
-
-function parseGitHubRunChangeSet(content: string): GitHubRunChangeSet {
-  try {
-    const raw = JSON.parse(content) as unknown;
-    const record = recordValue(raw);
-    const pullRequest = recordValue(record.pullRequest);
-    if (
-      record.version !== 1 ||
-      !Array.isArray(record.changes) ||
-      typeof record.summary !== "string" ||
-      record.summary.length === 0 ||
-      typeof pullRequest.title !== "string" ||
-      pullRequest.title.length === 0 ||
-      typeof pullRequest.body !== "string"
-    ) {
-      throw new Error("Change set fields are invalid.");
-    }
-    return {
-      changes: record.changes.map((change) => GitHubChangeSchema.parse(change)),
-      summary: record.summary,
-      metrics: RunMetricsSchema.parse(record.metrics),
-      pullRequest: { title: pullRequest.title, body: pullRequest.body },
-    };
-  } catch (error) {
-    throw new DevflowError({
-      code: "GITHUB_FAILED",
-      message: "Persisted GitHub change set is invalid.",
-      cause: error,
-    });
-  }
 }
 
 function recordValue(value: unknown): Record<string, unknown> {

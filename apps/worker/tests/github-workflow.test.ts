@@ -19,10 +19,10 @@ import type { NewAgentEvent } from "@devflow/shared";
 import { describe, expect, it, vi } from "vitest";
 
 import { loadWorkerEnvironment } from "../src/config/env.js";
-import { ApprovalWorkflowRunExecutor } from "../src/runs/approval-workflow-run-executor.js";
+import { GitHubDeliveryExecutor, prepareGitHubPushApproval } from "../src/runs/github-delivery.js";
 
-describe("ApprovalWorkflowRunExecutor GitHub publication stages", () => {
-  it("resumes approved push and PR stages idempotently without invoking the Agent model", async () => {
+describe("GitHubDeliveryExecutor publication stages", () => {
+  it("resumes approved push and PR stages idempotently", async () => {
     const run = githubRun("PUSH");
     const artifact = changeSetArtifact(run.id);
     const store = new MemoryGitHubPublicationStore([
@@ -40,16 +40,7 @@ describe("ApprovalWorkflowRunExecutor GitHub publication stages", () => {
     const events: NewAgentEvent[] = [];
     const database = fakeDatabase(store, approvals, artifact, events);
     const provider = new FakeGitHubProvider();
-    const modelFactory = vi.fn(() => {
-      throw new Error("Agent model must not participate in platform GitHub writes.");
-    });
-    const executor = new ApprovalWorkflowRunExecutor(
-      database,
-      environment(),
-      modelFactory,
-      modelFactory,
-      () => provider,
-    );
+    const executor = new GitHubDeliveryExecutor(database, environment(), () => provider);
 
     const firstPush = await executor.execute(run, new AbortController().signal);
     const duplicatePush = await executor.execute(run, new AbortController().signal);
@@ -59,7 +50,6 @@ describe("ApprovalWorkflowRunExecutor GitHub publication stages", () => {
     });
     expect(duplicatePush).toMatchObject({ status: "WAITING_APPROVAL" });
     expect(provider.pushSideEffects).toHaveLength(1);
-    expect(modelFactory).not.toHaveBeenCalled();
 
     approvals.push(approved(run.id, "GITHUB_PULL_REQUEST"));
     const completed = await executor.execute(
@@ -74,6 +64,46 @@ describe("ApprovalWorkflowRunExecutor GitHub publication stages", () => {
     expect(duplicateCompleted).toMatchObject({ status: "SUCCEEDED" });
     expect(provider.pullRequestSideEffects).toHaveLength(1);
     expect(events.map((event) => event.type)).toEqual(["PUSH_COMPLETED", "PR_CREATED"]);
+  });
+
+  it("publishes exactly the change set that any execution mode prepared for approval", async () => {
+    const run = githubRun("PUSH");
+    const prepared = JSON.parse(changeSetArtifact(run.id).content!) as {
+      changes: Parameters<typeof prepareGitHubPushApproval>[2];
+      metrics: Parameters<typeof prepareGitHubPushApproval>[4];
+    };
+    let artifact: ArtifactRecord | undefined;
+    const pause = await prepareGitHubPushApproval(
+      {
+        artifacts: {
+          create: async (input: Omit<ArtifactRecord, "id" | "createdAt">) =>
+            (artifact = { ...input, id: randomUUID(), createdAt: new Date().toISOString() }),
+        },
+      } as unknown as DatabaseAdapter,
+      run,
+      prepared.changes,
+      "Autonomous agent fixed the fixture.",
+      prepared.metrics,
+    );
+    expect(pause.approval.kind).toBe("GITHUB_PUSH");
+    const store = new MemoryGitHubPublicationStore([
+      { runId: run.id, ...pause.approval.publication! },
+    ]);
+    const approvals = [approved(run.id, "GITHUB_PUSH")];
+    const provider = new FakeGitHubProvider();
+    const executor = new GitHubDeliveryExecutor(
+      fakeDatabase(store, approvals, artifact!, []),
+      environment(),
+      () => provider,
+    );
+    const signal = new AbortController().signal;
+    await executor.execute(run, signal);
+    approvals.push(approved(run.id, "GITHUB_PULL_REQUEST"));
+    const done = await executor.execute({ ...run, currentStage: "CREATE_PR" }, signal);
+    expect(done).toMatchObject({ status: "SUCCEEDED", metrics: prepared.metrics });
+    expect(provider.pushSideEffects).toHaveLength(1);
+    expect(provider.pullRequestSideEffects).toHaveLength(1);
+    expect(provider.pushCalls[0]?.changes).toEqual(prepared.changes);
   });
 
   it("persists only a redacted structured provider failure", async () => {
@@ -92,11 +122,9 @@ describe("ApprovalWorkflowRunExecutor GitHub publication stages", () => {
     ]);
     const events: NewAgentEvent[] = [];
     const provider = new FakeGitHubProvider({ failPushes: 3 });
-    const executor = new ApprovalWorkflowRunExecutor(
+    const executor = new GitHubDeliveryExecutor(
       fakeDatabase(store, [approved(run.id, "GITHUB_PUSH")], artifact, events),
       environment(),
-      undefined,
-      undefined,
       () => provider,
     );
 
@@ -142,11 +170,9 @@ describe("ApprovalWorkflowRunExecutor GitHub publication stages", () => {
       createPullRequest: async (request, signal) => await remote.createPullRequest(request, signal),
     };
     const events: NewAgentEvent[] = [];
-    const executor = new ApprovalWorkflowRunExecutor(
+    const executor = new GitHubDeliveryExecutor(
       fakeDatabase(store, [approved(run.id, "GITHUB_PUSH")], artifact, events),
       environment(),
-      undefined,
-      undefined,
       () => provider,
     );
 

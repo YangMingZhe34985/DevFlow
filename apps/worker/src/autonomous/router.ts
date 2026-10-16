@@ -4,13 +4,15 @@ import type { RunResult } from "@devflow/shared";
 import type { RunExecutionOutcome, RunExecutionPort } from "../runs/run-execution.js";
 
 /**
- * Sends executionMode=autonomous Runs to the autonomous executor. GitHub publication
- * (PUSH/CREATE_PR after a human approval) stays with the existing executor for every mode.
+ * Sends executionMode=autonomous Runs to the autonomous executor and the rest to the
+ * legacy executor. GitHub publication (PUSH/CREATE_PR after a human approval) does not
+ * depend on how the candidate was produced, so every mode uses the delivery executor.
  */
 export class ExecutionModeRouter implements RunExecutionPort {
   constructor(
     private readonly legacy: RunExecutionPort,
     private readonly autonomous: RunExecutionPort,
+    private readonly delivery: RunExecutionPort,
   ) {}
 
   async execute(run: RunExecutionRecord, signal: AbortSignal): Promise<RunExecutionOutcome> {
@@ -19,12 +21,12 @@ export class ExecutionModeRouter implements RunExecutionPort {
 
   async observedMetrics(run: RunExecutionRecord): Promise<RunResult["metrics"]> {
     const target = this.select(run);
-    return (await target.observedMetrics?.(run)) ?? emptyMetrics();
+    return (await target.observedMetrics?.(run)) ?? run.result?.metrics ?? emptyMetrics();
   }
 
   private select(run: RunExecutionRecord): RunExecutionPort {
-    const publishing = run.currentStage === "PUSH" || run.currentStage === "CREATE_PR";
-    return run.executionMode === "autonomous" && !publishing ? this.autonomous : this.legacy;
+    if (run.currentStage === "PUSH" || run.currentStage === "CREATE_PR") return this.delivery;
+    return run.executionMode === "autonomous" ? this.autonomous : this.legacy;
   }
 }
 

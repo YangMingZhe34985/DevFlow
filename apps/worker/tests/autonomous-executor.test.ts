@@ -62,18 +62,15 @@ describe("ExecutionModeRouter", () => {
   const run = (executionMode: string, currentStage = "START") =>
     ({ executionMode, currentStage }) as unknown as RunExecutionRecord;
 
-  it("sends autonomous runs to the autonomous executor and publication back to the legacy one", async () => {
-    const legacy = port("legacy");
-    const autonomous = port("autonomous");
-    const router = new ExecutionModeRouter(legacy, autonomous);
+  it("routes by mode and sends every mode's publication to the delivery executor", async () => {
+    const router = new ExecutionModeRouter(port("legacy"), port("autonomous"), port("delivery"));
     const signal = new AbortController().signal;
     expect(await router.execute(run("autonomous"), signal)).toEqual({ name: "autonomous" });
-    expect(await router.execute(run("autonomous", "PUSH"), signal)).toEqual({ name: "legacy" });
-    expect(await router.execute(run("autonomous", "CREATE_PR"), signal)).toEqual({
-      name: "legacy",
-    });
     expect(await router.execute(run("workflow"), signal)).toEqual({ name: "legacy" });
     expect(await router.execute(run("team"), signal)).toEqual({ name: "legacy" });
+    for (const mode of ["autonomous", "workflow", "team"])
+      for (const stage of ["PUSH", "CREATE_PR"])
+        expect(await router.execute(run(mode, stage), signal)).toEqual({ name: "delivery" });
   });
 });
 
